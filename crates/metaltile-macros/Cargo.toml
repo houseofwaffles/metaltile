@@ -1,0 +1,20 @@
+[package]
+name = "metaltile-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Proc-macro crate providing the #[kernel] DSL for MetalTile GPU kernels"
+keywords = ["metal", "gpu", "apple-silicon", "macro", "dsl"]
+categories = ["compilers", "hardware-support"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+metaltile-core.workspace = true
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+darling.workspace = true

@@ -1,0 +1,59 @@
+[package]
+name = "metaltile-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Benchmark suite comparing MetalTile-generated kernels against MLX Metal reference kernels"
+keywords = ["metal", "gpu", "apple-silicon", "benchmark", "mlx"]
+categories = ["hardware-support", "development-tools"]
+publish = false
+
+[features]
+# Enable NAX (non-Apple-Silicon) kernel variants. Not needed on M1+.
+nax = []
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+metaltile.workspace = true
+metaltile-core.workspace = true
+metaltile-codegen.workspace = true
+metaltile-interp.workspace = true
+metaltile-runtime.workspace = true
+metaltile-macros.workspace = true
+criterion = { workspace = true, features = ["html_reports"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice", "MTLCommandQueue", "MTLLibrary",
+    "MTLComputePipeline", "MTLComputeCommandEncoder",
+    "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLFunctionConstantValues", "MTLDataType",
+] }
+objc2-foundation = "0.3"
+
+[[bin]]
+name = "bench_suite"
+path = "src/bench_suite.rs"
+
+[[bin]]
+name = "bench_regress"
+path = "src/bench_regress.rs"
+
+[[bin]]
+name = "gpu_bench"
+path = "src/gpu_bench.rs"
+
+[[bin]]
+name = "dump_msl"
+path = "src/dump_msl.rs"
+
+[[bench]]
+name = "kernels"
+harness = false

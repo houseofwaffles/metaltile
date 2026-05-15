@@ -1,0 +1,16 @@
+[package]
+name = "metaltile-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Metal Shading Language (MSL) code generator for MetalTile kernels"
+keywords = ["metal", "gpu", "apple-silicon", "codegen", "msl"]
+categories = ["compilers", "hardware-support"]
+
+[dependencies]
+metaltile-core.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+half.workspace = true

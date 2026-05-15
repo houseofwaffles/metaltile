@@ -1,0 +1,23 @@
+[package]
+name = "metaltile-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Apple Metal runtime dispatch for MetalTile GPU kernels"
+keywords = ["metal", "gpu", "apple-silicon", "runtime", "dispatch"]
+categories = ["compilers", "hardware-support"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLLibrary", "MTLComputePipeline", "MTLComputeCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLFunctionConstantValues"] }
+objc2-foundation = "0.3"
+
+[dependencies]
+metaltile-core.workspace = true
+metaltile-codegen.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "metaltile-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core IR types and data structures for the MetalTile GPU kernel DSL"
+keywords = ["metal", "gpu", "apple-silicon", "compiler", "ir"]
+categories = ["compilers", "hardware-support"]
+
+[dependencies]
+thiserror.workspace = true
+smallvec.workspace = true
+half.workspace = true
+serde.workspace = true
+bytemuck.workspace = true
+bitvec.workspace = true

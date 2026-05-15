@@ -1,0 +1,18 @@
+# Rust
+target/
+Cargo.lock
+
+# Benchmarks
+criterion/
+outputs/
+
+# macOS
+.DS_Store
+*.metallib
+
+# Editor
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo

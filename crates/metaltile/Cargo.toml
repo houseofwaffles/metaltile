@@ -1,0 +1,18 @@
+[package]
+name = "metaltile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Rust DSL for writing Apple Metal GPU kernels — write once, run fast on Apple Silicon"
+keywords = ["metal", "gpu", "apple-silicon", "dsl", "shader"]
+categories = ["compilers", "hardware-support"]
+
+[dependencies]
+metaltile-core.workspace = true
+metaltile-macros.workspace = true
+metaltile-codegen.workspace = true
+metaltile-interp.workspace = true
+metaltile-runtime.workspace = true

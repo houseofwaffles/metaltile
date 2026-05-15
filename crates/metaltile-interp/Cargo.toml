@@ -1,0 +1,17 @@
+[package]
+name = "metaltile-interp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CPU reference interpreter for MetalTile kernel IR (testing and verification)"
+keywords = ["metal", "gpu", "apple-silicon", "interpreter", "testing"]
+categories = ["compilers", "hardware-support", "development-tools::testing"]
+
+[dependencies]
+metaltile-core.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+half.workspace = true
+bytemuck.workspace = true
