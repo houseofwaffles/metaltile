@@ -6,6 +6,7 @@
 
 use crate::{ops::OpResult, runner::GpuRunner};
 
-static _SRC: &str = include_str!("../../../metal/steel/conv/steel_conv_general.metal");
+static _SRC: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/metal/steel/conv/steel_conv_general.metal"));
 
 pub fn bench_conv_general(_runner: &GpuRunner) -> Vec<OpResult> { vec![] }

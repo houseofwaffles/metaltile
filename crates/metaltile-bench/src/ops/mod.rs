@@ -64,34 +64,21 @@ pub mod strided;
 pub mod ternary;
 pub mod unary;
 
-pub use arange::bench_arange_f32;
-pub use arg_reduce::bench_arg_reduce;
-pub use binary::{bench_binary_ops_f32, bench_elementwise_f32};
-pub use binary_two::bench_binary_two_f32;
-pub use copy::bench_copy_f32;
-pub use fp_quantized::bench_fp_quantized;
-pub use gemv::bench_gemv;
-pub use gemv_masked::bench_gemv_masked;
-pub use layer_norm::bench_layer_norm;
-pub use logsumexp::bench_logsumexp;
-pub use quantized::bench_quantized;
-pub use random::bench_random;
-pub use reduce::bench_reduce;
-pub use rms_norm::bench_rms_norm_f32;
-pub use rope::bench_rope;
-pub use scaled_dot_product_attention::{bench_sdpa_vector, bench_sdpa_vector_f16};
-pub use scan::bench_scan;
 pub use shared::{
     CorrectnessStatus,
     DEFAULT_MIN_COSINE_SIM,
     DType,
+    DtypeCtx,
     EquivResult,
     EquivTolerance,
+    FLOAT_DTYPE_STRS,
     FLOAT_DTYPES,
     INTEGER_DTYPES,
     OpBench,
     OpResult,
     SuitePrinter,
+    bench_all_dtypes,
+    bench_gbps,
     buffer_typed,
     check_equiv,
     check_equiv_with,
@@ -99,6 +86,8 @@ pub use shared::{
     dtype_tol,
     dtype_tol_reduce,
     elem_bytes,
+    generate_elementwise_msl,
+    generate_reduction_msl,
     mlx_tname,
     print_suite,
     quantize_roundtrip,
@@ -107,15 +96,10 @@ pub use shared::{
     validate_results,
     zeros_typed,
 };
-pub(crate) use shared::{run_f16_once_as_f32, run_f32_once, run_typed_once, to_gbps, to_gflops};
-pub use softmax::bench_softmax_f32;
-pub use sort::bench_sort;
+pub(crate) use shared::{run_f16_once_as_f32, run_typed_once, to_gflops};
 pub use steel::gemm::{
     bench_matmul_fp16,
     bench_matmul_gather,
     bench_matmul_masked,
     bench_matmul_segmented,
 };
-pub use strided::bench_strided;
-pub use ternary::bench_select_f32;
-pub use unary::bench_all_unary;

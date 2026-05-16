@@ -12,35 +12,12 @@ use metaltile_bench::{
         CorrectnessStatus,
         OpResult,
         SuitePrinter,
-        bench_all_unary,
-        bench_arange_f32,
-        bench_arg_reduce,
-        bench_binary_ops_f32,
-        bench_binary_two_f32,
-        bench_copy_f32,
-        bench_fp_quantized,
-        bench_gemv,
-        bench_gemv_masked,
-        bench_layer_norm,
-        bench_logsumexp,
         bench_matmul_fp16,
-        bench_quantized,
-        bench_random,
-        bench_reduce,
-        bench_rms_norm_f32,
-        bench_rope,
-        bench_scan,
-        bench_sdpa_vector,
-        bench_sdpa_vector_f16,
-        bench_select_f32,
-        bench_softmax_f32,
-        bench_sort,
-        bench_strided,
         set_result_reporter,
         validate_results,
     },
-    roofline::lookup_chip,
     runner::GpuRunner,
+    spec::BenchSpec,
     term::{Color, Style, paint_stderr, paint_stdout},
 };
 
@@ -60,8 +37,6 @@ fn main() {
             return;
         },
     };
-
-    let chip = lookup_chip(&runner.device_name);
 
     println!(
         "{}",
@@ -89,64 +64,33 @@ fn main() {
         paint_stdout("Device:", Style::new().fg(Color::BrightBlack).bold()),
         paint_stdout(&runner.device_name, Style::new().fg(Color::BrightWhite).bold())
     );
-    if let Some(c) = &chip {
-        println!(
-            "{} {}  {} {}  {} {}",
-            paint_stdout("Peak fp16:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(
-                &format!("{:.0} TFLOPS", c.peak_tflops_fp16),
-                Style::new().fg(Color::Cyan).bold()
-            ),
-            paint_stdout("Peak BW:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(
-                &format!("{:.0} GB/s", c.peak_bw_gbps),
-                Style::new().fg(Color::Cyan).bold()
-            ),
-            paint_stdout("Ridge:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(
-                &format!("{:.0} FLOPS/B", c.ridge_point_fp16()),
-                Style::new().fg(Color::Cyan).bold()
-            )
-        );
-    }
 
     // Run all ops, optionally narrowed to a single substring filter.
     let mut all: Vec<OpResult> = Vec::new();
-    let mut printer = {
-        let mut p = SuitePrinter::new(true);
-        if let Some(c) = &chip {
-            p = p.with_peak_gbps(c.peak_bw_gbps);
-        }
-        p
-    };
+    let mut printer = SuitePrinter::new(true);
     {
-        let mut report = |result: &OpResult| printer.print_batch(std::slice::from_ref(result));
+        let mut report = |result: &OpResult| {
+            if matches_filter(filter.as_deref(), result.op()) {
+                printer.print_batch(std::slice::from_ref(result));
+            }
+        };
         let _reporter = set_result_reporter(&mut report);
 
-        extend_if_selected(&mut all, &runner, &filter, "matmul", bench_matmul_fp16);
-        extend_if_selected(&mut all, &runner, &filter, "gemv", bench_gemv);
-        extend_if_selected(&mut all, &runner, &filter, "gemv_masked", bench_gemv_masked);
-        extend_if_selected(&mut all, &runner, &filter, "softmax", bench_softmax_f32);
-        extend_if_selected(&mut all, &runner, &filter, "rms", bench_rms_norm_f32);
-        extend_if_selected(&mut all, &runner, &filter, "binary", bench_binary_ops_f32);
-        extend_if_selected(&mut all, &runner, &filter, "layer_norm", bench_layer_norm);
-        extend_if_selected(&mut all, &runner, &filter, "logsumexp", bench_logsumexp);
-        extend_if_selected(&mut all, &runner, &filter, "reduce", bench_reduce);
-        extend_if_selected(&mut all, &runner, &filter, "rope", bench_rope);
-        extend_if_selected(&mut all, &runner, &filter, "unary", bench_all_unary);
-        extend_if_selected(&mut all, &runner, &filter, "copy", bench_copy_f32);
-        extend_if_selected(&mut all, &runner, &filter, "arange", bench_arange_f32);
-        extend_if_selected(&mut all, &runner, &filter, "select", bench_select_f32);
-        extend_if_selected(&mut all, &runner, &filter, "binary_two", bench_binary_two_f32);
-        extend_if_selected(&mut all, &runner, &filter, "scan", bench_scan);
-        extend_if_selected(&mut all, &runner, &filter, "sdpa", bench_sdpa_vector);
-        extend_if_selected(&mut all, &runner, &filter, "sdpa", bench_sdpa_vector_f16);
-        extend_if_selected(&mut all, &runner, &filter, "quantized", bench_quantized);
-        extend_if_selected(&mut all, &runner, &filter, "sort", bench_sort);
-        extend_if_selected(&mut all, &runner, &filter, "random", bench_random);
-        extend_if_selected(&mut all, &runner, &filter, "fp_quantized", bench_fp_quantized);
-        extend_if_selected(&mut all, &runner, &filter, "arg_reduce", bench_arg_reduce);
-        extend_if_selected(&mut all, &runner, &filter, "strided", bench_strided);
+        // Matrix multiply
+        extend_if_selected(&mut all, &runner, &filter, bench_matmul_fp16);
+        // All other ops — inventory-registered via #[bench_kernel]
+        {
+            let mut specs: Vec<&BenchSpec> = inventory::iter::<BenchSpec>.into_iter().collect();
+            specs.sort_unstable_by_key(|s| (s.op, s.subop));
+            for spec in specs {
+                if matches_filter(filter.as_deref(), spec.op) {
+                    for &dt in spec.dtypes {
+                        runner.flush_slc();
+                        all.extend(spec.run(&runner, dt));
+                    }
+                }
+            }
+        }
     }
 
     if all.is_empty() {
@@ -155,7 +99,7 @@ fn main() {
                 "{} {}",
                 paint_stderr("[warn]", Style::new().fg(Color::Yellow).bold()),
                 paint_stderr(
-                    &format!("No benchmarks matched --filter {pattern:?}"),
+                    format!("No benchmarks matched --filter {pattern:?}"),
                     Style::new().fg(Color::BrightWhite)
                 )
             );
@@ -229,14 +173,14 @@ fn main() {
         println!(
             "  {} {}",
             paint_stdout("Correctness failures:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(&equiv_fail.to_string(), Style::new().fg(Color::Red).bold())
+            paint_stdout(equiv_fail.to_string(), Style::new().fg(Color::Red).bold())
         );
     }
     if !unchecked.is_empty() {
         println!(
             "  {} {}",
             paint_stdout("Unchecked MT results:", Style::new().fg(Color::BrightBlack).bold()),
-            paint_stdout(&unchecked.join(", "), Style::new().fg(Color::Yellow).bold())
+            paint_stdout(unchecked.join(", "), Style::new().fg(Color::Yellow).bold())
         );
     }
     println!();
@@ -288,12 +232,9 @@ fn extend_if_selected(
     all: &mut Vec<OpResult>,
     runner: &GpuRunner,
     filter: &Option<String>,
-    label: &str,
     run: fn(&GpuRunner) -> Vec<OpResult>,
 ) {
-    if matches_filter(filter.as_deref(), label) {
-        all.extend(run(runner));
-    }
+    all.extend(run(runner).into_iter().filter(|r| matches_filter(filter.as_deref(), r.op())));
 }
 
 fn matches_filter(filter: Option<&str>, label: &str) -> bool {

@@ -19,6 +19,6 @@
 
 use crate::{ops::OpResult, runner::GpuRunner};
 
-static _SRC: &str = include_str!("../metal/fft.metal");
+static _SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/metal/fft.metal"));
 
 pub fn bench_fft(_runner: &GpuRunner) -> Vec<OpResult> { vec![] }

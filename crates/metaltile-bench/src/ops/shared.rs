@@ -1,6 +1,8 @@
 use std::{cell::RefCell, io::Write, ptr::NonNull};
 
 pub use metaltile::core::dtype::DType;
+use metaltile::core::ir::{Kernel, KernelMode};
+use metaltile_codegen::msl::MslGenerator;
 
 use crate::{
     runner::{CompiledKernel, GpuBuffer, GpuRunner},
@@ -11,6 +13,8 @@ use crate::{
 
 /// All floating-point dtypes to iterate over in multi-variant benches.
 pub const FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+/// Short names for the three floating-point dtypes, matching MLX convention.
+pub const FLOAT_DTYPE_STRS: &[&str] = &["f32", "f16", "bf16"];
 /// Integer dtypes supported by MLX elementwise and copy kernels.
 pub const INTEGER_DTYPES: &[DType] = &[DType::I32, DType::U32, DType::I8, DType::U8];
 
@@ -201,7 +205,7 @@ thread_local! {
 pub const DEFAULT_MIN_COSINE_SIM: f32 = 0.999;
 
 /// Result of a numerical equivalence check between the reference and MT kernels.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct EquivResult {
     /// Number of elements compared.
     pub n_checked: usize,
@@ -295,9 +299,22 @@ pub struct OpBench {
 
 impl OpBench {
     pub const fn new(op: &'static str, metric: &'static str) -> Self { Self { op, metric } }
+    pub const fn op(&self) -> &'static str { self.op }
 
     pub fn result(
         &self,
+        shape: impl Into<String>,
+        ref_perf: Option<f64>,
+        mt_perf: Option<f64>,
+        equiv: Option<EquivResult>,
+    ) -> OpResult {
+        self.result_sub(None::<&str>, shape, ref_perf, mt_perf, equiv)
+    }
+
+    /// Like `result()` but with a sub-operation label displayed as "op (subop)".
+    pub fn result_sub(
+        &self,
+        subop: Option<impl Into<String>>,
         shape: impl Into<String>,
         ref_perf: Option<f64>,
         mt_perf: Option<f64>,
@@ -307,7 +324,15 @@ impl OpBench {
         if mt_perf.is_some() && equiv.is_none() {
             panic!("implemented benchmark '{}' [{}] is missing correctness", self.op, shape);
         }
-        let result = OpResult { op: self.op, shape, metric: self.metric, ref_perf, mt_perf, equiv };
+        let result = OpResult {
+            op: self.op,
+            subop: subop.map(|s| s.into()),
+            shape,
+            metric: self.metric,
+            ref_perf,
+            mt_perf,
+            equiv,
+        };
         report_result(&result);
         result
     }
@@ -329,6 +354,9 @@ impl OpBench {
 
 pub struct OpResult {
     op: &'static str,
+    /// Optional sub-operation displayed as "op (subop)" in the Op column.
+    /// Does not affect blank-line grouping — that still uses `op`.
+    subop: Option<String>,
     shape: String,
     /// "GFLOPS" or "GB/s"
     metric: &'static str,
@@ -342,6 +370,14 @@ pub struct OpResult {
 
 impl OpResult {
     pub fn op(&self) -> &'static str { self.op }
+
+    /// Rendered op name: "op (subop)" if subop is set, else "op".
+    pub fn op_display(&self) -> String {
+        match &self.subop {
+            Some(s) => format!("{} ({})", self.op, s),
+            None => self.op.to_string(),
+        }
+    }
 
     pub fn shape(&self) -> &str { &self.shape }
 
@@ -373,12 +409,18 @@ impl OpResult {
 
     pub fn correctness_cell(&self) -> String {
         match self.correctness_status() {
-            CorrectnessStatus::Passed { max_abs_err, cosine_sim } => {
-                format!("✓ cos={cosine_sim:.6} err={max_abs_err:.2e}")
-            },
-            CorrectnessStatus::Failed { max_abs_err, cosine_sim } => {
-                format!("✗ cos={cosine_sim:.6} err={max_abs_err:.2e}")
-            },
+            CorrectnessStatus::Passed { max_abs_err, .. } =>
+                if max_abs_err < 1e-5 {
+                    "✓".into()
+                } else {
+                    format!("✓ {max_abs_err:.2e}")
+                },
+            CorrectnessStatus::Failed { max_abs_err, cosine_sim } =>
+                if cosine_sim < 0.999 {
+                    format!("✗ {max_abs_err:.2e} cos={cosine_sim:.3}")
+                } else {
+                    format!("✗ {max_abs_err:.2e}")
+                },
             CorrectnessStatus::Unchecked => "! missing-check".into(),
             CorrectnessStatus::Unavailable => "—".into(),
         }
@@ -432,8 +474,7 @@ pub fn set_result_reporter(reporter: &mut dyn FnMut(&OpResult)) -> ResultReporte
     // the reference could become dangling.
     let reporter: NonNull<dyn FnMut(&OpResult)> =
         unsafe { std::mem::transmute(NonNull::from(reporter)) };
-    let previous =
-        RESULT_REPORTER.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), Some(reporter)));
+    let previous = RESULT_REPORTER.with(|slot| (*slot.borrow_mut()).replace(reporter));
     ResultReporterGuard { previous }
 }
 
@@ -441,10 +482,8 @@ pub struct SuitePrinter {
     show_correctness: bool,
     started: bool,
     last_op: Option<&'static str>,
-    /// DRAM bandwidth ceiling for the current device (GB/s).  When set,
-    /// any GB/s value that exceeds this ceiling is flagged with `~`.
-    peak_gbps: Option<f64>,
-    any_above_peak: bool,
+    last_op_display: Option<String>,
+    last_shape_base: Option<String>,
 }
 
 impl SuitePrinter {
@@ -453,15 +492,9 @@ impl SuitePrinter {
             show_correctness,
             started: false,
             last_op: None,
-            peak_gbps: None,
-            any_above_peak: false,
+            last_op_display: None,
+            last_shape_base: None,
         }
-    }
-
-    /// Set the DRAM bandwidth ceiling so values above it are flagged with `~`.
-    pub fn with_peak_gbps(mut self, peak: f64) -> Self {
-        self.peak_gbps = Some(peak);
-        self
     }
 
     pub fn print_batch(&mut self, results: &[OpResult]) {
@@ -473,21 +506,29 @@ impl SuitePrinter {
             self.started = true;
         }
         for result in results {
-            if self.last_op.is_some() && self.last_op != Some(result.op()) {
+            // Blank line between top-level op groups.
+            let new_group = self.last_op.is_some() && self.last_op != Some(result.op());
+            if new_group {
                 println!();
+                self.last_shape_base = None;
             }
             self.last_op = Some(result.op());
-            // Track whether any perf value exceeds the DRAM ceiling.
-            if let Some(peak) = self.peak_gbps {
-                if result.metric() == "GB/s" {
-                    let over = result.ref_perf().map_or(false, |v| v > peak)
-                        || result.mt_perf().map_or(false, |v| v > peak);
-                    if over {
-                        self.any_above_peak = true;
-                    }
-                }
+
+            // Blank repeated op_display within a group; reset shape tracking on change.
+            let op_display = result.op_display();
+            let show_op = Some(&op_display) != self.last_op_display.as_ref();
+            if show_op {
+                self.last_shape_base = None;
             }
-            println!("{}", format_row(result, self.show_correctness, self.peak_gbps));
+            self.last_op_display = Some(op_display.clone());
+            let shown_op = if show_op { &op_display } else { "" };
+
+            // Dim repeated shape base (e.g. "N=64M") when only the dtype changes.
+            let (shape_cell, new_base) =
+                build_shape_cell(result.shape(), self.last_shape_base.as_deref());
+            self.last_shape_base = new_base;
+
+            println!("{}", format_row(result, self.show_correctness, shown_op, &shape_cell));
         }
         self.flush();
     }
@@ -497,34 +538,29 @@ impl SuitePrinter {
             return;
         }
         println!("  {}", separator(separator_width(self.show_correctness)));
-        if self.any_above_peak {
-            println!(
-                "  {} GB/s exceeds DRAM peak — cache-resident working set or compute-bound; metric counts application bytes only",
-                paint_stdout("~", Style::new().fg(Color::BrightBlack))
-            );
-        }
         self.flush();
     }
 
     fn print_header(&self) {
         println!();
+        let sep = col_sep();
         if self.show_correctness {
             println!(
-                "  {} {} {}  {}  {}  {}",
+                "  {} {sep} {} {sep} {} {sep} {} {sep} {} {sep} {}",
                 header_cell("Op", 28, false),
-                header_cell("Shape", 18, false),
-                header_cell("Reference", 13, true),
-                header_cell("MetalTile", 13, true),
+                header_cell("Shape", 26, false),
+                header_cell("Reference", 14, true),
+                header_cell("MetalTile", 14, true),
                 header_cell("MT%", 6, true),
-                header_cell("Correct", 28, true),
+                header_cell("Correct", 14, true),
             );
         } else {
             println!(
-                "  {} {} {}  {}  {}",
+                "  {} {sep} {} {sep} {} {sep} {} {sep} {}",
                 header_cell("Op", 28, false),
-                header_cell("Shape", 18, false),
-                header_cell("Reference", 13, true),
-                header_cell("MetalTile", 13, true),
+                header_cell("Shape", 26, false),
+                header_cell("Reference", 14, true),
+                header_cell("MetalTile", 14, true),
                 header_cell("MT%", 6, true),
             );
         }
@@ -546,30 +582,61 @@ fn report_result(result: &OpResult) {
     });
 }
 
-fn fmt_perf(v: Option<f64>, metric: &str, fallback: &str, peak_gbps: Option<f64>) -> String {
+fn fmt_perf(v: Option<f64>, metric: &str, fallback: &str) -> String {
     match v {
         None => fallback.into(),
-        Some(x) => {
-            let flag =
-                if metric == "GB/s" && peak_gbps.map_or(false, |p| x > p) { "~" } else { "" };
-            format!("{flag}{x:.1} {metric}")
-        },
+        Some(x) => format!("{x:.1} {metric}"),
     }
 }
 
-fn format_row(result: &OpResult, show_correctness: bool, peak_gbps: Option<f64>) -> String {
-    let ref_s = fmt_perf(result.ref_perf(), result.metric(), "—", peak_gbps);
-    let mt_s = fmt_perf(result.mt_perf(), result.metric(), "NYI", peak_gbps);
+/// Returns (painted_shape_cell, new_last_base).
+/// When the shape ends with a known dtype token and the base matches `last_base`,
+/// the base is dimmed and only the dtype is bright, reducing visual noise for
+/// consecutive rows that differ only in dtype (e.g. "N=64M f32" / f16 / bf16).
+fn build_shape_cell(shape: &str, last_base: Option<&str>) -> (String, Option<String>) {
+    const DTYPES: &[&str] = &["bf16", "f16", "f32", "i32", "u32", "i8", "u8"];
+    const W: usize = 26;
+    for &dtype in DTYPES {
+        if let Some(base) = shape.strip_suffix(&format!(" {dtype}")) {
+            if Some(base) == last_base {
+                // Dim the repeated base, highlight just the dtype.
+                let prefix = format!("{base} ");
+                let pad_w = W.saturating_sub(dtype.len());
+                let cell = format!(
+                    "{}{}",
+                    paint_stdout(pad_left(&prefix, pad_w), Style::new().fg(Color::BrightBlack)),
+                    paint_stdout(dtype, Style::new().fg(Color::BrightWhite)),
+                );
+                return (cell, Some(base.to_string()));
+            } else {
+                let cell = paint_stdout(pad_left(shape, W), Style::new().fg(Color::BrightWhite));
+                return (cell, Some(base.to_string()));
+            }
+        }
+    }
+    (paint_stdout(pad_left(shape, W), Style::new().fg(Color::BrightWhite)), None)
+}
+
+fn format_row(
+    result: &OpResult,
+    show_correctness: bool,
+    shown_op: &str,
+    shape_cell: &str,
+) -> String {
+    let ref_s = fmt_perf(result.ref_perf(), result.metric(), "—");
+    let mt_s = fmt_perf(result.mt_perf(), result.metric(), "NYI");
     let pct_s = result.pct().map(|p| format!("{:.0}%", p)).unwrap_or_else(|| "—".into());
     let ref_cell = style_reference(&ref_s, result.ref_perf());
     let mt_cell = style_metaltile(&mt_s, result);
     let pct_cell = style_pct(&pct_s, result);
+    let sep = col_sep();
+    let op_col = paint_stdout(pad_left(shown_op, 28), Style::new().fg(Color::Cyan).bold());
     if show_correctness {
         let eq_s = result.correctness_cell();
         format!(
-            "  {} {} {}  {}  {}  {}",
-            paint_stdout(&pad_left(result.op(), 28), Style::new().fg(Color::Cyan).bold()),
-            paint_stdout(&pad_left(result.shape(), 18), Style::new().fg(Color::BrightWhite)),
+            "  {} {sep} {} {sep} {} {sep} {} {sep} {} {sep} {}",
+            op_col,
+            shape_cell,
             ref_cell,
             mt_cell,
             pct_cell,
@@ -577,25 +644,25 @@ fn format_row(result: &OpResult, show_correctness: bool, peak_gbps: Option<f64>)
         )
     } else {
         format!(
-            "  {} {} {}  {}  {}",
-            paint_stdout(&pad_left(result.op(), 28), Style::new().fg(Color::Cyan).bold()),
-            paint_stdout(&pad_left(result.shape(), 18), Style::new().fg(Color::BrightWhite)),
-            ref_cell,
-            mt_cell,
-            pct_cell,
+            "  {} {sep} {} {sep} {} {sep} {} {sep} {}",
+            op_col, shape_cell, ref_cell, mt_cell, pct_cell,
         )
     }
 }
 
-fn separator_width(show_correctness: bool) -> usize { if show_correctness { 115 } else { 82 } }
+// Visible widths: 2 prefix + 28 op + 3 sep + 26 shape + 3 sep + 14 ref + 3 sep + 14 mt
+//                + 3 sep + 6 pct [+ 3 sep + 14 correct]
+fn separator_width(show_correctness: bool) -> usize { if show_correctness { 119 } else { 99 } }
 
 fn header_cell(label: &str, width: usize, right_align: bool) -> String {
     let cell = if right_align { pad_right(label, width) } else { pad_left(label, width) };
     paint_stdout(&cell, Style::new().fg(Color::BrightWhite).bold())
 }
 
+fn col_sep() -> String { paint_stdout("│", Style::new().fg(Color::BrightBlack).dim()) }
+
 fn separator(width: usize) -> String {
-    paint_stdout(&"─".repeat(width), Style::new().fg(Color::BrightBlack).dim())
+    paint_stdout("─".repeat(width), Style::new().fg(Color::BrightBlack).dim())
 }
 
 fn pad_left(text: &str, width: usize) -> String { format!("{text:<width$}") }
@@ -608,7 +675,7 @@ fn style_reference(text: &str, value: Option<f64>) -> String {
     } else {
         Style::new().fg(Color::Red).bold()
     };
-    paint_stdout(&pad_right(text, 13), style)
+    paint_stdout(pad_right(text, 14), style)
 }
 
 fn style_metaltile(text: &str, result: &OpResult) -> String {
@@ -617,7 +684,7 @@ fn style_metaltile(text: &str, result: &OpResult) -> String {
         (Some(_), _) => Style::new().fg(Color::BrightWhite).bold(),
         (None, _) => Style::new().fg(Color::Yellow).bold(),
     };
-    paint_stdout(&pad_right(text, 13), style)
+    paint_stdout(pad_right(text, 14), style)
 }
 
 fn style_pct(text: &str, result: &OpResult) -> String {
@@ -628,7 +695,7 @@ fn style_pct(text: &str, result: &OpResult) -> String {
         (Some(_), _) => Style::new().fg(Color::Red).bold(),
         (None, _) => Style::new().fg(Color::Yellow).bold(),
     };
-    paint_stdout(&pad_right(text, 6), style)
+    paint_stdout(pad_right(text, 6), style)
 }
 
 fn style_correctness(text: &str, status: CorrectnessStatus) -> String {
@@ -638,9 +705,10 @@ fn style_correctness(text: &str, status: CorrectnessStatus) -> String {
         CorrectnessStatus::Unchecked => Style::new().fg(Color::Yellow).bold(),
         CorrectnessStatus::Unavailable => Style::new().fg(Color::BrightBlack).dim(),
     };
-    paint_stdout(&pad_right(text, 28), style)
+    paint_stdout(pad_right(text, 14), style)
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_f32_once(
     runner: &GpuRunner,
     kernel: &CompiledKernel,
@@ -689,6 +757,134 @@ pub(crate) fn to_gbps(st: &crate::stats::BenchStats, bytes: f64) -> Option<f64> 
     st.is_valid().then(|| bytes / (st.mean_us * 1e-6) / 1e9)
 }
 
+/// Run `kernel` for performance measurement and return throughput in GB/s.
+///
+/// Flushes the System Level Cache (SLC) before timing so that both reference and
+/// MetalTile measurements start from the same cold-cache state. This eliminates the
+/// noise caused by working sets that fit in the 64 MB SLC (M4 Max).
+///
+/// Uses the standard 3-warmup / 10-iteration schedule. Returns `None` if the
+/// benchmark produced no valid timing samples (e.g. on non-macOS).
+pub fn bench_gbps(
+    runner: &GpuRunner,
+    kernel: &CompiledKernel,
+    buffers: &[&GpuBuffer],
+    grid: [usize; 3],
+    tpg: [usize; 3],
+    bytes: f64,
+) -> Option<f64> {
+    runner.flush_slc();
+    to_gbps(&runner.bench(kernel, buffers, grid, tpg, 3, 10), bytes)
+}
+
+// ── Shared bench abstractions ─────────────────────────────────────────────────
+
+/// Generate MSL for an elementwise kernel IR produced by `make_ir`.
+///
+/// Uses default `KernelMode::Elementwise`. `label` is used only in the error message.
+pub fn generate_elementwise_msl<F>(make_ir: F, label: &str) -> String
+where F: Fn() -> Kernel {
+    MslGenerator::default().generate(&make_ir()).unwrap_or_else(|e| {
+        eprintln!("[{label}]: {e}");
+        String::new()
+    })
+}
+
+/// Generate MSL for a reduction kernel IR produced by `make_ir`, setting `Reduction` mode.
+///
+/// `label` is used only in the error message when code generation fails.
+pub fn generate_reduction_msl<F>(make_ir: F, label: &str) -> String
+where F: Fn() -> Kernel {
+    let mut k = make_ir();
+    k.mode = KernelMode::Reduction;
+    MslGenerator::default().generate(&k).unwrap_or_else(|e| {
+        eprintln!("[{label}]: {e}");
+        String::new()
+    })
+}
+
+/// Per-dtype context bundled at the top of every bench function.
+pub struct DtypeCtx {
+    pub dt: DType,
+    /// MLX template-name suffix (e.g. `"float32"`).
+    pub tn: &'static str,
+    /// Short label used in shape strings (e.g. `"f32"`).
+    pub label: &'static str,
+    /// Bytes per element.
+    pub eb: usize,
+    /// Absolute-error tolerance for correctness checks.
+    pub tol: f32,
+}
+
+impl DtypeCtx {
+    /// Context for reduction ops — uses `dtype_tol_reduce`.
+    pub fn reduce(dt: DType) -> Self {
+        Self {
+            dt,
+            tn: mlx_tname(dt),
+            label: dtype_label(dt),
+            eb: elem_bytes(dt),
+            tol: dtype_tol_reduce(dt),
+        }
+    }
+
+    /// Context for elementwise ops — uses `dtype_tol`.
+    pub fn elementwise(dt: DType) -> Self {
+        Self {
+            dt,
+            tn: mlx_tname(dt),
+            label: dtype_label(dt),
+            eb: elem_bytes(dt),
+            tol: dtype_tol(dt),
+        }
+    }
+}
+
+/// Run `f` for each dtype in `FLOAT_DTYPES` and collect all results.
+pub fn bench_all_dtypes<F>(runner: &GpuRunner, f: F) -> Vec<OpResult>
+where F: Fn(&GpuRunner, DType) -> Vec<OpResult> {
+    FLOAT_DTYPES.iter().flat_map(|&dt| f(runner, dt)).collect()
+}
+
+/// Emit the standard two-test block for a reduction op.
+///
+/// Generates:
+/// - `msl_generates_for_all_dtypes` — calls `$msl_fn(dt)` for each float dtype
+/// - `kernels_compile` (macos only) — compiles the generated MSL
+///
+/// Usage:
+/// ```ignore
+/// bench_tests!(msl_fn: layer_norm_msl_for, kernel_name: "mt_layer_norm");
+/// ```
+#[macro_export]
+macro_rules! bench_tests {
+    (msl_fn: $msl_fn:ident, kernel_name: $name:expr) => {
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn msl_generates_for_all_dtypes() {
+                for &dt in $crate::ops::FLOAT_DTYPES {
+                    let msl = $msl_fn(dt);
+                    assert!(!msl.trim().is_empty(), "MSL empty for {dt:?}");
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            #[test]
+            fn kernels_compile() {
+                let Ok(runner) = $crate::runner::GpuRunner::new() else {
+                    return;
+                };
+                for &dt in $crate::ops::FLOAT_DTYPES {
+                    runner.compile(&$msl_fn(dt), $name).unwrap();
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CorrectnessStatus, EquivResult, OpBench, OpResult, check_equiv, validate_results};
@@ -701,6 +897,7 @@ mod tests {
     fn correctness_status_distinguishes_unchecked_from_unavailable() {
         let unchecked = OpResult {
             op: "sample",
+            subop: None,
             shape: "shape".into(),
             metric: "GB/s",
             ref_perf: Some(1.0),
@@ -739,12 +936,12 @@ mod tests {
             max_abs_err: 0.0,
             cosine_sim: 1.0
         });
-        assert_eq!(passed.correctness_cell(), "✓ cos=1.000000 err=0.00e0");
+        assert_eq!(passed.correctness_cell(), "✓");
         assert_eq!(failed.correctness_status(), CorrectnessStatus::Failed {
             max_abs_err: 1.5,
             cosine_sim: 0.5
         });
-        assert_eq!(failed.correctness_cell(), "✗ cos=0.500000 err=1.50e0");
+        assert_eq!(failed.correctness_cell(), "✗ 1.50e0 cos=0.500");
     }
 
     #[test]
@@ -757,6 +954,7 @@ mod tests {
     fn validation_reports_unchecked_rows() {
         let unchecked = OpResult {
             op: "sample",
+            subop: None,
             shape: "shape".into(),
             metric: "GB/s",
             ref_perf: Some(1.0),

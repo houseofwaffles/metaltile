@@ -26,6 +26,12 @@ pub struct GpuRunner {
     pub device_name: String,
     #[cfg(target_os = "macos")]
     inner: MacosRunner,
+    /// Pre-compiled kernel and scratch buffer for SLC cache-flush.
+    /// Writing 128 MB (> M4 Max's 64 MB SLC) evicts any cached benchmark data.
+    #[cfg(target_os = "macos")]
+    slc_kernel: CompiledKernel,
+    #[cfg(target_os = "macos")]
+    slc_buf: GpuBuffer,
 }
 
 pub struct CompiledKernel {
@@ -204,7 +210,7 @@ mod metal_impl {
                     cb.commit();
                     cb.waitUntilCompleted();
                     if pass >= warmup {
-                        let gpu_us = ((&*cb).GPUEndTime() - (&*cb).GPUStartTime()) * 1_000_000.0;
+                        let gpu_us = ((*cb).GPUEndTime() - (*cb).GPUStartTime()) * 1_000_000.0;
                         results.push(gpu_us);
                     }
                 }
@@ -223,8 +229,22 @@ impl GpuRunner {
     pub fn new() -> Result<Self, String> {
         #[cfg(target_os = "macos")]
         {
+            const SLC_FLUSH_MSL: &str = concat!(
+                "#include <metal_stdlib>\nusing namespace metal;\n",
+                "kernel void _mt_slc_flush(",
+                "device uint* buf [[buffer(0)]],",
+                "uint gid [[thread_position_in_grid]]",
+                ") { buf[gid] = gid; }"
+            );
+            const SLC_BYTES: usize = 128 * 1024 * 1024; // 128 MB > M4 Max 64 MB SLC
+
             let (name, inner) = MacosRunner::new()?;
-            return Ok(GpuRunner { device_name: name, inner });
+            let slc_pso = inner
+                .compile(SLC_FLUSH_MSL, "_mt_slc_flush")
+                .map_err(|e| format!("SLC flush compile: {e}"))?;
+            let slc_kernel = CompiledKernel { inner: slc_pso };
+            let slc_buf = GpuBuffer { size_bytes: SLC_BYTES, inner: inner.alloc_zeros(SLC_BYTES) };
+            Ok(GpuRunner { device_name: name, inner, slc_kernel, slc_buf })
         }
         #[cfg(not(target_os = "macos"))]
         Err("Metal not available on this platform".into())
@@ -233,7 +253,7 @@ impl GpuRunner {
     pub fn compile(&self, source: &str, fn_name: &str) -> Result<CompiledKernel, String> {
         #[cfg(target_os = "macos")]
         {
-            return Ok(CompiledKernel { inner: self.inner.compile(source, fn_name)? });
+            Ok(CompiledKernel { inner: self.inner.compile(source, fn_name)? })
         }
         #[cfg(not(target_os = "macos"))]
         Err("not macOS".into())
@@ -249,9 +269,9 @@ impl GpuRunner {
     ) -> Result<CompiledKernel, String> {
         #[cfg(target_os = "macos")]
         {
-            return Ok(CompiledKernel {
+            Ok(CompiledKernel {
                 inner: self.inner.compile_with_bool_constants(source, fn_name, bool_constants)?,
-            });
+            })
         }
         #[cfg(not(target_os = "macos"))]
         Err("not macOS".into())
@@ -296,7 +316,7 @@ impl GpuRunner {
     pub fn read_bytes(&self, buf: &GpuBuffer, n_bytes: usize) -> Vec<u8> {
         #[cfg(target_os = "macos")]
         {
-            return MacosRunner::read_bytes(&buf.inner, n_bytes);
+            MacosRunner::read_bytes(&buf.inner, n_bytes)
         }
         #[cfg(not(target_os = "macos"))]
         vec![0u8; n_bytes]
@@ -308,10 +328,7 @@ impl GpuRunner {
         #[cfg(target_os = "macos")]
         {
             let bytes = MacosRunner::read_bytes(&buf.inner, n * 4);
-            return bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
+            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
         }
         #[cfg(not(target_os = "macos"))]
         vec![0.0f32; n]
@@ -323,13 +340,13 @@ impl GpuRunner {
         #[cfg(target_os = "macos")]
         {
             let bytes = MacosRunner::read_bytes(&buf.inner, n * 2);
-            return bytes
+            bytes
                 .chunks_exact(2)
                 .map(|b| {
                     let bits = u16::from_le_bytes([b[0], b[1]]);
                     f32::from_bits((bits as u32) << 16)
                 })
-                .collect();
+                .collect()
         }
         #[cfg(not(target_os = "macos"))]
         vec![0.0f32; n]
@@ -340,10 +357,10 @@ impl GpuRunner {
         #[cfg(target_os = "macos")]
         {
             let bytes = MacosRunner::read_bytes(&buf.inner, n * 2);
-            return bytes
+            bytes
                 .chunks_exact(2)
                 .map(|b| f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
-                .collect();
+                .collect()
         }
         #[cfg(not(target_os = "macos"))]
         vec![0.0f32; n]
@@ -363,7 +380,7 @@ impl GpuRunner {
         #[cfg(target_os = "macos")]
         {
             let raw: Vec<&MacosBuffer> = buffers.iter().map(|b| &b.inner).collect();
-            return self.inner.measure(&kernel.inner, &raw, tgs, tpg, warmup, iters);
+            self.inner.measure(&kernel.inner, &raw, tgs, tpg, warmup, iters)
         }
         #[cfg(not(target_os = "macos"))]
         vec![0.0; iters]
@@ -381,12 +398,33 @@ impl GpuRunner {
         BenchStats::from_samples(self.measure(kernel, buffers, tgs, tpg, warmup, iters))
     }
 
+    /// Write 128 MB to a scratch buffer to evict the System Level Cache (SLC).
+    ///
+    /// Call this before each timed benchmark run so that both the reference and
+    /// MetalTile kernels start from the same cold-cache state, eliminating the
+    /// measurement noise that arises when the working set fits inside the SLC.
+    pub fn flush_slc(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            const N_ELEM: usize = 128 * 1024 * 1024 / 4; // 32 M uint32 elements
+            const TPG: usize = 256;
+            self.inner.measure(
+                &self.slc_kernel.inner,
+                &[&self.slc_buf.inner],
+                [N_ELEM / TPG, 1, 1],
+                [TPG, 1, 1],
+                0,
+                1,
+            );
+        }
+    }
+
     /// Returns true if the device supports simdgroup matrix operations (M3+ / Apple GPU family 9+).
     pub fn supports_simd_matrix(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
             use objc2_metal::{MTLDevice, MTLGPUFamily};
-            return self.inner.device.supportsFamily(MTLGPUFamily::Apple9);
+            self.inner.device.supportsFamily(MTLGPUFamily::Apple9)
         }
         #[cfg(not(target_os = "macos"))]
         false

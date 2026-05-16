@@ -34,7 +34,8 @@ use crate::{
     runner::{CompiledKernel, GpuBuffer, GpuRunner},
 };
 
-static SRC: &str = include_str!("../../../metal/steel/gemm/steel_gemm_segmented.metal");
+static SRC: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_segmented.metal"));
 
 const FN: &str = "steel_segmented_mm_nn_float16_float16_bm64_bn64_bk16_wm2_wn2";
 

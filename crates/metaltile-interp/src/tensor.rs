@@ -81,6 +81,23 @@ impl TensorData {
         self.data[offset..offset + 2].copy_from_slice(&f16_val.to_le_bytes());
     }
 
+    /// Read a single bf16 element (as f32).
+    pub fn read_bf16(&self, index: usize) -> f32 {
+        assert_eq!(self.dtype, DType::BF16);
+        let offset = index * 2;
+        let bits = u16::from_le_bytes(self.data[offset..offset + 2].try_into().unwrap());
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    /// Write a single bf16 element (from f32, round-to-nearest-even).
+    pub fn write_bf16(&mut self, index: usize, value: f32) {
+        assert_eq!(self.dtype, DType::BF16);
+        let x = value.to_bits();
+        let bits = ((x + 0x7FFF + ((x >> 16) & 1)) >> 16) as u16;
+        let offset = index * 2;
+        self.data[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+    }
+
     /// Read a single i32 element.
     pub fn read_i32(&self, index: usize) -> i32 {
         assert_eq!(self.dtype, DType::I32);
@@ -101,6 +118,7 @@ impl TensorData {
         match self.dtype {
             DType::F32 => self.read_f32(index) as f64,
             DType::F16 => self.read_f16(index) as f64,
+            DType::BF16 => self.read_bf16(index) as f64,
             DType::I32 => self.read_i32(index) as f64,
             other => panic!("read_scalar not implemented for {other:?}"),
         }
@@ -111,6 +129,7 @@ impl TensorData {
         match self.dtype {
             DType::F32 => self.write_f32(index, value as f32),
             DType::F16 => self.write_f16(index, value as f32),
+            DType::BF16 => self.write_bf16(index, value as f32),
             DType::I32 => self.write_i32(index, value as i32),
             other => panic!("write_scalar not implemented for {other:?}"),
         }

@@ -40,7 +40,8 @@ use crate::{
     runner::{CompiledKernel, GpuBuffer, GpuRunner},
 };
 
-static SRC: &str = include_str!("../../../metal/steel/gemm/steel_gemm_fused.metal");
+static SRC: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_fused.metal"));
 const FN: &str = "steel_gemm_fused_nn_float16_float16_bm64_bn64_bk16_wm2_wn2";
 
 const BM: usize = 64;
@@ -48,7 +49,7 @@ const BN: usize = 64;
 const BK: usize = 16;
 
 const SHAPES: &[(usize, usize, usize)] = &[(1_024, 1_024, 1_024), (4_096, 4_096, 4_096)];
-const BENCH: OpBench = OpBench::new("matmul_fp16", "GFLOPS");
+const BENCH: OpBench = OpBench::new("matmul", "GFLOPS");
 const MATMUL_TOLERANCE: EquivTolerance = EquivTolerance::new(1.0, 0.999);
 
 /// Replace [[function_constant(N)]] declarations with compile-time constants
@@ -228,7 +229,7 @@ pub fn bench_matmul_fp16(runner: &GpuRunner) -> Vec<OpResult> {
     SHAPES
         .iter()
         .map(|&(m, n, k)| {
-            let shape = format!("{m}×{n}×{k}");
+            let shape = format!("{m}×{n}×{k} f16");
             let a = runner.buffer_f16(&patterned_f16(m * k, 1));
             let b = runner.buffer_f16(&patterned_f16(k * n, 7));
             let params = runner.buffer_bytes(&params_bytes(m, n, k));

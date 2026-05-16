@@ -2,6 +2,9 @@
 target/
 Cargo.lock
 
+# Cached vendored sources (fetched at build time by build.rs)
+.cache/
+
 # Benchmarks
 criterion/
 outputs/

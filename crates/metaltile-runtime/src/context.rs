@@ -391,7 +391,7 @@ impl Context {
 
         let queue = dev.newCommandQueue().ok_or(MetalTileError::NoDevice)?;
         let cb = queue.commandBuffer().ok_or(MetalTileError::NoDevice)?;
-        let enc = (&*cb).computeCommandEncoder().ok_or(MetalTileError::NoDevice)?;
+        let enc = (*cb).computeCommandEncoder().ok_or(MetalTileError::NoDevice)?;
         enc.setComputePipelineState(&pipe);
         for (i, buf) in metal_bufs.iter().enumerate() {
             unsafe { enc.setBuffer_offset_atIndex(Some(buf), 0, i) };
@@ -411,7 +411,7 @@ impl Context {
             },
             KernelMode::Grid3D => {
                 // Flat 3-D dispatch: treat total as width, H=D=1.
-                let groups = (n_threads + tpg_w - 1) / tpg_w;
+                let groups = n_threads.div_ceil(tpg_w);
                 (MTLSize { width: groups, height: 1, depth: 1 }, MTLSize {
                     width: tpg_w,
                     height: 1,
@@ -421,7 +421,7 @@ impl Context {
             KernelMode::Tile2D => {
                 // Square threadgroup tile; total threads is the flat count.
                 let tpg_dim = (tpg_w as f64).sqrt() as usize;
-                let groups = (n_threads + tpg_dim * tpg_dim - 1) / (tpg_dim * tpg_dim);
+                let groups = n_threads.div_ceil(tpg_dim * tpg_dim);
                 (MTLSize { width: groups, height: 1, depth: 1 }, MTLSize {
                     width: tpg_dim,
                     height: tpg_dim,
@@ -429,7 +429,7 @@ impl Context {
                 })
             },
             KernelMode::Elementwise => {
-                let groups = (n_threads + tpg_w - 1) / tpg_w;
+                let groups = n_threads.div_ceil(tpg_w);
                 (MTLSize { width: groups, height: 1, depth: 1 }, MTLSize {
                     width: tpg_w,
                     height: 1,
@@ -438,27 +438,28 @@ impl Context {
             },
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(tgs, tpg);
-        (&*enc).endEncoding();
-        (&*cb).commit();
-        (&*cb).waitUntilCompleted();
+        (*enc).endEncoding();
+        (*cb).commit();
+        (*cb).waitUntilCompleted();
 
         // Read back output buffers.
         let mut outputs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (param, binding) in kernel.params.iter().zip(&binding_plans) {
-            if param.is_output && binding.data_len > 0 {
-                if let Some(buf) = metal_bufs.get(binding.data_binding_index) {
-                    use objc2_metal::MTLBuffer;
-                    let ptr = buf.contents();
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(ptr.as_ptr() as *const u8, binding.data_len)
-                    }
-                    .to_vec();
-                    outputs.insert(param.name.clone(), bytes);
+            if param.is_output
+                && binding.data_len > 0
+                && let Some(buf) = metal_bufs.get(binding.data_binding_index)
+            {
+                use objc2_metal::MTLBuffer;
+                let ptr = buf.contents();
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(ptr.as_ptr() as *const u8, binding.data_len)
                 }
+                .to_vec();
+                outputs.insert(param.name.clone(), bytes);
             }
         }
 
-        let elapsed_us = ((&*cb).GPUEndTime() - (&*cb).GPUStartTime()) * 1_000_000.0;
+        let elapsed_us = ((*cb).GPUEndTime() - (*cb).GPUStartTime()) * 1_000_000.0;
         Ok(DispatchResult { elapsed_us, gflops: 0.0, outputs })
     }
 

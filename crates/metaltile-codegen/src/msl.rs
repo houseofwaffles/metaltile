@@ -454,6 +454,25 @@ impl MslGenerator {
         let has_tile = matches!(kernel.mode, KernelMode::Tile2D);
         let pad = "    ".repeat(indent);
 
+        // Deduplicate variable names within this block.
+        // The body_parser inlines `{ }` sub-blocks, so the same human-readable name
+        // (e.g. "ov") can appear multiple times with different ValueIds.  MSL/C++ does
+        // not allow re-declarations in the same scope, so suffix duplicates: _2, _3, …
+        let mut dedup_extra = extra_names.clone();
+        {
+            use std::collections::BTreeMap as Map;
+            let mut name_counts: Map<String, u32> = Map::new();
+            for (vid, raw_name) in &block.names {
+                let base = format!("v_{raw_name}");
+                let count = name_counts.entry(base.clone()).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    dedup_extra.insert(*vid, format!("{base}_{count}"));
+                }
+            }
+        }
+        let extra_names = &dedup_extra;
+
         if self.config.debug_comments {
             // Emit a comment per op if debug mode is on.
             // We'll emit inline comments alongside the ops below.
@@ -1443,8 +1462,8 @@ impl MslGenerator {
             && axis == 0;
         if use_threadgroup {
             let tg_name = format!("{result_var}_sg");
-            // 256 threads / 32 per SIMD = 8 SIMD groups max.
-            hoists.push(format!("threadgroup float {tg_name}[8];"));
+            // 1024 threads / 32 per SIMD = 32 SIMD groups max.
+            hoists.push(format!("threadgroup float {tg_name}[32];"));
 
             let (simd_fn, pad_val) = match kind {
                 ReduceKind::Sum | ReduceKind::Mean => ("simd_sum", "0.0f"),

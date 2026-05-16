@@ -6,6 +6,7 @@
 
 use crate::{ops::OpResult, runner::GpuRunner};
 
-static _SRC: &str = include_str!("../../../metal/steel/gemm/steel_gemm_splitk_nax.metal");
+static _SRC: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_splitk_nax.metal"));
 
 pub fn bench_matmul_splitk_nax(_runner: &GpuRunner) -> Vec<OpResult> { vec![] }

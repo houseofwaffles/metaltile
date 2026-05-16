@@ -73,6 +73,7 @@ pub struct DslBodyParser {
 
 impl DslBodyParser {
     /// Parse a function body and return token streams for IR construction.
+    #[allow(dead_code)]
     pub fn parse(body: &Block, param_names: &[String], constexpr_names: &[String]) -> TokenStream {
         Self::parse_with_type_vars(body, param_names, constexpr_names, &Default::default())
     }
@@ -273,7 +274,7 @@ impl DslBodyParser {
         // Redirect IR emission to the loop body block.
         let prev_target =
             std::mem::replace(&mut self.current_target, format!("block_{loop_body_bid}"));
-        let prev_stmts = std::mem::replace(&mut self.ir_stmts, Vec::new());
+        let prev_stmts = std::mem::take(&mut self.ir_stmts);
 
         for stmt in &for_loop.body.stmts {
             self.parse_stmt(stmt);
@@ -306,7 +307,7 @@ impl DslBodyParser {
 
         // Collect then-block IR.
         let prev_target = std::mem::replace(&mut self.current_target, format!("block_{then_bid}"));
-        let prev_stmts = std::mem::replace(&mut self.ir_stmts, Vec::new());
+        let prev_stmts = std::mem::take(&mut self.ir_stmts);
         let prev_bindings = self.bindings.clone();
         for stmt in &if_expr.then_branch.stmts {
             self.parse_stmt(stmt);
@@ -320,7 +321,7 @@ impl DslBodyParser {
             let else_bid = self.alloc_bid();
             let prev_target =
                 std::mem::replace(&mut self.current_target, format!("block_{else_bid}"));
-            let prev_stmts = std::mem::replace(&mut self.ir_stmts, Vec::new());
+            let prev_stmts = std::mem::take(&mut self.ir_stmts);
             let prev_bindings = self.bindings.clone();
             match else_expr.as_ref() {
                 Expr::Block(else_block) =>
@@ -547,7 +548,7 @@ impl DslBodyParser {
         if args.is_empty() {
             return self.alloc_vid();
         }
-        let (src_name, idx_tokens) = self.parse_tensor_index(&args[0]);
+        let (src_name, idx_tokens) = self.parse_tensor_index(args[0]);
         let result = self.alloc_vid();
         self.push_op(
             quote! {
@@ -568,8 +569,8 @@ impl DslBodyParser {
         if args.len() < 2 {
             return 0;
         }
-        let (dst_name, idx_tokens) = self.parse_tensor_index(&args[0]);
-        let value_vid = self.parse_expr(&args[1]);
+        let (dst_name, idx_tokens) = self.parse_tensor_index(args[0]);
+        let value_vid = self.parse_expr(args[1]);
         self.push_op_no_result(quote! {
             Op::Store {
                 dst: #dst_name.to_string(),
@@ -722,22 +723,22 @@ impl DslBodyParser {
         if args.len() < 4 {
             return self.alloc_vid();
         }
-        let src_name = expr_to_path_string(&args[0]);
+        let src_name = expr_to_path_string(args[0]);
         if src_name.is_empty() {
             return self.alloc_vid();
         }
         // 4-arg: (src, offset, end, op)   — implicit stride
         // 5-arg: (src, offset, stride, end, op)
         let (offset, stride, end, op_name) = if args.len() >= 5 {
-            let off = self.parse_expr(&args[1]);
-            let st = self.parse_expr(&args[2]);
-            let en = self.parse_expr(&args[3]);
-            let op = expr_to_path_string(&args[4]);
+            let off = self.parse_expr(args[1]);
+            let st = self.parse_expr(args[2]);
+            let en = self.parse_expr(args[3]);
+            let op = expr_to_path_string(args[4]);
             (off, st, en, op)
         } else {
-            let off = self.parse_expr(&args[1]);
-            let en = self.parse_expr(&args[2]);
-            let op = expr_to_path_string(&args[3]);
+            let off = self.parse_expr(args[1]);
+            let en = self.parse_expr(args[2]);
+            let op = expr_to_path_string(args[3]);
             (off, 0u32, en, op) // stride=0 → ignored in Reduction mode / resolves to 1 on CPU
         };
         let op = match op_name.as_str() {
@@ -772,22 +773,22 @@ impl DslBodyParser {
         if args.len() < 4 {
             return self.alloc_vid();
         }
-        let src_name = expr_to_path_string(&args[0]);
+        let src_name = expr_to_path_string(args[0]);
         if src_name.is_empty() {
             return self.alloc_vid();
         }
         // 4-arg: (src, offset, end, sub_val)   5-arg: (src, offset, stride, end, sub_val)
         let (offset, stride, end, sub_val) = if args.len() >= 5 {
             (
-                self.parse_expr(&args[1]),
-                self.parse_expr(&args[2]),
-                self.parse_expr(&args[3]),
-                self.parse_expr(&args[4]),
+                self.parse_expr(args[1]),
+                self.parse_expr(args[2]),
+                self.parse_expr(args[3]),
+                self.parse_expr(args[4]),
             )
         } else {
-            let off = self.parse_expr(&args[1]);
-            let en = self.parse_expr(&args[2]);
-            let sv = self.parse_expr(&args[3]);
+            let off = self.parse_expr(args[1]);
+            let en = self.parse_expr(args[2]);
+            let sv = self.parse_expr(args[3]);
             (off, 0u32, en, sv)
         };
         let result = self.alloc_vid();
@@ -826,14 +827,14 @@ impl DslBodyParser {
         if args.len() < 5 {
             return self.alloc_vid();
         }
-        let src_a = expr_to_path_string(&args[0]);
-        let src_b = expr_to_path_string(&args[1]);
+        let src_a = expr_to_path_string(args[0]);
+        let src_b = expr_to_path_string(args[1]);
         if src_a.is_empty() || src_b.is_empty() {
             return self.alloc_vid();
         }
-        let offset = self.parse_expr(&args[2]);
-        let base = self.parse_expr(&args[3]);
-        let end = self.parse_expr(&args[4]);
+        let offset = self.parse_expr(args[2]);
+        let base = self.parse_expr(args[3]);
+        let end = self.parse_expr(args[4]);
         let result = self.alloc_vid();
         self.push_op(
             quote! {
@@ -860,16 +861,16 @@ impl DslBodyParser {
         if args.len() < 5 {
             return 0;
         }
-        let src_name = expr_to_path_string(&args[0]);
-        let dst_name = expr_to_path_string(&args[1]);
+        let src_name = expr_to_path_string(args[0]);
+        let dst_name = expr_to_path_string(args[1]);
         if src_name.is_empty() || dst_name.is_empty() {
             return 0;
         }
-        let offset = self.parse_expr(&args[2]);
-        let end = self.parse_expr(&args[3]);
-        let scalar = self.parse_expr(&args[4]);
+        let offset = self.parse_expr(args[2]);
+        let end = self.parse_expr(args[3]);
+        let scalar = self.parse_expr(args[4]);
         let aux_src_tokens = if args.len() >= 6 {
-            let aux_name = expr_to_path_string(&args[5]);
+            let aux_name = expr_to_path_string(args[5]);
             quote! { Some(#aux_name.to_string()) }
         } else {
             quote! { None }
@@ -894,13 +895,13 @@ impl DslBodyParser {
         if args.len() < 4 {
             return 0;
         }
-        let src_name = expr_to_path_string(&args[0]);
-        let dst_name = expr_to_path_string(&args[1]);
+        let src_name = expr_to_path_string(args[0]);
+        let dst_name = expr_to_path_string(args[1]);
         if src_name.is_empty() || dst_name.is_empty() {
             return 0;
         }
-        let offset = self.parse_expr(&args[2]);
-        let end = self.parse_expr(&args[3]);
+        let offset = self.parse_expr(args[2]);
+        let end = self.parse_expr(args[3]);
         self.push_op_no_result(quote! {
             Op::StrideScan {
                 src: #src_name.to_string(),
@@ -920,12 +921,12 @@ impl DslBodyParser {
         if args.len() < 3 {
             return self.alloc_vid();
         }
-        let src_name = expr_to_path_string(&args[0]);
+        let src_name = expr_to_path_string(args[0]);
         if src_name.is_empty() {
             return self.alloc_vid();
         }
-        let offset = self.parse_expr(&args[1]);
-        let end = self.parse_expr(&args[2]);
+        let offset = self.parse_expr(args[1]);
+        let end = self.parse_expr(args[2]);
         let op = match op_str {
             "Max" => quote! { ReduceKind::Max },
             _ => quote! { ReduceKind::Min },
@@ -1164,9 +1165,9 @@ impl DslBodyParser {
         if args.len() < 3 {
             return self.alloc_vid();
         }
-        let cond = self.parse_expr(&args[0]);
-        let on_true = self.parse_expr(&args[1]);
-        let on_false = self.parse_expr(&args[2]);
+        let cond = self.parse_expr(args[0]);
+        let on_true = self.parse_expr(args[1]);
+        let on_false = self.parse_expr(args[2]);
         let result = self.alloc_vid();
         self.push_op(
             quote! {
@@ -1304,19 +1305,17 @@ fn extract_turbofish_axis(expr: &Expr) -> Option<u32> {
         for seg in &path.path.segments {
             if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
                 for arg in &args.args {
-                    if let syn::GenericArgument::Type(syn::Type::Path(tp)) = arg {
-                        if let Some(last) = tp.path.segments.last() {
-                            if let Ok(n) = last.ident.to_string().parse::<u32>() {
-                                return Some(n);
-                            }
-                        }
+                    if let syn::GenericArgument::Type(syn::Type::Path(tp)) = arg
+                        && let Some(last) = tp.path.segments.last()
+                        && let Ok(n) = last.ident.to_string().parse::<u32>()
+                    {
+                        return Some(n);
                     }
-                    if let syn::GenericArgument::Const(syn::Expr::Lit(lit)) = arg {
-                        if let syn::Lit::Int(n) = &lit.lit {
-                            if let Ok(val) = n.base10_parse::<u32>() {
-                                return Some(val);
-                            }
-                        }
+                    if let syn::GenericArgument::Const(syn::Expr::Lit(lit)) = arg
+                        && let syn::Lit::Int(n) = &lit.lit
+                        && let Ok(val) = n.base10_parse::<u32>()
+                    {
+                        return Some(val);
                     }
                 }
             }
@@ -1330,10 +1329,10 @@ fn extract_turbofish_name(expr: &Expr) -> Option<String> {
         for seg in &path.path.segments {
             if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
                 for arg in &args.args {
-                    if let syn::GenericArgument::Type(syn::Type::Path(tp)) = arg {
-                        if let Some(last) = tp.path.segments.last() {
-                            return Some(last.ident.to_string());
-                        }
+                    if let syn::GenericArgument::Type(syn::Type::Path(tp)) = arg
+                        && let Some(last) = tp.path.segments.last()
+                    {
+                        return Some(last.ident.to_string());
                     }
                     if let syn::GenericArgument::Const(syn::Expr::Lit(lit)) = arg {
                         return Some(format!("{}", quote! { #lit }));
@@ -1359,10 +1358,10 @@ fn dtype_tokens_for_name(name: &str) -> proc_macro2::TokenStream {
 
 /// Extract a string literal from an expression like `"my_name"`.
 fn string_lit_from_expr(expr: &Expr) -> String {
-    if let Expr::Lit(lit) = expr {
-        if let syn::Lit::Str(s) = &lit.lit {
-            return s.value();
-        }
+    if let Expr::Lit(lit) = expr
+        && let syn::Lit::Str(s) = &lit.lit
+    {
+        return s.value();
     }
     String::new()
 }
@@ -1370,10 +1369,10 @@ fn string_lit_from_expr(expr: &Expr) -> String {
 /// Extract a usize literal from an optional expression like `9`.
 fn usize_lit_from_expr(expr: Option<&Expr>) -> usize {
     let Some(expr) = expr else { return 0 };
-    if let Expr::Lit(lit) = expr {
-        if let syn::Lit::Int(n) = &lit.lit {
-            return n.base10_parse::<usize>().unwrap_or(0);
-        }
+    if let Expr::Lit(lit) = expr
+        && let syn::Lit::Int(n) = &lit.lit
+    {
+        return n.base10_parse::<usize>().unwrap_or(0);
     }
     0
 }

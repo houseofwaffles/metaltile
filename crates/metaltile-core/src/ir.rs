@@ -154,7 +154,10 @@ impl UnaryOpKind {
             UnaryOpKind::Exp2 => format!("exp2({arg})"),
             UnaryOpKind::Log2 => format!("log2({arg})"),
             UnaryOpKind::Sign => format!("sign({arg})"),
-            UnaryOpKind::Round => format!("round({arg})"),
+            // rint() maps to the hardware RINT instruction (round-to-even, IEEE 754 default).
+            // round() requires software emulation for half-away-from-zero on bfloat, making it
+            // ~2× slower. MLX also uses rint() for its Round op (see unary.metal).
+            UnaryOpKind::Round => format!("rint({arg})"),
             UnaryOpKind::Trunc => format!("trunc({arg})"),
         }
     }

@@ -14,6 +14,6 @@
 
 use crate::{ops::OpResult, runner::GpuRunner};
 
-static _SRC: &str = include_str!("../metal/fence.metal");
+static _SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/metal/fence.metal"));
 
 pub fn bench_fence(_runner: &GpuRunner) -> Vec<OpResult> { vec![] }

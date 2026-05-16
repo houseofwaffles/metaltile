@@ -10,6 +10,6 @@
 
 use crate::{ops::OpResult, runner::GpuRunner};
 
-static _SRC: &str = include_str!("../metal/quantized_nax.metal");
+static _SRC: &str = include_str!(concat!(env!("OUT_DIR"), "/metal/quantized_nax.metal"));
 
 pub fn bench_quantized_nax(_runner: &GpuRunner) -> Vec<OpResult> { vec![] }

@@ -121,12 +121,12 @@ use metaltile_codegen::msl::MslGenerator;
 
 use crate::{
     ops::{
-        DType, FLOAT_DTYPES, OpBench, OpResult,
+        DType, DtypeCtx, OpBench, OpResult,
+        bench_all_dtypes,
         buffer_typed, zeros_typed, run_typed_once,
         check_equiv, quantize_roundtrip,
-        dtype_tol,        // elementwise ops
-        // dtype_tol_reduce, // reductions — use this instead for reduce/norm/softmax
-        dtype_label, elem_bytes, mlx_tname, to_gbps,
+        bench_gbps,
+        KernelSpec, RefSpec, FLOAT_DTYPE_STRS,
     },
     runner::GpuRunner,
 };
@@ -136,7 +136,7 @@ static SRC: &str = include_str!("../metal/<op>.metal");
 
 const BENCH: OpBench = OpBench::new("<op_name>", "GB/s");
 // For 1-D flat ops:
-const SHAPES: &[usize] = &[64 * 1024 * 1024];
+pub const N_ELEM: usize = 64 * 1024 * 1024;
 // For row-parallel ops (B rows × N cols):
 // const SHAPES: &[(usize, usize)] = &[(1_024, 4_096)];
 const N_CHECK: usize = 2_048;   // correctness only; keep small (256–4096)
@@ -165,83 +165,68 @@ fn <op>_msl_for(dt: DType) -> String {
 // ── Bench ─────────────────────────────────────────────────────────────────────
 
 pub fn bench_<op>(runner: &GpuRunner) -> Vec<OpResult> {
-    FLOAT_DTYPES.iter().flat_map(|&dt| bench_for(runner, dt)).collect()
+    bench_all_dtypes(runner, bench_<op>_for)
 }
 
-fn bench_for(runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
-    let tn     = mlx_tname(dt);
-    let dlabel = dtype_label(dt);
-    let eb     = elem_bytes(dt);
-    let tol    = dtype_tol(dt); // or dtype_tol_reduce(dt)
+fn bench_<op>_for(runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
+    let ctx = DtypeCtx::elementwise(dt); // or DtypeCtx::reduce(dt) for reductions
+    let (tn, dlabel, eb, tol) = (ctx.tn, ctx.label, ctx.eb, ctx.tol);
 
     let msl = <op>_msl_for(dt);
-    let mk  = runner.compile(&msl, "mt_<op>").ok();
+    let Some(mk) = runner.compile(&msl, "mt_<op>").ok() else { return vec![]; };
 
     // Some MLX kernels require bool function constants.  When they do:
     //   let rk = runner.compile_with_bool_constants(SRC, &format!("...{tn}"),
     //                &[(SLOT, true), ...]).ok();
     // Otherwise:
-    let rk  = runner.compile(SRC, &format!("<mlx_kernel_name_{}>", tn)).ok();
+    let rk = runner.compile(SRC, &format!("<mlx_kernel_name_{}>", tn)).ok();
 
     // ── Correctness (compare MT vs CPU reference or MT vs MLX reference) ──────
     //
-    // RULE: every op that produces an `BENCH.implemented` result MUST have a
-    // correctness check.  OpBench panics if equiv is not provided.
+    // RULE: every BENCH.result call with Some(equiv) requires a real check.
+    // Pass None only when the op is NYI (mk compile failed) — but then do not
+    // call bench_gbps for mt_perf either.
     //
     // Strategy A — MT vs CPU (preferred for simple elementwise/reduction ops):
-    let equiv: Option<crate::ops::EquivResult> = mk.as_ref().map(|mk| {
-        let a_f32: Vec<f32> = (0..N_CHECK).map(|i| i as f32 * 0.001).collect();
-        let a_q   = quantize_roundtrip(&a_f32, dt);
-        let cpu_ref: Vec<f32> = a_q.iter().map(|&x| /* scalar op on x */ x).collect();
-        let a_buf   = buffer_typed(runner, &a_f32, dt);
-        let out_buf = zeros_typed(runner, N_CHECK, dt);
-        let ns      = runner.buffer_u32(N_CHECK as u32);
-        let mt_vals = run_typed_once(runner, mk, &[&a_buf, &out_buf, &ns],
-                                     &out_buf, N_CHECK,
-                                     [N_CHECK.div_ceil(TPG), 1, 1], [TPG, 1, 1], dt);
-        check_equiv(&cpu_ref, &mt_vals, tol)
-    });
+    let a_f32: Vec<f32> = (0..N_CHECK).map(|i| i as f32 * 0.001).collect();
+    let a_q   = quantize_roundtrip(&a_f32, dt);
+    let cpu_ref: Vec<f32> = a_q.iter().map(|&x| /* scalar op on x */ x).collect();
+    let a_buf   = buffer_typed(runner, &a_f32, dt);
+    let out_buf = zeros_typed(runner, N_CHECK, dt);
+    let ns      = runner.buffer_u32(N_CHECK as u32);
+    let mt_vals = run_typed_once(runner, &mk, &[&a_buf, &out_buf, &ns],
+                                 &out_buf, N_CHECK,
+                                 [N_CHECK.div_ceil(TPG), 1, 1], [TPG, 1, 1], dt);
+    let equiv = check_equiv(&cpu_ref, &mt_vals, tol);
     //
     // Strategy B — MT vs MLX reference (when CPU oracle is complex or fp-order-sensitive):
-    // let equiv = mk.as_ref().and_then(|mk| rk.as_ref().map(|rk| {
-    //     /* run both on same input, check_equiv their outputs */
-    // }));
+    // Run rk on the same input, compare outputs with check_equiv.
 
     // ── Performance ──────────────────────────────────────────────────────────
-    let mut results = Vec::new();
-    for &n in SHAPES {
-        // bytes = actual memory traffic per kernel invocation.
-        // Elementwise read+write: n * eb * 2
-        // Read-only (e.g. argmax):  n * eb
-        // Two inputs + one output:  n * eb * 3
-        let bytes = (n * eb * 2) as f64;
+    // bytes = actual memory traffic per kernel invocation.
+    // Elementwise read+write: N_ELEM * eb * 2
+    // Two inputs + one output: N_ELEM * eb * 3
+    let bytes = (N_ELEM * eb * 2) as f64;
+    let tgs = [N_ELEM.div_ceil(TPG), 1, 1];
+    let tpg = [TPG, 1, 1];
 
-        let a_perf = buffer_typed(runner, &vec![1.0f32; n], dt);
+    let a_perf = buffer_typed(runner, &vec![1.0f32; N_ELEM], dt);
 
-        // Reference perf — dispatch must exactly match the MLX kernel's expected grid.
-        let ref_perf = rk.as_ref().and_then(|rk| {
-            let out = zeros_typed(runner, n, dt);
-            let ns  = runner.buffer_u32(n as u32);
-            to_gbps(&runner.bench(rk, &[&a_perf, &out, &ns],
-                                  [n.div_ceil(TPG), 1, 1], [TPG, 1, 1], 3, 10), bytes)
-        });
+    // Reference perf — dispatch must exactly match the MLX kernel's expected grid.
+    let ref_perf = rk.as_ref().and_then(|rk| {
+        let out = zeros_typed(runner, N_ELEM, dt);
+        let ns  = runner.buffer_u32(N_ELEM as u32);
+        bench_gbps(runner, rk, &[&a_perf, &out, &ns], tgs, tpg, bytes)
+    });
 
-        // MT perf
-        let mt_perf = mk.as_ref().and_then(|mk| {
-            let out = zeros_typed(runner, n, dt);
-            let ns  = runner.buffer_u32(n as u32);
-            to_gbps(&runner.bench(mk, &[&a_perf, &out, &ns],
-                                  [n.div_ceil(TPG), 1, 1], [TPG, 1, 1], 3, 10), bytes)
-        });
+    // MT perf
+    let mt_out = zeros_typed(runner, N_ELEM, dt);
+    let ns_perf = runner.buffer_u32(N_ELEM as u32);
+    let mt_perf = bench_gbps(runner, &mk, &[&a_perf, &mt_out, &ns_perf], tgs, tpg, bytes);
 
-        let shape = format!("N={n} {dlabel}");
-        // For row-parallel ops: format!("B={b} N={n} {dlabel}")
-        results.push(match mt_perf {
-            Some(p) => BENCH.implemented(shape, ref_perf, p, equiv.clone().unwrap()),
-            None    => BENCH.nyi(shape, ref_perf),
-        });
-    }
-    results
+    let shape = format!("N={N_ELEM} {dlabel}");
+    // For row-parallel ops: format!("B={b} N={n} {op_name} {dlabel}")
+    vec![BENCH.result(shape, ref_perf, mt_perf, Some(equiv))]
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -249,6 +234,7 @@ fn bench_for(runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::FLOAT_DTYPES;
 
     #[test]
     fn msl_generates_for_all_dtypes() {
@@ -267,6 +253,20 @@ mod tests {
             runner.compile(&msl, "mt_<op>").unwrap();
         }
     }
+}
+
+use crate::ops::{KernelSpec, RefSpec, FLOAT_DTYPE_STRS};
+
+pub fn kernel_specs() -> Vec<KernelSpec> {
+    vec![KernelSpec {
+        op: "<op_name>",
+        mt_kernel: "mt_<op>".into(),
+        metal_file: "<op>.metal",
+        ref_spec: RefSpec::Format("<mlx_kernel_name_{tn}>"),
+        // or: RefSpec::Literal("exact_kernel_name")
+        // or: RefSpec::None("reason it has no standalone MLX kernel")
+        dtypes: FLOAT_DTYPE_STRS,
+    }]
 }
 ```
 
@@ -364,15 +364,16 @@ pub fn mt_<op><T>(a: Tensor<T>, out: Tensor<T>, ...) { ... }
   project is to express every kernel in the `#[kernel]` DSL and measure the
   generated MSL against MLX's existing metal references.  If the DSL cannot yet
   express a required pattern, the op is NYI — fix the DSL or codegen instead.
-- **Never call `BENCH.implemented` without a correctness check.**
+- **Never call `BENCH.result(..., Some(equiv))` without a real correctness check.**
 - **Never guess an MLX function name** — always grep the metal file.
 
 ---
 
 ## Correctness rules
 
-- **Every `BENCH.implemented` row requires a correctness check.**  `OpBench`
-  panics if the `equiv` argument is not provided.  There are no exceptions.
+- **Every `BENCH.result(..., Some(equiv))` call requires a real correctness check.**
+  Do not pass `None` for an implemented kernel.  `EquivResult` is `Copy`; no
+  `.clone()` is needed when reusing it across multiple result rows.
 - Run correctness on `N_CHECK` elements (256–4096), perf on full `SHAPES` size.
 - Use `quantize_roundtrip` so the CPU reference operates on the same representable
   values the GPU receives after dtype conversion.
@@ -398,11 +399,14 @@ pub fn mt_<op><T>(a: Tensor<T>, out: Tensor<T>, ...) { ... }
   | read only (e.g. argmax) | `n * eb` |
   | row-parallel (B rows) | `b * n * eb * 2` |
 
-- The reference `runner.bench` dispatch (`grid`, `tpg`) must exactly match what
-  the MLX metal file expects for that kernel — read the metal file to confirm.
+- The reference dispatch (`grid`, `tpg`) passed to `bench_gbps` must exactly
+  match what the MLX metal file expects for that kernel — read the metal file
+  to confirm.
 - MT dispatch must match the `KernelMode` used during MSL generation; mismatching
   these silently produces wrong results.
-- Warmup=3, iterations=10 is the standard (`runner.bench(..., 3, 10)`).
+- Use `bench_gbps(runner, kernel, buffers, grid, tpg, bytes) -> Option<f64>` — it
+  handles warmup (3 runs) and measurement (10 runs) internally and returns
+  `Some(gb_per_sec)` or `None` if the kernel fails to dispatch.
 
 ---
 
@@ -419,16 +423,22 @@ pub fn mt_<op><T>(a: Tensor<T>, out: Tensor<T>, ...) { ... }
 
 ## Existing violations — technical debt, not patterns to follow
 
-`softmax.rs`, `scan.rs`, and `arg_reduce.rs` contain hand-written inline MSL
-constants (`ONLINE_SOFTMAX_MSL`, `PARALLEL_MSL`).  These are **technical debt**
-that predates this rule.  They are not examples to copy.  When the DSL gains the
-required primitives (e.g. `simd_shuffle_down`, two-phase scan), these files must
-be converted to pure DSL kernels.
+`scan.rs` and `arg_reduce.rs` contain hand-written inline MSL constants
+(`PARALLEL_MSL`).  These are **technical debt** that predates this rule.  They
+are not examples to copy.  When the DSL gains the required primitives
+(e.g. `simd_shuffle_down`, two-phase scan), these files must be converted to
+pure DSL kernels.
 
 ---
 
 ## Registration
 
 1. Add `pub mod <op>;` to `src/ops/mod.rs`.
-2. Add `pub use <op>::bench_<op>;` to `src/ops/mod.rs`.
-3. Call `bench_<op>(runner)` in `src/main.rs` bench dispatch.
+2. Add `pub use <op>::{bench_<op>, kernel_specs as <op>_kernel_specs};` to the
+   re-exports in `src/ops/mod.rs`, and add `<op>::kernel_specs()` to the
+   `all_kernel_specs()` collector in the same file.
+3. Add `extend_if_selected(&mut all, &runner, &filter, bench_<op>);` to
+   `src/bench_suite.rs`.  No label string is needed — filtering uses
+   `result.op()` which comes from `OpBench::new("<op_name>", ...)`.
+4. Implement `pub fn kernel_specs() -> Vec<KernelSpec>` in your op module
+   (see template above).  This is required for `kernel_table` coverage reporting.
