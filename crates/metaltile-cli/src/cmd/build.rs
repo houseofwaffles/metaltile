@@ -13,6 +13,7 @@ use metaltile_std::{bench_types::DType, spec::BenchSpec};
 
 use crate::{
     flag_val,
+    kernel_utils::{dtype_label, first_mode},
     matches_filter,
     term::{Color, Style, paint_stderr, paint_stdout},
 };
@@ -63,7 +64,7 @@ pub fn run(args: &[String]) {
         };
 
         // Determine the kernel mode from dispatch.
-        let mode = first_mode(spec, dtypes);
+        let mode = first_mode(spec);
 
         let mut dtypes_ok = Vec::new();
         let mut dtypes_err = Vec::new();
@@ -138,30 +139,5 @@ pub fn run(args: &[String]) {
         std::process::exit(1);
     } else {
         eprintln!("  {}", paint_stdout(format!("{ok} ok"), Style::new().fg(Color::Green).bold()),);
-    }
-}
-
-fn first_mode(spec: &BenchSpec, _dtypes: &[DType]) -> KernelMode {
-    match &spec.dispatch {
-        metaltile_std::spec::BenchDispatch::Generic =>
-            spec.shapes.first().map(|s| s.mode).unwrap_or(KernelMode::Elementwise),
-        metaltile_std::spec::BenchDispatch::Sort { .. }
-        | metaltile_std::spec::BenchDispatch::Scan { .. }
-        | metaltile_std::spec::BenchDispatch::ArgReduce { .. }
-        | metaltile_std::spec::BenchDispatch::QuantizedMatVec { .. }
-        | metaltile_std::spec::BenchDispatch::Attention { .. } => KernelMode::Reduction,
-        metaltile_std::spec::BenchDispatch::Random { .. }
-        | metaltile_std::spec::BenchDispatch::FpQuantized { .. } => KernelMode::Elementwise,
-        metaltile_std::spec::BenchDispatch::Rope { .. }
-        | metaltile_std::spec::BenchDispatch::StridedCopy { .. } => KernelMode::Grid3D,
-    }
-}
-
-fn dtype_label(dt: DType) -> &'static str {
-    match dt {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-        DType::BF16 => "bf16",
-        _ => "?",
     }
 }

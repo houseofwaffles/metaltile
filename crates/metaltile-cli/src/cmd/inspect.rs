@@ -22,6 +22,7 @@ use metaltile_std::{bench_types::DType, spec::BenchSpec};
 use crate::{
     flag_present,
     flag_val,
+    kernel_utils::{dtype_label, first_mode},
     matches_filter,
     positional,
     term::{Color, Style, paint_stdout},
@@ -75,7 +76,7 @@ pub fn run(args: &[String]) {
                     std::fs::write(&path, &msl).expect("write failed");
                     println!("wrote {path}");
                 } else {
-                    let mode_str = mode_label(first_mode(spec, dtypes));
+                    let mode_str = mode_label(first_mode(spec));
                     println!("// ═══════════════════════════════════════════════════════");
                     println!("// kernel: {}  mode: {}", name, mode_str);
                     println!("// ═══════════════════════════════════════════════════════");
@@ -95,7 +96,7 @@ pub fn run(args: &[String]) {
         println!();
         for (name, (spec, dtypes)) in &sorted {
             let dtype_str = dtypes.iter().map(|dt| dtype_label(*dt)).collect::<Vec<_>>().join("/");
-            let mode_str = mode_label(first_mode(spec, dtypes));
+            let mode_str = mode_label(first_mode(spec));
             println!(
                 "  {}   {}   {dtype_str}",
                 paint_stdout(format!("{name:<20}"), Style::new().fg(Color::Cyan).bold()),
@@ -157,7 +158,7 @@ pub fn run(args: &[String]) {
         } else if let Some(pass) = &pass_arg {
             // --pass flag: print IR after a specific pass (or 'all' for every stage)
             let mut k = (spec.kernel_ir)(dt);
-            let mode = first_mode(spec, dtypes);
+            let mode = first_mode(spec);
             k.mode = mode;
 
             match pass.as_str() {
@@ -199,7 +200,7 @@ pub fn run(args: &[String]) {
                 std::fs::write(&path, &msl).expect("write failed");
                 println!("wrote {path}");
             } else {
-                let mode_str = mode_label(first_mode(spec, dtypes));
+                let mode_str = mode_label(first_mode(spec));
                 println!("// ═══════════════════════════════════════════════════════");
                 println!("// kernel: {}  mode: {}", name, mode_str);
                 println!("// ═══════════════════════════════════════════════════════");
@@ -244,22 +245,6 @@ fn run_all_passes_and_print(k: &mut metaltile_core::ir::Kernel) {
     }
 }
 
-fn first_mode(spec: &BenchSpec, _dtypes: &[DType]) -> KernelMode {
-    match &spec.dispatch {
-        metaltile_std::spec::BenchDispatch::Generic =>
-            spec.shapes.first().map(|s| s.mode).unwrap_or(KernelMode::Elementwise),
-        metaltile_std::spec::BenchDispatch::Sort { .. }
-        | metaltile_std::spec::BenchDispatch::Scan { .. }
-        | metaltile_std::spec::BenchDispatch::ArgReduce { .. }
-        | metaltile_std::spec::BenchDispatch::QuantizedMatVec { .. }
-        | metaltile_std::spec::BenchDispatch::Attention { .. } => KernelMode::Reduction,
-        metaltile_std::spec::BenchDispatch::Random { .. }
-        | metaltile_std::spec::BenchDispatch::FpQuantized { .. } => KernelMode::Elementwise,
-        metaltile_std::spec::BenchDispatch::Rope { .. }
-        | metaltile_std::spec::BenchDispatch::StridedCopy { .. } => KernelMode::Grid3D,
-    }
-}
-
 fn mode_label(mode: KernelMode) -> &'static str {
     match mode {
         KernelMode::Elementwise => "Elementwise",
@@ -269,23 +254,10 @@ fn mode_label(mode: KernelMode) -> &'static str {
     }
 }
 
-fn dtype_label(dt: DType) -> &'static str {
-    match dt {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-        DType::BF16 => "bf16",
-        DType::I32 => "i32",
-        DType::U32 => "u32",
-        DType::I8 => "i8",
-        DType::U8 => "u8",
-        _ => "?",
-    }
-}
-
 fn generate_msl(spec: &BenchSpec, dtypes: &[DType]) -> String {
     let dt = dtypes.first().copied().unwrap_or(DType::F32);
     let mut k = (spec.kernel_ir)(dt);
-    let mode = first_mode(spec, dtypes);
+    let mode = first_mode(spec);
     k.mode = mode;
 
     let generator: MslGenerator = if matches!(mode, KernelMode::Tile2D) {

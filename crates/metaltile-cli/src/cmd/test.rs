@@ -19,6 +19,7 @@ use metaltile_std::{
 
 use crate::{
     flag_val,
+    kernel_utils::{dtype_label, first_mode},
     matches_filter,
     measure::{buffer_typed, run_typed_once},
     runner::GpuRunner,
@@ -169,31 +170,6 @@ fn collect_unique_names(specs: &[&BenchSpec]) -> BTreeMap<&'static str, (KernelM
         }
     }
     map
-}
-
-fn first_mode(spec: &BenchSpec) -> KernelMode {
-    match &spec.dispatch {
-        metaltile_std::spec::BenchDispatch::Generic =>
-            spec.shapes.first().map(|s| s.mode).unwrap_or(KernelMode::Elementwise),
-        metaltile_std::spec::BenchDispatch::Sort { .. }
-        | metaltile_std::spec::BenchDispatch::Scan { .. }
-        | metaltile_std::spec::BenchDispatch::ArgReduce { .. }
-        | metaltile_std::spec::BenchDispatch::QuantizedMatVec { .. }
-        | metaltile_std::spec::BenchDispatch::Attention { .. } => KernelMode::Reduction,
-        metaltile_std::spec::BenchDispatch::Random { .. }
-        | metaltile_std::spec::BenchDispatch::FpQuantized { .. } => KernelMode::Elementwise,
-        metaltile_std::spec::BenchDispatch::Rope { .. }
-        | metaltile_std::spec::BenchDispatch::StridedCopy { .. } => KernelMode::Grid3D,
-    }
-}
-
-fn dtype_label(dt: DType) -> &'static str {
-    match dt {
-        DType::F32 => "f32",
-        DType::F16 => "f16",
-        DType::BF16 => "bf16",
-        _ => "?",
-    }
 }
 
 /// Run a single correctness check for one kernel × dtype.

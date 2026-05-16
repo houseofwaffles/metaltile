@@ -160,23 +160,21 @@ pub fn run(args: &[String]) {
     );
 }
 
-/// Basic ISO-like timestamp without a chrono dependency.
 fn chrono_like_now() -> String {
     use std::time::SystemTime;
     let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    let secs = dur.as_secs();
-    // Convert to a rough readable date string
-    // epoch days since 1970-01-01
+    unix_secs_to_iso(dur.as_secs())
+}
+
+fn unix_secs_to_iso(secs: u64) -> String {
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let mins = (time_of_day % 3600) / 60;
     let s = time_of_day % 60;
 
-    // Simple date calculation (approximate, good enough for snapshot naming)
-    let y = 1970;
     let mut remaining_days = days as i64;
-    let mut year = y;
+    let mut year = 1970i64;
     loop {
         let days_in_year = if is_leap(year) { 366 } else { 365 };
         if remaining_days < days_in_year {
@@ -186,11 +184,11 @@ fn chrono_like_now() -> String {
         year += 1;
     }
     let month_days = if is_leap(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        [31i64, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        [31i64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
-    let mut month = 1;
+    let mut month = 1i64;
     for &md in &month_days {
         if remaining_days < md {
             break;
@@ -212,7 +210,75 @@ fn gpu_family_from_name(name: &str) -> Option<&'static str> {
         Some("Apple8")
     } else if name.contains("M1") {
         Some("Apple7")
+    } else if name.contains("A18") || name.contains("A17") {
+        Some("Apple9")
+    } else if name.contains("A16") || name.contains("A15") {
+        Some("Apple8")
+    } else if name.contains("A14") {
+        Some("Apple7")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unix_secs_to_iso;
+
+    #[test]
+    fn epoch_zero() {
+        assert_eq!(unix_secs_to_iso(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn time_of_day() {
+        // 1 hour, 2 minutes, 3 seconds into epoch
+        assert_eq!(unix_secs_to_iso(3723), "1970-01-01T01:02:03Z");
+    }
+
+    #[test]
+    fn y2k() {
+        // 2000-01-01 00:00:00 UTC — well-known Unix timestamp
+        assert_eq!(unix_secs_to_iso(946684800), "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn leap_day_2024() {
+        // 2024 is a leap year; 2024-02-29 is day 59 of the year (0-indexed)
+        // Days from epoch to 2024-02-29: 54 years * 365 + 13 leap years + 59 = 19782
+        // 19782 * 86400 = 1_709_164_800
+        assert_eq!(unix_secs_to_iso(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn year_2000_is_leap() {
+        // 2000 is divisible by 400, so it IS a leap year
+        // 2000-02-29 exists; it is day 59 of 2000 (0-indexed)
+        // Days from epoch to 2000-02-29: 10957 (to Jan 1) + 59 = 11016
+        // 11016 * 86400 = 951_782_400
+        assert_eq!(unix_secs_to_iso(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn year_2100_not_leap() {
+        // 2100 is divisible by 100 but not 400 — not a leap year
+        // Days from epoch to 2100-03-01 must follow 2100-02-28 directly (no Feb 29)
+        // Days to Jan 1 2100: 130 years, leap years in [1970,2099]:
+        //   1972,1976,...,2096 → (2096-1972)/4+1 = 32 leap years
+        //   130*365 + 32 = 47_482
+        // Feb 28 = day 58 (0-indexed), Mar 1 = day 59
+        // 2100-02-28 = (47_482 + 58) * 86400 = 47_540 * 86400 = 4_107_456_000
+        // 2100-03-01 = (47_482 + 59) * 86400 = 47_541 * 86400 = 4_107_542_400
+        assert_eq!(unix_secs_to_iso(4_107_456_000), "2100-02-28T00:00:00Z");
+        assert_eq!(unix_secs_to_iso(4_107_542_400), "2100-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn dec_31_wraps_correctly() {
+        // 2023-12-31: 2023 is not a leap year, Dec 31 = day 364 (0-indexed)
+        // Days to Jan 1 2023: 53 years, leap years in [1970,2022]: 13
+        //   53*365 + 13 = 19_358
+        // 2023-12-31 = (19_358 + 364) * 86400 = 19_722 * 86400 = 1_703_980_800
+        assert_eq!(unix_secs_to_iso(1_703_980_800), "2023-12-31T00:00:00Z");
     }
 }

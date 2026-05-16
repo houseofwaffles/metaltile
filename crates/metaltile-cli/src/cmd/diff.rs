@@ -13,7 +13,6 @@ use serde_json::Value;
 use crate::{
     flag_val,
     matches_filter,
-    positional,
     term::{Color, Style, paint_stderr, paint_stdout},
 };
 
@@ -42,13 +41,31 @@ struct DiffRow {
     kind: DeltaKind,
 }
 
+/// Collect positional arguments, skipping flag names and their values.
+fn positionals(args: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &["--filter", "-f", "--threshold", "--sort", "--json", "-o"];
+    let mut result = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if VALUE_FLAGS.contains(&arg.as_str()) {
+                skip_next = true;
+            }
+        } else {
+            result.push(arg.clone());
+        }
+    }
+    result
+}
+
 pub fn run(args: &[String]) {
-    let baseline_path = positional(args);
-    let current_path = args
-        .get(1)
-        .filter(|a| !a.starts_with('-'))
-        .or(args.get(2).filter(|a| !a.starts_with('-')))
-        .cloned();
+    let pos = positionals(args);
+    let baseline_path = pos.first().cloned();
+    let current_path = pos.get(1).cloned();
     let filter = flag_val(args, "--filter").or_else(|| flag_val(args, "-f"));
     let threshold_str = flag_val(args, "--threshold");
     let threshold: f64 = threshold_str.as_deref().and_then(|s| s.parse().ok()).unwrap_or(5.0);

@@ -20,13 +20,7 @@ use metaltile_std::{
         check_equiv,
         check_equiv_with,
     },
-    spec::{
-        BenchDispatch,
-        BenchSpec,
-        MlxArg,
-        ScalarBufSpec,
-        ShapeSpec,
-    },
+    spec::{BenchDispatch, BenchSpec, MlxArg, ScalarBufSpec, ShapeSpec},
 };
 
 use crate::{

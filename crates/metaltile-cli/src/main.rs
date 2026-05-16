@@ -7,6 +7,7 @@
 //!   device    Show GPU device info and supported features
 
 mod cmd;
+pub mod kernel_utils;
 pub mod measure;
 pub mod run_spec;
 pub mod runner;

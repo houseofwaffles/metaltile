@@ -2,10 +2,7 @@ pub mod arange;
 pub mod arg_reduce;
 pub mod binary;
 pub mod binary_two;
-pub mod conv;
 pub mod copy;
-pub mod fence;
-pub mod fft;
 pub mod fp_quantized;
 #[cfg(feature = "nax")]
 pub mod fp_quantized_nax;
@@ -24,7 +21,6 @@ pub mod scaled_dot_product_attention;
 pub mod scan;
 pub mod softmax;
 pub mod sort;
-pub mod steel;
 pub mod strided;
 pub mod ternary;
 pub mod unary;

@@ -28,12 +28,14 @@ pub fn run(args: &[String]) {
     let device_name = &runner.device_name;
     let simd = runner.supports_simd_matrix();
 
-    // Heuristic GPU family strings based on device name.
+    // Heuristic GPU family string based on device name.
     let gpu_family = gpu_family_from_name(device_name);
 
-    // Check native bfloat support: M4 Max supports bfloat; most modern Apple GPUs do.
-    // We infer from GPU family: Apple9+ (M3+) supports native bfloat via Metal 3.1.
-    let native_bfloat = simd; // simdgroup support requires M3+ which also has bfloat
+    // Native bfloat (Metal 3.1 `bfloat` type) and async threadgroup copy both
+    // require Apple9 (M3 / A17) or later, independent of SIMD matrix support.
+    let apple9_or_later = gpu_family.contains("Apple9");
+    let native_bfloat = apple9_or_later;
+    let async_copy = apple9_or_later;
 
     // Threadgroup memory is inferred from GPU family.
     let tpg_mem = tpg_memory_from_family(gpu_family);
@@ -78,7 +80,7 @@ pub fn run(args: &[String]) {
 
     check("native_bfloat", native_bfloat, "Metal 3.1+ bfloat type");
     check("simdgroup_hw", simd, "simdgroup matrix multiply");
-    check("async_copy", simd, "async threadgroup copy (M3+)");
+    check("async_copy", async_copy, "async threadgroup copy (M3+)");
 
     println!("  {}", paint_stdout("─".repeat(42), Style::new().fg(Color::BrightBlack).dim(),),);
 
@@ -95,29 +97,43 @@ pub fn run(args: &[String]) {
     println!(
         "  {}  {}",
         paint_stdout(format!("{:<16}", "SLC"), label_style),
-        paint_stdout("~64 MB", Style::new().fg(Color::BrightWhite)),
+        paint_stdout(slc_size_from_name(device_name), Style::new().fg(Color::BrightWhite)),
     );
     println!();
 }
 
 /// Heuristic GPU family based on device name substring.
+/// M-series checked before A-series since "M1 Pro" etc. contain neither A-chip name.
 fn gpu_family_from_name(name: &str) -> &'static str {
     if name.contains("M4") {
         "Apple9 (M4)"
     } else if name.contains("M3") {
-        "Apple9 (M3+)"
+        "Apple9 (M3)"
     } else if name.contains("M2") {
         "Apple8 (M2)"
-    } else if name.contains("M1") || name.contains("Pro") || name.contains("Max") {
+    } else if name.contains("M1") {
         "Apple7 (M1)"
-    } else if name.contains("A17") || name.contains("A18") {
+    } else if name.contains("A18") || name.contains("A17") {
         "Apple9 (A17+)"
-    } else if name.contains("A16") {
-        "Apple8 (A16)"
-    } else if name.contains("A15") {
-        "Apple7 (A15)"
+    } else if name.contains("A16") || name.contains("A15") {
+        "Apple8 (A15+)"
+    } else if name.contains("A14") {
+        "Apple7 (A14)"
     } else {
         "unknown"
+    }
+}
+
+/// Known SLC sizes per chip tier. Returns "varies" when the tier is not recognised.
+fn slc_size_from_name(name: &str) -> &'static str {
+    if name.contains("Ultra") {
+        "~96 MB"
+    } else if name.contains("Max") && name.contains("M4") {
+        "~64 MB"
+    } else if name.contains("Max") {
+        "~48 MB"
+    } else {
+        "varies"
     }
 }
 
