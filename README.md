@@ -60,6 +60,8 @@ Early development — APIs are not yet stable. Core DSL works; autotuner and typ
 | `metaltile-interp` | CPU reference interpreter | Working |
 | `metaltile-runtime` | Metal dispatch, PSO cache | Working |
 | `metaltile` | Facade re-exporting all crates | — |
+| `metaltile-std` | Kernel stdlib, op files, bench types | Working |
+| `metaltile-cli` | `tile` CLI binary | Working |
 
 ## Quick Start
 
@@ -120,12 +122,31 @@ println!("{msl}");
 
 **Misc**: RoPE, scan (parallel prefix sum), arg-reduce (argmax), sort (bitonic), random (xorshift32), quantized GeMV (int4), fp4 quantize/dequantize, strided copy (non-contiguous tensors)
 
+## CLI
+
+Install the `tile` binary:
+
+```sh
+cargo install --path crates/metaltile-cli
+```
+
+```
+tile bench                      # full benchmark suite vs MLX
+tile bench --filter softmax     # narrow to one op
+tile build                      # compile all kernels, report errors
+tile inspect --kernel mt_rms_norm  # print IR and generated MSL
+tile device                     # show GPU info and supported features
+tile test                       # correctness checks: interpreter ↔ GPU
+tile snap -o baseline.json      # save bench results as a regression baseline
+tile diff baseline.json         # compare current results to baseline
+```
+
 ## Benchmarks
 
 Run against MLX Metal kernels on M4 Max:
 
-```
-cargo run --release -p metaltile-bench --bin bench_suite
+```sh
+tile bench
 ```
 
 Selected results (M4 Max, higher = better vs MLX):
@@ -138,12 +159,6 @@ Selected results (M4 Max, higher = better vs MLX):
 | gemv f16 | ~100% |
 | argmax f32 | **206%** |
 | scan f32 | ~104% |
-
-Full benchmark table with correctness checks:
-
-```
-cargo run --release -p metaltile-bench --bin bench_suite -- --filter softmax
-```
 
 ## Architecture
 

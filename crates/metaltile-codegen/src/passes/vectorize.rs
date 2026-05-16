@@ -61,7 +61,9 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
 
             // Collect a run of up to MAX_VEC_LEN consecutive loads.
             let mut run_indices: Vec<usize> = vec![i];
-            for (j, skip_val) in skip.iter().enumerate().skip(i + 1).take(n.min(i + MAX_VEC_LEN) - (i + 1)) {
+            for (j, skip_val) in
+                skip.iter().enumerate().skip(i + 1).take(n.min(i + MAX_VEC_LEN) - (i + 1))
+            {
                 if *skip_val {
                     break;
                 }
@@ -120,7 +122,9 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
             }
 
             let mut run_indices: Vec<usize> = vec![i];
-            for (j, skip_val) in skip.iter().enumerate().skip(i + 1).take(n.min(i + MAX_VEC_LEN) - (i + 1)) {
+            for (j, skip_val) in
+                skip.iter().enumerate().skip(i + 1).take(n.min(i + MAX_VEC_LEN) - (i + 1))
+            {
                 if *skip_val {
                     break;
                 }

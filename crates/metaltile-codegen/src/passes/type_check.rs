@@ -116,9 +116,7 @@ fn check_op(op: &Op, kernel: &Kernel, env: &TypeEnv) -> Result<()> {
         },
 
         Op::Reduce { axis, .. } if *axis > 3 => {
-            return Err(Error::Validation(format!(
-                "Op::Reduce: axis {axis} > 3 is implausible"
-            )));
+            return Err(Error::Validation(format!("Op::Reduce: axis {axis} > 3 is implausible")));
         },
 
         Op::StrideReduce { src, offset, stride, end, secondary_src, secondary_base, .. } => {

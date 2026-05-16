@@ -1,0 +1,36 @@
+[package]
+name = "metaltile-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "MetalTile CLI — benchmark, test, and inspect GPU kernels"
+keywords = ["metal", "gpu", "apple-silicon", "benchmark", "cli"]
+categories = ["hardware-support", "development-tools"]
+publish = false
+
+[[bin]]
+name = "tile"
+path = "src/main.rs"
+
+[dependencies]
+metaltile.workspace = true
+metaltile-core.workspace = true
+metaltile-codegen.workspace = true
+metaltile-interp.workspace = true
+metaltile-runtime.workspace = true
+metaltile-std.workspace = true
+inventory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice", "MTLCommandQueue", "MTLLibrary",
+    "MTLComputePipeline", "MTLComputeCommandEncoder",
+    "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLFunctionConstantValues", "MTLDataType",
+] }
+objc2-foundation = "0.3"

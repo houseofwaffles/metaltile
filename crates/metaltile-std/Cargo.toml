@@ -1,0 +1,13 @@
+[package]
+name = "metaltile-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MetalTile kernel standard library — benchmark metadata and type definitions"
+publish = true
+
+[dependencies]
+metaltile.workspace = true
+metaltile-core.workspace = true
+metaltile-codegen.workspace = true
+inventory.workspace = true

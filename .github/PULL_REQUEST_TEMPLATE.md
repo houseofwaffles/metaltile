@@ -14,7 +14,8 @@
 - [ ] `metaltile-codegen` (MSL lowering, passes)
 - [ ] `metaltile-interp` (CPU reference interpreter)
 - [ ] `metaltile-runtime` (Metal dispatch)
-- [ ] `metaltile-bench` (benchmarks)
+- [ ] `metaltile-std` (kernel stdlib, op files)
+- [ ] `metaltile-cli` (`tile` binary)
 
 ## Testing
 

@@ -127,9 +127,7 @@ fn fuse_block(block: &mut Block, pinned: &BTreeSet<ValueId>) {
             // - Be fusible
             // - Produce a value used ONLY by cursor (single-use)
             // - Come before cursor in the block
-            if prev_idx >= cursor
-                || !is_fusible(&block.ops[prev_idx])
-                || fused.contains(&prev_idx)
+            if prev_idx >= cursor || !is_fusible(&block.ops[prev_idx]) || fused.contains(&prev_idx)
             {
                 break;
             }

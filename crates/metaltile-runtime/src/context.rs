@@ -60,10 +60,7 @@ fn static_buffer_len(param: &Param) -> Result<Option<usize>, MetalTileError> {
         .map(Some)
 }
 
-#[cfg_attr(
-    not(any(target_os = "macos", test)),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn planned_data_len(
     param: &Param,
     buffers: &BTreeMap<String, Vec<u8>>,
@@ -87,10 +84,7 @@ fn planned_data_len(
     Ok(provided_len)
 }
 
-#[cfg_attr(
-    not(any(target_os = "macos", test)),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn build_param_buffer_plans(
     kernel: &Kernel,
     buffers: &BTreeMap<String, Vec<u8>>,
@@ -145,10 +139,7 @@ fn row_major_strides(name: &str, dims: &[u32]) -> Result<Vec<u32>, MetalTileErro
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 type StridedMetadata<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
-#[cfg_attr(
-    not(any(target_os = "macos", test)),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn resolve_strided_metadata<'a>(
     param: &Param,
     buffers: &'a BTreeMap<String, Vec<u8>>,

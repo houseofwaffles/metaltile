@@ -741,6 +741,324 @@ impl Clone for Kernel {
     }
 }
 
+// ── Display / pretty-printing ────────────────────────────────────────────────
+
+impl std::fmt::Display for Kernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Header
+        let mode_str = match self.mode {
+            KernelMode::Elementwise => "Elementwise",
+            KernelMode::Reduction => "Reduction",
+            KernelMode::Grid3D => "Grid3D",
+            KernelMode::Tile2D => "Tile2D",
+        };
+        let params_str: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| {
+                let io = if p.is_output { "out:" } else { "" };
+                format!("{io}{}:{:?}", p.name, p.dtype)
+            })
+            .collect();
+        writeln!(f, "kernel {}  mode={mode_str}  params=[{}]", self.name, params_str.join(", "))?;
+
+        // Entry block
+        write!(f, "{}", self.body)?;
+
+        // Nested blocks (sorted by ID)
+        let mut block_ids: Vec<BlockId> = self.blocks.keys().copied().collect();
+        block_ids.sort_unstable();
+        for id in block_ids {
+            if id == self.body.id {
+                continue;
+            }
+            if let Some(block) = self.blocks.get(&id) {
+                write!(f, "{}", block)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "  block b{}:", self.id.as_u32())?;
+        for (i, op) in self.ops.iter().enumerate() {
+            let result_id = self.results.get(i).and_then(|r| *r);
+            if let Some(vid) = result_id {
+                write!(f, "    v{:<4} = ", vid.as_u32())?;
+            } else {
+                write!(f, "         ")?;
+            }
+            op.fmt_ir(f)?;
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Op {
+    /// Write a compact IR representation of this op.
+    fn fmt_ir(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Op::ProgramId { axis } => write!(f, "ProgramId(axis={axis})"),
+            Op::Const { value } => write!(f, "Const({value})"),
+            Op::Arange { start, step, len } => {
+                let s = start.map_or("0.0".into(), |v| format!("{v}"));
+                let st = step.map_or("1.0".into(), |v| format!("{v}"));
+                write!(f, "Arange(start={s}, step={st}, len={len:?})")
+            },
+            Op::Load { src, indices, mask, other } => {
+                let idx_str: Vec<String> = indices.iter().map(fmt_index).collect();
+                write!(f, "Load({src}, [{}]", idx_str.join(", "))?;
+                if let Some(m) = mask {
+                    write!(f, ", mask=v{}", m.as_u32())?;
+                }
+                if let Some(o) = other {
+                    write!(f, ", other={o}")?;
+                }
+                write!(f, ")")
+            },
+            Op::Store { dst, indices, value, mask } => {
+                let idx_str: Vec<String> = indices.iter().map(fmt_index).collect();
+                write!(f, "Store({dst}, v{}, [{}]", value.as_u32(), idx_str.join(", "))?;
+                if let Some(m) = mask {
+                    write!(f, ", mask=v{}", m.as_u32())?;
+                }
+                write!(f, ")")
+            },
+            Op::BinOp { op, lhs, rhs } => {
+                write!(f, "BinOp({op:?}, v{}, v{})", lhs.as_u32(), rhs.as_u32())
+            },
+            Op::Dot { a, b } => write!(f, "Dot(v{}, v{})", a.as_u32(), b.as_u32()),
+            Op::Reduce { value, axis, op } => {
+                write!(f, "Reduce({op:?}, axis={axis}, v{})", value.as_u32())
+            },
+            Op::StrideReduce {
+                src,
+                offset,
+                stride,
+                end,
+                op,
+                dtype,
+                transform,
+                secondary_src,
+                secondary_base,
+            } => {
+                write!(
+                    f,
+                    "StrideReduce({src}, offset=v{}, stride=v{}, end=v{}, op={op:?}, dtype={dtype:?}",
+                    offset.as_u32(),
+                    stride.as_u32(),
+                    end.as_u32()
+                )?;
+                if let Some(t) = transform {
+                    write!(f, ", transform=[{} ops]", t.len())?;
+                }
+                if secondary_src.is_some() {
+                    write!(f, ", secondary")?;
+                }
+                if secondary_base.is_some() {
+                    write!(f, ", secondary_base=v{}", secondary_base.unwrap().as_u32())?;
+                }
+                write!(f, ")")
+            },
+            Op::Cast { value, dtype } => write!(f, "Cast(v{}, {dtype:?})", value.as_u32()),
+            Op::Loop { var, start, end, step, body } => {
+                write!(
+                    f,
+                    "Loop(var{}, v{}..v{}, step=v{}, body=b{})",
+                    var.as_u32(),
+                    start.as_u32(),
+                    end.as_u32(),
+                    step.as_u32(),
+                    body.as_u32()
+                )
+            },
+            Op::If { cond, then_block, else_block } => {
+                write!(f, "If(v{}, b{}", cond.as_u32(), then_block.as_u32())?;
+                if let Some(eb) = else_block {
+                    write!(f, ", b{}", eb.as_u32())?;
+                }
+                write!(f, ")")
+            },
+            Op::Zeros { dtype, shape } => write!(f, "Zeros({dtype:?}, {shape:?})"),
+            Op::Transpose { value } => write!(f, "Transpose(v{})", value.as_u32()),
+            Op::ExpandDims { value, axis } =>
+                write!(f, "ExpandDims(v{}, axis={axis})", value.as_u32()),
+            Op::Reshape { value, shape } => write!(f, "Reshape(v{}, {shape:?})", value.as_u32()),
+            Op::Cat { values, axis } => {
+                let vals: Vec<String> = values.iter().map(|v| format!("v{}", v.as_u32())).collect();
+                write!(f, "Cat([{}], axis={axis})", vals.join(", "))
+            },
+            Op::Slice { value, ranges } => {
+                let r: Vec<String> =
+                    ranges.iter().map(|(a, s, l)| format!("dim{a}[{s}..{s}+{l}]")).collect();
+                write!(f, "Slice(v{}, [{}])", value.as_u32(), r.join(", "))
+            },
+            Op::InlineMsl { source, inputs, outputs } => {
+                write!(
+                    f,
+                    "InlineMsl(\"{}\", inputs=[{}], outputs={})",
+                    source.chars().take(40).collect::<String>(),
+                    inputs
+                        .iter()
+                        .map(|v| format!("v{}", v.as_u32()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    outputs.len()
+                )
+            },
+            Op::FlashAttention { q, k, v: v_val, params } => {
+                write!(
+                    f,
+                    "FlashAttention(q=v{}, k=v{}, v=v{}, scale={:?}, causal={})",
+                    q.as_u32(),
+                    k.as_u32(),
+                    v_val.as_u32(),
+                    params.scale,
+                    params.is_causal
+                )
+            },
+            Op::SlidingWindowAttention { q, k, v: v_val, window } => {
+                write!(
+                    f,
+                    "SlidingWindowAttention(q=v{}, k=v{}, v=v{}, window={window})",
+                    q.as_u32(),
+                    k.as_u32(),
+                    v_val.as_u32()
+                )
+            },
+            Op::RmsNorm { x, scale, eps } => {
+                write!(f, "RmsNorm(x=v{}, scale=v{}, eps={eps})", x.as_u32(), scale.as_u32())
+            },
+            Op::GatedMlp { x, gate_proj, up_proj, down_proj } => {
+                write!(
+                    f,
+                    "GatedMlp(x=v{}, gate=v{}, up=v{}, down=v{})",
+                    x.as_u32(),
+                    gate_proj.as_u32(),
+                    up_proj.as_u32(),
+                    down_proj.as_u32()
+                )
+            },
+            Op::UnaryOp { op, value } => write!(f, "UnaryOp({op:?}, v{})", value.as_u32()),
+            Op::Activation { kind, value } =>
+                write!(f, "Activation({kind:?}, v{})", value.as_u32()),
+            Op::Select { cond, on_true, on_false } => {
+                write!(
+                    f,
+                    "Select(v{}, v{}, v{})",
+                    cond.as_u32(),
+                    on_true.as_u32(),
+                    on_false.as_u32()
+                )
+            },
+            Op::Broadcast { value, shape } =>
+                write!(f, "Broadcast(v{}, {shape:?})", value.as_u32()),
+            Op::Splat { value, dtype, shape } => write!(f, "Splat({value}, {dtype:?}, {shape:?})"),
+            Op::FusedElementwise { ops } => {
+                write!(f, "FusedElementwise([")?;
+                for (i, op) in ops.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    op.fmt_ir(f)?;
+                }
+                write!(f, "])")
+            },
+            Op::VectorLoad { src, byte_offset, len } => {
+                write!(f, "VectorLoad({src}, offset=v{}, len={len})", byte_offset.as_u32())
+            },
+            Op::VectorStore { dst, byte_offset, len, value } => {
+                write!(
+                    f,
+                    "VectorStore({dst}, offset=v{}, len={len}, v{})",
+                    byte_offset.as_u32(),
+                    value.as_u32()
+                )
+            },
+            Op::Gather { src, indices, axis } => {
+                write!(f, "Gather({src}, v{}, axis={axis})", indices.as_u32())
+            },
+            Op::Scatter { dst, indices, value, axis } => {
+                write!(f, "Scatter({dst}, v{}, v{}, axis={axis})", indices.as_u32(), value.as_u32())
+            },
+            Op::Atomic { op, dst, index, value } => {
+                write!(f, "Atomic({op:?}, {dst}, v{}, v{})", index.as_u32(), value.as_u32())
+            },
+            Op::Scan { value, axis, op, exclusive } => {
+                write!(
+                    f,
+                    "Scan(v{}, axis={axis}, op={op:?}, exclusive={exclusive})",
+                    value.as_u32()
+                )
+            },
+            Op::StrideScan { src, dst, offset, end, op } => {
+                write!(
+                    f,
+                    "StrideScan({src}->{dst}, v{}..v{}, op={op:?})",
+                    offset.as_u32(),
+                    end.as_u32()
+                )
+            },
+            Op::StrideArgReduce { src, offset, end, op } => {
+                write!(
+                    f,
+                    "StrideArgReduce({src}, v{}..v{}, op={op:?})",
+                    offset.as_u32(),
+                    end.as_u32()
+                )
+            },
+            Op::StrideStore { src, dst, offset, end, scalar, aux_src } => {
+                write!(
+                    f,
+                    "StrideStore({src}->{dst}, v{}..v{}, scalar=v{}",
+                    offset.as_u32(),
+                    end.as_u32(),
+                    scalar.as_u32()
+                )?;
+                if let Some(aux) = aux_src {
+                    write!(f, ", aux_src={aux}")?;
+                }
+                write!(f, ")")
+            },
+            Op::Dequantize { weights, scales: _, zeros: _, group_size, bits } => {
+                write!(f, "Dequantize({weights}, gs={group_size}, bits={bits})")
+            },
+            Op::SimdReduce { value, op } => write!(f, "SimdReduce(v{}, {op:?})", value.as_u32()),
+            Op::ThreadgroupAlloc { dtype, size, name } => {
+                write!(f, "ThreadgroupAlloc({dtype:?}, {size}, {name})")
+            },
+            Op::ThreadgroupLoad { name, index } => {
+                write!(f, "ThreadgroupLoad({name}, v{})", index.as_u32())
+            },
+            Op::ThreadgroupStore { name, index, value } => {
+                write!(f, "ThreadgroupStore({name}, v{}, v{})", index.as_u32(), value.as_u32())
+            },
+            Op::Barrier => write!(f, "Barrier"),
+            Op::DeclareLocal { name, value } => {
+                write!(f, "DeclareLocal({name}, v{})", value.as_u32())
+            },
+            Op::SetLocal { name, value } => {
+                write!(f, "SetLocal({name}, v{})", value.as_u32())
+            },
+            Op::ArgReduce { value, axis, op } => {
+                write!(f, "ArgReduce(v{}, axis={axis}, {op:?})", value.as_u32())
+            },
+        }
+    }
+}
+
+/// Format an index expression for IR display.
+fn fmt_index(idx: &IndexExpr) -> String {
+    match idx {
+        IndexExpr::Value(v) => format!("v{}", v.as_u32()),
+        IndexExpr::Const(n) => format!("{n}"),
+        IndexExpr::Range(v, offset) => format!("v{}..v{}+{offset}", v.as_u32(), v.as_u32()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Block, BlockId, Kernel, Op, ValueId};
@@ -769,5 +1087,71 @@ mod tests {
         kernel.sync_entry_block();
         assert_eq!(kernel.blocks.get(&BlockId::new(0)).unwrap().ops.len(), 2);
         let _ = Block::new(BlockId::new(1));
+    }
+
+    #[test]
+    fn display_format_shows_kernel_structure() {
+        use super::{BinOpKind, IndexExpr, KernelMode, Param, ParamKind};
+        use crate::{dtype::DType, shape::Shape};
+
+        let mut k = Kernel::new("mt_vadd");
+        k.mode = KernelMode::Elementwise;
+        k.params.push(Param {
+            name: "a".into(),
+            dtype: DType::F32,
+            shape: Shape::scalar(),
+            is_output: false,
+            kind: ParamKind::Tensor,
+        });
+        k.params.push(Param {
+            name: "b".into(),
+            dtype: DType::F32,
+            shape: Shape::scalar(),
+            is_output: false,
+            kind: ParamKind::Tensor,
+        });
+        k.params.push(Param {
+            name: "out".into(),
+            dtype: DType::F32,
+            shape: Shape::scalar(),
+            is_output: true,
+            kind: ParamKind::Tensor,
+        });
+        k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+        k.body.push_op(
+            Op::Load {
+                src: "a".into(),
+                indices: vec![IndexExpr::Value(ValueId::new(0))],
+                mask: None,
+                other: None,
+            },
+            ValueId::new(1),
+        );
+        k.body.push_op(
+            Op::Load {
+                src: "b".into(),
+                indices: vec![IndexExpr::Value(ValueId::new(0))],
+                mask: None,
+                other: None,
+            },
+            ValueId::new(2),
+        );
+        k.body.push_op(
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(1), rhs: ValueId::new(2) },
+            ValueId::new(3),
+        );
+        k.body.push_op_no_result(Op::Store {
+            dst: "out".into(),
+            indices: vec![IndexExpr::Value(ValueId::new(0))],
+            value: ValueId::new(3),
+            mask: None,
+        });
+
+        let output = format!("{k}");
+        assert!(output.contains("kernel mt_vadd"), "should show kernel name: {output}");
+        assert!(output.contains("mode=Elementwise"), "should show mode: {output}");
+        assert!(output.contains("v0    = ProgramId(axis=0)"), "should show ProgramId: {output}");
+        assert!(output.contains("BinOp(Add, v1, v2)"), "should show BinOp: {output}");
+        assert!(output.contains("Store(out, v3, [v0])"), "should show Store: {output}");
     }
 }
