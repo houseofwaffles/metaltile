@@ -45,7 +45,9 @@ macro_rules! wl {
 #[derive(Debug, Clone)]
 pub struct MslConfig {
     pub simd_size: u32,
-    /// Emit `simdgroup_multiply_accumulate` (requires Metal GPU family 9 / M3+).
+    /// Emit `simdgroup_multiply_accumulate` (requires Metal GPU family 7+ / M1+).
+    /// On Apple9 (M3+) this uses dedicated matrix hardware; on Apple7/8 (M1/M2)
+    /// it is emulated via FMA on the simdgroup.
     pub use_simd_matrix: bool,
     pub debug_comments: bool,
     /// Use native `bfloat` type (Metal 3.1+, M3+). When false, uses `bfloat16_t` struct.
@@ -111,10 +113,11 @@ impl MslGenerator {
             self.emit_bf16_preamble(&mut out);
         }
         if self.config.use_simd_matrix {
+            // simdgroup_matrix is available from Metal 2.3 (macOS 11 / Apple7+).
+            // The runtime gate (runner.supports_simd_matrix) is the source of truth
+            // for whether this header gets included.
             wl!(out);
-            wl!(out, "#if __METAL_VERSION__ >= 310");
             wl!(out, "#include <metal_simdgroup_matrix>");
-            wl!(out, "#endif");
         }
         self.emit_activation_helpers(&feat, &mut out);
         wl!(out);
@@ -1511,8 +1514,9 @@ impl MslGenerator {
     }
 
     /// Emit the full tiled matmul body (cooperative threadgroup-memory GEMM).
-    /// When `use_simd_matrix` is true and we're on M3+ (Metal GPU family 9+),
-    /// uses hardware-accelerated `simdgroup_multiply_accumulate` for 8×8 half tiles.
+    /// When `use_simd_matrix` is true (Apple7+ / M1+), uses
+    /// `simdgroup_multiply_accumulate` for 8×8 half tiles. Apple9 (M3+) has
+    /// dedicated matrix hardware; Apple7/8 (M1/M2) emulate via simdgroup FMA.
     #[allow(non_snake_case)]
     fn emit_tiled(
         &self,
@@ -1642,7 +1646,9 @@ impl MslGenerator {
         Ok(())
     }
 
-    /// Simdgroup matrix multiply path (M3+): 8×8 half-precision hardware matmul.
+    /// Simdgroup matrix multiply path (Apple7+ / M1+): 8×8 half-precision tiles
+    /// via `simdgroup_multiply_accumulate`. Dedicated HW on Apple9 (M3+);
+    /// FMA-emulated on Apple7/8 (M1/M2).
     /// Each 32-thread simdgroup owns one `simdgroup_half8x8` fragment of C.
     #[allow(non_snake_case, clippy::too_many_arguments)]
     fn emit_tiled_simdgroup(
@@ -1796,6 +1802,7 @@ impl MslGenerator {
         wl!(out, "{pad}    }}");
         wl!(out);
         wl!(out, "{pad}    // MMA on current tile.");
+        wl!(out, "{pad}    #pragma clang loop unroll(full)");
         wl!(out, "{pad}    for (uint kk = 0; kk < {TK}; kk += 8) {{");
 
         // Load all SGN b_frags once per kk step (named variables so compiler keeps them in regs).
@@ -1830,12 +1837,15 @@ impl MslGenerator {
         wl!(out, "{pad}}}");
         wl!(out);
 
-        // Write fp32 accumulators via per-simdgroup scratch to global half.
-        // simdgroup_store with stride 8 places lane l's elements at flat positions l and l+32
-        // in the 64-element buffer.  Each lane reads its own 2 positions directly — no loop.
-        wl!(out, "{pad}threadgroup float sg_scratch[4 * 64];");
-        wl!(out, "{pad}const uint sg_idx = sg_y * {SG_COLS} + sg_x;");
+        // Write fp32 accumulators directly to global half.
+        // simdgroup_float8x8 element layout (matches MLX BaseMMAFrag<float,8,8>):
+        //   row = ((lane>>1) & 3) + ((lane>>4) << 2)
+        //   col = ((lane & 1) << 1) + (((lane>>3) & 1) << 2)  // and col+1
+        // col is always even; row may be odd, so when N is odd a half2 store at
+        // C+gr*N+gc is only 2-byte aligned (UB per MSL spec). Branch on N parity:
+        // half2 fast path when N is even, scalar fallback when N is odd.
         wl!(out, "{pad}const uint row_base = tgid.y * {TM}, col_base = tgid.x * {TN};");
+        wl!(out, "{pad}const bool n_aligned = (({n} & 1u) == 0u);");
         let sgm8 = SGM * 8; // simdgroup row span = 32
         let sgn8 = SGN * 8; // simdgroup col span = 32
         for fi in 0..SGM {
@@ -1843,20 +1853,24 @@ impl MslGenerator {
                 let idx = fi * SGN + fj;
                 let fi8 = fi * 8;
                 let fj8 = fj * 8;
+                wl!(out, "{pad}{{");
                 wl!(
                     out,
-                    "{pad}simdgroup_store(c{idx}, sg_scratch + sg_idx*64, 8, ulong2(0,0), false);"
+                    "{pad}    thread float2& c{idx}_e = (thread float2&)c{idx}.thread_elements();"
                 );
-                wl!(out, "{pad}{{");
-                wl!(out, "{pad}    float s0 = sg_scratch[sg_idx*64 + simd_lane];");
-                wl!(out, "{pad}    float s1 = sg_scratch[sg_idx*64 + simd_lane + 32];");
-                // simdgroup origin within tile + fragment offset + per-lane offset
-                wl!(out, "{pad}    uint gr0 = row_base + sg_y*{sgm8} + {fi8} + simd_lane/8;");
-                wl!(out, "{pad}    uint gc0 = col_base + sg_x*{sgn8} + {fj8} + simd_lane%8;");
-                wl!(out, "{pad}    uint gr1 = row_base + sg_y*{sgm8} + {fi8} + (simd_lane+32)/8;");
-                wl!(out, "{pad}    uint gc1 = col_base + sg_x*{sgn8} + {fj8} + (simd_lane+32)%8;");
-                wl!(out, "{pad}    if (gr0 < {m} && gc0 < {n}) {c}[gr0*{n}+gc0] = half(s0);");
-                wl!(out, "{pad}    if (gr1 < {m} && gc1 < {n}) {c}[gr1*{n}+gc1] = half(s1);");
+                wl!(out, "{pad}    uint pair = simd_lane >> 1;");
+                wl!(out, "{pad}    uint row_in_frag = (pair & 3u) + ((simd_lane >> 4) << 2);");
+                wl!(out, "{pad}    uint col0 = ((simd_lane & 1u) << 1) + (((simd_lane >> 3) & 1u) << 2);");
+                wl!(out, "{pad}    uint gr = row_base + sg_y*{sgm8} + {fi8} + row_in_frag;");
+                wl!(out, "{pad}    uint gc = col_base + sg_x*{sgn8} + {fj8} + col0;");
+                wl!(out, "{pad}    if (gr < {m}) {{");
+                wl!(out, "{pad}        if (n_aligned && gc + 1 < {n}) {{");
+                wl!(out, "{pad}            *((device half2*)({c} + gr*{n} + gc)) = half2(half(c{idx}_e.x), half(c{idx}_e.y));");
+                wl!(out, "{pad}        }} else {{");
+                wl!(out, "{pad}            if (gc < {n}) {c}[gr*{n}+gc] = half(c{idx}_e.x);");
+                wl!(out, "{pad}            if (gc + 1 < {n}) {c}[gr*{n}+gc+1] = half(c{idx}_e.y);");
+                wl!(out, "{pad}        }}");
+                wl!(out, "{pad}    }}");
                 wl!(out, "{pad}}}");
             }
         }
