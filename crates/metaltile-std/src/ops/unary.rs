@@ -324,3 +324,28 @@ pub fn mt_log1p<T>(a: Tensor<T>, out: Tensor<T>) {
     let x = load(a[idx]);
     store(out[idx], log(1.0f32.cast::<T>() + x));
 }
+
+// Softplus: out[i] = log(1 + exp(x[i])). Numerically-stable form: when
+// x is large, log(1 + exp(x)) ≈ x; when x is very negative,
+// log(1 + exp(x)) ≈ exp(x). The simple form overflows for x > ~85 in
+// fp32, so we add a max-with-0 shift: `log(1 + exp(-|x|)) + max(x, 0)`
+// which is exact across the full input range.
+//
+// MLX has no direct softplus kernel — included here because Mamba 2's
+// `dt = softplus(dt_raw + dt_bias)` step needs it. Benched standalone.
+#[bench_kernel(
+    op="unary",
+    subop="softplus",
+    class=Unary,
+    input=Signed,
+    tol=1e-4,
+)]
+#[kernel]
+pub fn mt_softplus<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id::<0>();
+    let x = load(a[idx]).cast::<f32>();
+    let abs_x = select(x < 0.0f32, -x, x);
+    let max0 = select(x > 0.0f32, x, 0.0f32);
+    let y = log(1.0f32 + exp(-abs_x)) + max0;
+    store(out[idx], y.cast::<T>());
+}

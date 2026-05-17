@@ -1415,6 +1415,7 @@ mod bench_impl {
                     mlx_pattern: #mlx_pat,
                     shapes:      #shapes_ts,
                     dispatch:    #dispatch_ts,
+                    kernel_mode: None,
                 }
             }
         }

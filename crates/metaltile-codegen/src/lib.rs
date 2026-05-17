@@ -8,6 +8,7 @@
 //! The output is a valid MSL source string that can be compiled by the
 //! Metal runtime.
 
+pub mod emit;
 pub mod error;
 pub mod msl;
 pub mod passes;

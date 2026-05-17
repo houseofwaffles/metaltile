@@ -216,6 +216,13 @@ pub struct BenchSpec {
     pub mlx_pattern: Option<&'static str>,
     pub shapes: &'static [ShapeSpec],
     pub dispatch: BenchDispatch,
+    /// Optional explicit kernel mode override. When `None`, downstream
+    /// tooling (e.g. `tile build`) infers the mode from `dispatch`/
+    /// `shapes` via `first_mode(spec)`. Used by codegen-only kernels
+    /// (empty `shapes`, `dispatch: Generic`) that need a non-default
+    /// mode — e.g. Reduction-mode dequant GEMV kernels that rely on
+    /// `lsize`/`tid` aliases the Elementwise mode doesn't provide.
+    pub kernel_mode: Option<KernelMode>,
 }
 
 inventory::collect!(BenchSpec);
