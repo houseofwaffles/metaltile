@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ask a question
+    url: https://github.com/0xClandestine/metaltile/discussions
+    about: Please use Discussions for questions and support
+  - name: Read the docs
+    url: https://github.com/0xClandestine/metaltile/blob/main/CONTRIBUTING.md
+    about: Check the contributing guide before opening a PR

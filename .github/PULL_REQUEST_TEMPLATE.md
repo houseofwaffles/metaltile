@@ -1,10 +1,7 @@
-## What
+## Proposed changes
 
-<!-- One-line summary of the change. -->
-
-## Why
-
-<!-- Motivation: bug fix, new op, perf improvement, refactor, etc. -->
+Please describe the problem or feature this PR addresses. Link any
+relevant issue with `#<issue-number>`.
 
 ## Crates affected
 
@@ -24,6 +21,19 @@
 
 ## Checklist
 
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` clean
-- [ ] `cargo test --workspace` passes
-- [ ] Typos clean (`typos`)
+- [ ] PR title uses a conventional-commit prefix (see below)
+- [ ] `make clippy` passes clean
+- [ ] `make test --workspace` passes
+- [ ] `make fmt-check` passes
+- [ ] `make typos` passes (or `typos` is clean)
+- [ ] PR body explains **what** and **why**
+
+## Conventional commit prefix
+
+PR title prefix is used by `auto-label.yml` for release-notes
+categorization. Use one of:
+
+`feat: …` `fix: …` `perf: …` `docs: …` `test: …`
+`chore: …` `ci: …` `build: …` `refactor: …` `style: …`
+
+Add `!` for breaking changes (`feat!: …`).
