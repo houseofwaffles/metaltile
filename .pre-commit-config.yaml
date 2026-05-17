@@ -1,0 +1,27 @@
+# Pre-commit hooks for metaltile.
+# Install:  pip install pre-commit && pre-commit install
+# Run all:  pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        language: system
+        entry: cargo fmt --all -- --check
+        pass_filenames: false
+        types: [rust]
+
+      - id: clippy
+        name: clippy
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        pass_filenames: false
+        types: [rust]
+
+      - id: typos
+        name: typos
+        language: system
+        entry: typos
+        pass_filenames: false
+        types: [text]

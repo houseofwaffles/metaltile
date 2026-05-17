@@ -1100,14 +1100,15 @@ fn run_attention(
     };
     const REF_FCS: &[(usize, bool)] =
         &[(20, false), (21, false), (22, false), (23, false), (24, false), (25, false)];
-    let ref_name = match dt {
-        DType::F32 => "sdpa_vector_float_128_128",
-        DType::F16 => "sdpa_vector_float16_t_128_128",
-        _ => return vec![],
+    // MLX ships sdpa_vector only for f32/f16; bf16 still runs correctness vs CPU reference.
+    let ref_name: Option<&str> = match dt {
+        DType::F32 => Some("sdpa_vector_float_128_128"),
+        DType::F16 => Some("sdpa_vector_float16_t_128_128"),
+        _ => None,
     };
-    let rk = spec
-        .mlx_src
-        .and_then(|src| runner.compile_with_bool_constants(src, ref_name, REF_FCS).ok());
+    let rk = ref_name.and_then(|name| {
+        spec.mlx_src.and_then(|src| runner.compile_with_bool_constants(src, name, REF_FCS).ok())
+    });
     let mut results = Vec::new();
     for &(h, n_kv, d) in shapes {
         let scale = 1.0_f32 / (d as f32).sqrt();
@@ -1147,40 +1148,12 @@ fn run_attention(
             }
             out
         };
-        let (q_b, k_b, v_b, out_b, n_b, sc_b) = if dt == DType::F32 {
-            let q_b = buffer_typed(runner, &cq, dt);
-            let k_b = buffer_typed(runner, &ck_, dt);
-            let v_b = buffer_typed(runner, &cv, dt);
-            let out_b = zeros_typed(runner, ch * d, dt);
-            let n_b = runner.buffer_u32(cn as u32);
-            let sc_b = runner.buffer_f32_scalar(scale);
-            (q_b, k_b, v_b, out_b, n_b, sc_b)
-        } else {
-            let f32_to_f16 = |v: f32| -> u16 {
-                let x = v.to_bits();
-                let sign = ((x >> 31) as u16) << 15;
-                let exp = ((x >> 23) & 0xFF) as i32 - 127 + 15;
-                let mant32 = x & 0x7F_FFFF;
-                if exp <= 0 {
-                    return sign;
-                }
-                if exp >= 31 {
-                    return sign | 0x7C00;
-                }
-                let mant16 = mant32 >> 13;
-                sign | ((exp as u16) << 10) | (mant16 as u16)
-            };
-            let q_f16: Vec<u16> = cq.iter().copied().map(f32_to_f16).collect();
-            let k_f16: Vec<u16> = ck_.iter().copied().map(f32_to_f16).collect();
-            let v_f16: Vec<u16> = cv.iter().copied().map(f32_to_f16).collect();
-            let q_b = runner.buffer_f16(&q_f16);
-            let k_b = runner.buffer_f16(&k_f16);
-            let v_b = runner.buffer_f16(&v_f16);
-            let out_b = runner.buffer_zeros(ch * d * 2);
-            let n_b = runner.buffer_u32(cn as u32);
-            let sc_b = runner.buffer_f32_scalar(scale);
-            (q_b, k_b, v_b, out_b, n_b, sc_b)
-        };
+        let q_b = buffer_typed(runner, &cq, dt);
+        let k_b = buffer_typed(runner, &ck_, dt);
+        let v_b = buffer_typed(runner, &cv, dt);
+        let out_b = zeros_typed(runner, ch * d, dt);
+        let n_b = runner.buffer_u32(cn as u32);
+        let sc_b = runner.buffer_f32_scalar(scale);
         runner.measure(
             &mk,
             &[&q_b, &k_b, &v_b, &out_b, &n_b, &sc_b],
@@ -1189,58 +1162,22 @@ fn run_attention(
             0,
             1,
         );
-        let mt_chk = if dt == DType::F32 {
-            runner.read_f32_slice(&out_b, ch * d)
-        } else {
-            runner.read_f16_slice(&out_b, ch * d)
-        };
+        let mt_chk = crate::measure::read_typed(runner, &out_b, ch * d, dt);
         let equiv = check_equiv_with(&ref_out, &mt_chk, EquivTolerance::new(spec.tol, 0.999));
 
         let vals: Vec<f32> = (0..h * n_kv * d).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
         let bytes = (h * n_kv * d * ctx.eb * 2 + h * d * ctx.eb * 2) as f64;
-        let (q_buf, k_buf, v_buf, n_buf, sc_buf) = if dt == DType::F32 {
-            let qb = buffer_typed(runner, &vals[..h * d], dt);
-            let kb = buffer_typed(runner, &vals[..h * n_kv * d], dt);
-            let vb = buffer_typed(runner, &vals[..h * n_kv * d], dt);
-            let nb = runner.buffer_u32(n_kv as u32);
-            let sb = runner.buffer_f32_scalar(scale);
-            (qb, kb, vb, nb, sb)
-        } else {
-            let f32_to_f16 = |v: f32| -> u16 {
-                let x = v.to_bits();
-                let sign = ((x >> 31) as u16) << 15;
-                let exp = ((x >> 23) & 0xFF) as i32 - 127 + 15;
-                let mant16 = (x & 0x7F_FFFF) >> 13;
-                if exp <= 0 {
-                    return sign;
-                }
-                if exp >= 31 {
-                    return sign | 0x7C00;
-                }
-                sign | ((exp as u16) << 10) | (mant16 as u16)
-            };
-            let qb = runner
-                .buffer_f16(&vals[..h * d].iter().copied().map(f32_to_f16).collect::<Vec<_>>());
-            let kb = runner.buffer_f16(
-                &vals[..h * n_kv * d].iter().copied().map(f32_to_f16).collect::<Vec<_>>(),
-            );
-            let vb = runner.buffer_f16(
-                &vals[..h * n_kv * d].iter().copied().map(f32_to_f16).collect::<Vec<_>>(),
-            );
-            let nb = runner.buffer_u32(n_kv as u32);
-            let sb = runner.buffer_f32_scalar(scale);
-            (qb, kb, vb, nb, sb)
-        };
+        let q_buf = buffer_typed(runner, &vals[..h * d], dt);
+        let k_buf = buffer_typed(runner, &vals[..h * n_kv * d], dt);
+        let v_buf = buffer_typed(runner, &vals[..h * n_kv * d], dt);
+        let n_buf = runner.buffer_u32(n_kv as u32);
+        let sc_buf = runner.buffer_f32_scalar(scale);
         let ref_perf = rk.as_ref().and_then(|rk| {
             let gqa = runner.buffer_i32(1i32);
             let n_i32 = runner.buffer_i32(n_kv as i32);
             let khs = runner.buffer_u64((n_kv * d) as u64);
             let kss = runner.buffer_u64(d as u64);
-            let out = if dt == DType::F32 {
-                zeros_typed(runner, h * d, dt)
-            } else {
-                runner.buffer_zeros(h * d * 2)
-            };
+            let out = zeros_typed(runner, h * d, dt);
             bench_gbps(
                 runner,
                 rk,
@@ -1251,11 +1188,7 @@ fn run_attention(
             )
         });
         let mt_perf = {
-            let out = if dt == DType::F32 {
-                zeros_typed(runner, h * d, dt)
-            } else {
-                runner.buffer_zeros(h * d * 2)
-            };
+            let out = zeros_typed(runner, h * d, dt);
             bench_gbps(
                 runner,
                 &mk,

@@ -30,7 +30,7 @@ def find_issues(text):
     while i >= 0 and lines[i].strip() != "" and TRAILER_RE.match(lines[i]):
         trailers.append(lines[i])
         i -= 1
-    if trailers and (i < 0 or lines[i].strip() == ""):
+    if trailers and i >= 0 and lines[i].strip() == "":
         for t in reversed(trailers):
             issues.append(("trailer", t.strip()))
     return issues
@@ -46,7 +46,7 @@ def clean_text(text):
         trailer_start = i
         i -= 1
     if trailer_start < len(lines):
-        if trailer_start == 0 or lines[trailer_start - 1].strip() == "":
+        if trailer_start > 0 and lines[trailer_start - 1].strip() == "":
             lines = lines[:trailer_start]
             while lines and not lines[-1].strip():
                 lines.pop()

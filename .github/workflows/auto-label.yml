@@ -1,0 +1,74 @@
+name: PR
+
+# Apply a release-notes label based on the PR title's conventional-commit
+# prefix (`feat:` / `fix:` / `perf:` / etc.). Without this, GitHub's
+# `--generate-notes` falls back to the `*` catch-all in
+# `.github/release.yml` and dumps every PR into "Other Changes".
+#
+# Title-prefix → label mapping:
+#   feat: / feature:           → feature
+#   fix: / bugfix:             → bug
+#   perf:                      → performance
+#   docs: / doc:               → documentation
+#   test: / tests:             → test
+#   chore: / ci: / build: /
+#   refactor: / style:         → ignore-for-release  (hidden from notes)
+#   any prefix with `!` (e.g.  → breaking
+#   `feat!:` / `fix!:`)
+#   "BREAKING CHANGE" anywhere → breaking
+#
+# Order of the regex tests matters: longer prefixes are checked first so
+# `feat(scope):` doesn't fall through to a later match. Scope (the
+# `(...)` group) is optional — both `feat:` and `feat(qwen35):` work.
+#
+# Each PR gets at most ONE label from this workflow. If the title has no
+# matching prefix, no label is applied and the PR falls to "Other Changes"
+# in release notes — same as today.
+
+on:
+  # `pull_request_target` (not `pull_request`) so the workflow can label PRs
+  # opened from forks. For `pull_request` events from forks GitHub forces
+  # `GITHUB_TOKEN` to read-only, which makes label add/create fail even when
+  # `permissions:` declares write. `pull_request_target` runs against the
+  # base ref with full base-repo permissions. Safe here because this job
+  # only reads `pull_request.title` — it never checks out the PR's code.
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: write
+  issues: write  # required for `gh label create` (labels are an issues-scope resource)
+
+jobs:
+  apply-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply Label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          label=""; color=""; desc=""
+          # `breaking` checked first so `feat!:` / `fix!:` etc. always win
+          # over their non-breaking sibling. Body-level "BREAKING CHANGE"
+          # marker is a conventional-commits convention.
+          if   [[ "$PR_TITLE" == *"BREAKING CHANGE"* ]]                                  ; then label="breaking";          color="d73a4a"; desc="Breaking change"
+          elif [[ "$PR_TITLE" =~ ^[a-z]+(\(.+\))?\!: ]]                                  ; then label="breaking";          color="d73a4a"; desc="Breaking change"
+          elif [[ "$PR_TITLE" =~ ^(feat|feature)(\(.+\))?: ]]                            ; then label="feature";           color="0e8a16"; desc="New feature"
+          elif [[ "$PR_TITLE" =~ ^(fix|bugfix)(\(.+\))?: ]]                              ; then label="bug";               color="d73a4a"; desc="Bug fix"
+          elif [[ "$PR_TITLE" =~ ^perf(\(.+\))?: ]]                                      ; then label="performance";       color="1d76db"; desc="Performance improvement"
+          elif [[ "$PR_TITLE" =~ ^docs?(\(.+\))?: ]]                                     ; then label="documentation";     color="0075ca"; desc="Documentation"
+          elif [[ "$PR_TITLE" =~ ^tests?(\(.+\))?: ]]                                    ; then label="test";              color="fbca04"; desc="Tests"
+          elif [[ "$PR_TITLE" =~ ^(chore|ci|build|refactor|style)(\(.+\))?: ]]           ; then label="ignore-for-release"; color="cccccc"; desc="Hidden from release notes"
+          fi
+          if [ -n "$label" ]; then
+            echo "Applying label: $label"
+            # Self-bootstrap: create the label if the repo doesn't have it yet.
+            # `gh label create` errors when the label already exists; swallow that
+            # so the step stays idempotent across runs.
+            gh label create "$label" --color "$color" --description "$desc" --repo "${{ github.repository }}" 2>/dev/null || true
+            gh pr edit "$PR_NUM" --add-label "$label" --repo "${{ github.repository }}"
+          else
+            echo "No matching prefix in '$PR_TITLE'; leaving unlabeled (will fall to 'Other Changes')."
+          fi

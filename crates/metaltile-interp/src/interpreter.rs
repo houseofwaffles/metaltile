@@ -483,7 +483,9 @@ impl Interpreter {
                         } else {
                             0.0
                         },
-                    UnaryOpKind::Round => v.round(),
+                    // Match GPU rint() semantics (round-half-to-even, IEEE 754 default),
+                    // not Rust f64::round() which is half-away-from-zero.
+                    UnaryOpKind::Round => v.round_ties_even(),
                     UnaryOpKind::Trunc => v.trunc(),
                 };
                 if let Some(rid) = result {
@@ -1168,7 +1170,8 @@ impl Interpreter {
             UnaryOpKind::Exp2 => v.exp2(),
             UnaryOpKind::Log2 => v.log2(),
             UnaryOpKind::Sign => v.signum(),
-            UnaryOpKind::Round => v.round(),
+            // Match GPU rint() semantics (round-half-to-even).
+            UnaryOpKind::Round => v.round_ties_even(),
             UnaryOpKind::Trunc => v.trunc(),
         }
     }
