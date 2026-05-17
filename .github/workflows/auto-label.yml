@@ -26,7 +26,13 @@ name: Auto-label PRs
 # in release notes — same as today.
 
 on:
-  pull_request:
+  # `pull_request_target` (not `pull_request`) so the workflow can label PRs
+  # opened from forks. For `pull_request` events from forks GitHub forces
+  # `GITHUB_TOKEN` to read-only, which makes label add/create fail even when
+  # `permissions:` declares write. `pull_request_target` runs against the
+  # base ref with full base-repo permissions. Safe here because this job
+  # only reads `pull_request.title` — it never checks out the PR's code.
+  pull_request_target:
     types: [opened, edited, reopened, synchronize]
 
 permissions:
