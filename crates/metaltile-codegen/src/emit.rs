@@ -281,8 +281,25 @@ pub fn compile_metallib(
             .and_then(|s| s.to_str())
             .ok_or_else(|| EmitError::MetalToolchain(format!("bad filename: {}", metal.display())))?;
         let air = air_dir.join(format!("{stem}.air"));
+        // Codegen-artifact warnings we deliberately suppress:
+        //
+        // * `-Wno-sign-compare`: the MSL generator currently emits integer
+        //   literals as `int` even when compared against `uint` (so e.g.
+        //   `if lid < 128u32` in the DSL becomes
+        //   `if (v_lid < (int v123 = 128))` in MSL, triggering a warning).
+        //   The DSL keeps the unsigned semantics correct; the warning is
+        //   purely about C-style implicit conversion.
+        // * `-Wno-unused-variable`: the kernel preamble always defines
+        //   `tgid_y`, `tgid_z`, and a handful of temporary aliases even
+        //   when the kernel body doesn't reference them.
+        //
+        // Both are tracked-down-the-road codegen-quality fixes (emit `uint`
+        // literals when context is unsigned; only declare alias variables
+        // that are referenced). Until then this keeps the build log clean
+        // without losing signal on actual MSL warnings.
         let status = Command::new("xcrun")
             .args(["-sdk", sdk, "metal", "-c"])
+            .args(["-Wno-sign-compare", "-Wno-unused-variable"])
             .arg(metal)
             .arg("-o")
             .arg(&air)
