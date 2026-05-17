@@ -31,6 +31,7 @@ on:
 
 permissions:
   pull-requests: write
+  issues: write  # required for `gh label create` (labels are an issues-scope resource)
 
 jobs:
   label:
@@ -42,21 +43,25 @@ jobs:
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          label=""
+          label=""; color=""; desc=""
           # `breaking` checked first so `feat!:` / `fix!:` etc. always win
           # over their non-breaking sibling. Body-level "BREAKING CHANGE"
           # marker is a conventional-commits convention.
-          if   [[ "$PR_TITLE" == *"BREAKING CHANGE"* ]]                                  ; then label="breaking"
-          elif [[ "$PR_TITLE" =~ ^[a-z]+(\(.+\))?\!: ]]                                  ; then label="breaking"
-          elif [[ "$PR_TITLE" =~ ^(feat|feature)(\(.+\))?: ]]                            ; then label="feature"
-          elif [[ "$PR_TITLE" =~ ^(fix|bugfix)(\(.+\))?: ]]                              ; then label="bug"
-          elif [[ "$PR_TITLE" =~ ^perf(\(.+\))?: ]]                                      ; then label="performance"
-          elif [[ "$PR_TITLE" =~ ^docs?(\(.+\))?: ]]                                     ; then label="documentation"
-          elif [[ "$PR_TITLE" =~ ^tests?(\(.+\))?: ]]                                    ; then label="test"
-          elif [[ "$PR_TITLE" =~ ^(chore|ci|build|refactor|style)(\(.+\))?: ]]           ; then label="ignore-for-release"
+          if   [[ "$PR_TITLE" == *"BREAKING CHANGE"* ]]                                  ; then label="breaking";          color="d73a4a"; desc="Breaking change"
+          elif [[ "$PR_TITLE" =~ ^[a-z]+(\(.+\))?\!: ]]                                  ; then label="breaking";          color="d73a4a"; desc="Breaking change"
+          elif [[ "$PR_TITLE" =~ ^(feat|feature)(\(.+\))?: ]]                            ; then label="feature";           color="0e8a16"; desc="New feature"
+          elif [[ "$PR_TITLE" =~ ^(fix|bugfix)(\(.+\))?: ]]                              ; then label="bug";               color="d73a4a"; desc="Bug fix"
+          elif [[ "$PR_TITLE" =~ ^perf(\(.+\))?: ]]                                      ; then label="performance";       color="1d76db"; desc="Performance improvement"
+          elif [[ "$PR_TITLE" =~ ^docs?(\(.+\))?: ]]                                     ; then label="documentation";     color="0075ca"; desc="Documentation"
+          elif [[ "$PR_TITLE" =~ ^tests?(\(.+\))?: ]]                                    ; then label="test";              color="fbca04"; desc="Tests"
+          elif [[ "$PR_TITLE" =~ ^(chore|ci|build|refactor|style)(\(.+\))?: ]]           ; then label="ignore-for-release"; color="cccccc"; desc="Hidden from release notes"
           fi
           if [ -n "$label" ]; then
             echo "Applying label: $label"
+            # Self-bootstrap: create the label if the repo doesn't have it yet.
+            # `gh label create` errors when the label already exists; swallow that
+            # so the step stays idempotent across runs.
+            gh label create "$label" --color "$color" --description "$desc" --repo "${{ github.repository }}" 2>/dev/null || true
             gh pr edit "$PR_NUM" --add-label "$label" --repo "${{ github.repository }}"
           else
             echo "No matching prefix in '$PR_TITLE'; leaving unlabeled (will fall to 'Other Changes')."
