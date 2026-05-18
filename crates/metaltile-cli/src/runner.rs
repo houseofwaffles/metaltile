@@ -436,7 +436,11 @@ impl GpuRunner {
         {
             use objc2_metal::{MTLDevice, MTLGPUFamily};
             let dev = &self.inner.device;
-            dev.supportsFamily(MTLGPUFamily::Apple9)
+            // Apple GPU families are cumulative — Apple10 (M5) implies Apple9/8/7 —
+            // so any of these returning true is sufficient. Listed newest-first to
+            // short-circuit on modern hardware.
+            dev.supportsFamily(MTLGPUFamily::Apple10)
+                || dev.supportsFamily(MTLGPUFamily::Apple9)
                 || dev.supportsFamily(MTLGPUFamily::Apple8)
                 || dev.supportsFamily(MTLGPUFamily::Apple7)
         }
