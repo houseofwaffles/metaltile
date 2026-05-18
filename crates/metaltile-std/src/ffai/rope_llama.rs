@@ -28,7 +28,7 @@ use crate::{
 };
 
 #[kernel]
-pub fn rope_llama<T>(
+pub fn ffai_rope_llama<T>(
     qk: Tensor<T>,
     out: Tensor<T>,
     #[constexpr] head_dim: u32,
@@ -84,8 +84,8 @@ inventory::submit! {
     BenchSpec {
         op: "rope",
         subop: "rope_llama",
-        kernel_name: "rope_llama",
-        kernel_ir: rope_llama::kernel_ir_for,
+        kernel_name: "ffai_rope_llama",
+        kernel_ir: ffai_rope_llama::kernel_ir_for,
         dtypes: &[DType::F32, DType::F16, DType::BF16],
         tol: 0.0,
         mlx_src: None,

@@ -38,7 +38,7 @@ use crate::{
 };
 
 #[kernel]
-pub fn sdpa_decode<T>(
+pub fn ffai_sdpa_decode<T>(
     q: Tensor<T>,
     k: Tensor<T>,
     v: Tensor<T>,
@@ -195,8 +195,8 @@ inventory::submit! {
     BenchSpec {
         op: "sdpa",
         subop: "sdpa_decode",
-        kernel_name: "sdpa_decode",
-        kernel_ir: sdpa_decode::kernel_ir_for,
+        kernel_name: "ffai_sdpa_decode",
+        kernel_ir: ffai_sdpa_decode::kernel_ir_for,
         dtypes: &[DType::F32, DType::F16, DType::BF16],
         tol: 1e-3,
         mlx_src: None,
@@ -212,13 +212,13 @@ mod tests {
     use metaltile_codegen::msl::MslGenerator;
     use metaltile_core::ir::KernelMode;
 
-    use super::sdpa_decode;
+    use super::ffai_sdpa_decode;
     use crate::bench_types::DType;
 
     fn msl_for(dt: DType) -> String {
-        let mut k = sdpa_decode::kernel_ir_for(dt);
+        let mut k = ffai_sdpa_decode::kernel_ir_for(dt);
         k.mode = KernelMode::Reduction;
-        MslGenerator::default().generate(&k).expect("sdpa_decode codegen succeeds")
+        MslGenerator::default().generate(&k).expect("ffai_sdpa_decode codegen succeeds")
     }
 
     #[test]
@@ -227,7 +227,7 @@ mod tests {
             let src = msl_for(dt);
             assert!(!src.trim().is_empty(), "MSL for {dt:?} should not be empty");
             assert!(
-                src.contains("kernel void sdpa_decode"),
+                src.contains("kernel void ffai_sdpa_decode"),
                 "MSL for {dt:?} should declare the kernel function:\n{src}",
             );
         }

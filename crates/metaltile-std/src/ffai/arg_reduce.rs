@@ -47,7 +47,7 @@ macro_rules! argmax_step {
 }
 
 #[kernel]
-pub fn argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
+pub fn ffai_argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
     let lid = tid;
     let mut best_val = neg_infinity();
     let mut best_idx = lid - lid;
@@ -96,8 +96,8 @@ inventory::submit! {
         // "argmax" in mlx/arg_reduce.rs) but doesn't collide with it
         // in the bench table.
         subop: "argmax_u32",
-        kernel_name: "argmax",
-        kernel_ir: argmax::kernel_ir_for,
+        kernel_name: "ffai_argmax",
+        kernel_ir: ffai_argmax::kernel_ir_for,
         dtypes: &[DType::F32, DType::F16, DType::BF16],
         tol: 0.0,
         mlx_src: None,

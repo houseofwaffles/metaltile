@@ -15,7 +15,7 @@ use crate::{
 };
 
 #[kernel]
-pub fn gather<T>(table: Tensor<T>, indices: Tensor<u32>, out: Tensor<T>, #[constexpr] dim: u32) {
+pub fn ffai_gather<T>(table: Tensor<T>, indices: Tensor<u32>, out: Tensor<T>, #[constexpr] dim: u32) {
     let idx = program_id::<0>();
     let token = idx / dim;
     let d = idx - token * dim;
@@ -28,8 +28,8 @@ inventory::submit! {
     BenchSpec {
         op: "gather",
         subop: "gather",
-        kernel_name: "gather",
-        kernel_ir: gather::kernel_ir_for,
+        kernel_name: "ffai_gather",
+        kernel_ir: ffai_gather::kernel_ir_for,
         dtypes: &[DType::F32, DType::F16, DType::BF16],
         tol: 0.0,
         mlx_src: None,
