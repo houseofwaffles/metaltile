@@ -102,9 +102,19 @@ mod tests {
         let b = ConstExpr::new("B");
         assert!(a < b);
         assert_ne!(a, b);
-        // Hashing — relies on derive(Hash) producing a consistent value
-        // for equal instances; covered by use as a BTreeMap key in
-        // ConstExprValues below.
+    }
+
+    #[test]
+    fn hash_consistent_with_equality() {
+        // `derive(Hash)` must agree with `derive(PartialEq)`: equal
+        // instances hash to the same value. Verified by round-trip
+        // through `HashSet::contains` — would miss the lookup if the
+        // hash didn't agree.
+        use std::collections::HashSet;
+        let mut seen: HashSet<ConstExpr> = HashSet::new();
+        seen.insert(ConstExpr::new("BLOCK_SIZE"));
+        assert!(seen.contains(&ConstExpr::new("BLOCK_SIZE")));
+        assert!(!seen.contains(&ConstExpr::new("OTHER")));
     }
 
     #[test]

@@ -205,15 +205,19 @@ mod tests {
     }
 
     #[test]
-    fn copy_and_eq_round_trip_through_match() {
-        // Smoke check: Copy + PartialEq + Hash trait derives wire up.
+    fn copy_eq_and_hash_consistent_per_variant() {
+        // Copy + PartialEq + Hash derives wire up AND hashing agrees
+        // with equality: each variant hashes the same as its copy.
         use std::hash::{Hash, Hasher};
+        let hash_of = |dt: DType| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            dt.hash(&mut h);
+            h.finish()
+        };
         for &dt in ALL {
             let copy = dt;
             assert_eq!(dt, copy);
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            dt.hash(&mut h);
-            let _ = h.finish();
+            assert_eq!(hash_of(dt), hash_of(copy), "hash differs for copy of {dt:?}");
         }
     }
 }
