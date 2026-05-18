@@ -871,4 +871,373 @@ mod tests {
         k.body.push_op(Op::Const { value: 3 }, ValueId::new(3));
         assert_eq!(find_max_vid(&k), 5);
     }
+
+    // ── op-variant coverage ───────────────────────────────────────────────
+    //
+    // The existing `all_op_variants_covered` test exercises a handful of
+    // Op variants and notes "we can't exhaustively instantiate every
+    // variant". The tests below add coverage on the remaining ~40 variants
+    // so the match arms in `remap_value_ids`, `op_value_refs`, and
+    // `max_vid_in_op` are not silently broken by future additions to
+    // `Op`. Each test groups variants by category for readability.
+
+    use metaltile_core::{
+        dtype::DType,
+        ir::{ActKind, AtomicKind, AttnParams, ReduceKind, UnaryOpKind},
+        shape::Shape,
+    };
+
+    /// Apply remap, refs, max in one place — keeps each variant case a
+    /// single line in the per-category tests below.
+    fn check_op(op: Op, expected_refs: usize, expected_max: u32) {
+        let refs = op_value_refs(&op);
+        assert_eq!(
+            refs.len(),
+            expected_refs,
+            "op_value_refs returned {} refs for {op:?}, expected {expected_refs}",
+            refs.len(),
+        );
+        assert_eq!(
+            max_vid_in_op(&op),
+            expected_max,
+            "max_vid_in_op returned wrong value for {op:?}",
+        );
+        // No-op map: remap_value_ids must not panic on any variant and
+        // must leave value refs unchanged.
+        let mut op_remapped = op.clone();
+        let empty: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+        remap_value_ids(&mut op_remapped, &empty);
+        assert_eq!(op_value_refs(&op_remapped), refs);
+    }
+
+    #[test]
+    fn arith_and_cast_variants() {
+        check_op(Op::ProgramId { axis: 0 }, 0, 0);
+        check_op(Op::Const { value: 7 }, 0, 0);
+        check_op(Op::Cast { value: ValueId::new(3), dtype: DType::F16 }, 1, 3);
+        check_op(Op::UnaryOp { op: UnaryOpKind::Exp, value: ValueId::new(4) }, 1, 4);
+        check_op(Op::Activation { kind: ActKind::Silu, value: ValueId::new(5) }, 1, 5);
+        check_op(Op::Dot { a: ValueId::new(2), b: ValueId::new(8) }, 2, 8);
+        check_op(
+            Op::Select {
+                cond: ValueId::new(1),
+                on_true: ValueId::new(2),
+                on_false: ValueId::new(3),
+            },
+            3,
+            3,
+        );
+    }
+
+    #[test]
+    fn tile_shape_variants() {
+        let shape = Shape::scalar();
+        check_op(Op::Zeros { dtype: DType::F32, shape: shape.clone() }, 0, 0);
+        check_op(Op::Transpose { value: ValueId::new(6) }, 1, 6);
+        check_op(Op::ExpandDims { value: ValueId::new(7), axis: 0 }, 1, 7);
+        check_op(Op::Reshape { value: ValueId::new(8), shape: shape.clone() }, 1, 8);
+        check_op(
+            Op::Cat { values: vec![ValueId::new(2), ValueId::new(9), ValueId::new(4)], axis: 0 },
+            3,
+            9,
+        );
+        check_op(
+            Op::Slice { value: ValueId::new(11), ranges: vec![(0, 0, 4)] },
+            1,
+            11,
+        );
+        check_op(Op::Broadcast { value: ValueId::new(12), shape: shape.clone() }, 1, 12);
+        check_op(Op::Splat { value: 1.0, dtype: DType::F32, shape }, 0, 0);
+    }
+
+    #[test]
+    fn reduce_and_scan_variants() {
+        check_op(
+            Op::Reduce { value: ValueId::new(13), axis: 0, op: ReduceKind::Sum },
+            1,
+            13,
+        );
+        check_op(
+            Op::Scan {
+                value: ValueId::new(14),
+                axis: 0,
+                op: ReduceKind::Max,
+                exclusive: false,
+            },
+            1,
+            14,
+        );
+        check_op(
+            Op::ArgReduce { value: ValueId::new(15), axis: 0, op: ReduceKind::Max },
+            1,
+            15,
+        );
+        check_op(Op::SimdReduce { value: ValueId::new(16), op: ReduceKind::Sum }, 1, 16);
+        check_op(Op::SimdScan { value: ValueId::new(17), op: ReduceKind::Sum, exclusive: true }, 1, 17);
+        check_op(
+            Op::StrideScan {
+                src: "x".into(),
+                dst: "y".into(),
+                offset: ValueId::new(18),
+                end: ValueId::new(19),
+                op: ReduceKind::Sum,
+            },
+            2,
+            19,
+        );
+        check_op(
+            Op::StrideArgReduce {
+                src: "x".into(),
+                offset: ValueId::new(20),
+                end: ValueId::new(21),
+                op: ReduceKind::Max,
+            },
+            2,
+            21,
+        );
+        check_op(
+            Op::StrideStore {
+                src: "x".into(),
+                dst: "y".into(),
+                offset: ValueId::new(22),
+                end: ValueId::new(23),
+                scalar: ValueId::new(24),
+                aux_src: Some("w".into()),
+            },
+            3,
+            24,
+        );
+    }
+
+    #[test]
+    fn indexed_memory_variants() {
+        check_op(
+            Op::Gather { src: "x".into(), indices: ValueId::new(25), axis: 0 },
+            1,
+            25,
+        );
+        check_op(
+            Op::Scatter {
+                dst: "y".into(),
+                indices: ValueId::new(26),
+                value: ValueId::new(27),
+                axis: 0,
+            },
+            2,
+            27,
+        );
+        check_op(
+            Op::Atomic {
+                op: AtomicKind::Add,
+                dst: "z".into(),
+                index: ValueId::new(28),
+                value: ValueId::new(29),
+            },
+            2,
+            29,
+        );
+        check_op(
+            Op::VectorLoad { src: "x".into(), byte_offset: ValueId::new(30), len: 4 },
+            1,
+            30,
+        );
+        check_op(
+            Op::VectorStore {
+                dst: "y".into(),
+                byte_offset: ValueId::new(31),
+                len: 4,
+                value: ValueId::new(32),
+            },
+            2,
+            32,
+        );
+    }
+
+    #[test]
+    fn attention_and_ml_variants() {
+        check_op(
+            Op::FlashAttention {
+                q: ValueId::new(33),
+                k: ValueId::new(34),
+                v: ValueId::new(35),
+                params: AttnParams { scale: None, is_causal: false, dropout_p: 0.0 },
+            },
+            3,
+            35,
+        );
+        check_op(
+            Op::SlidingWindowAttention {
+                q: ValueId::new(36),
+                k: ValueId::new(37),
+                v: ValueId::new(38),
+                window: 128,
+            },
+            3,
+            38,
+        );
+        check_op(
+            Op::RmsNorm { x: ValueId::new(39), scale: ValueId::new(40), eps: 1e-5 },
+            2,
+            40,
+        );
+        check_op(
+            Op::GatedMlp {
+                x: ValueId::new(41),
+                gate_proj: ValueId::new(42),
+                up_proj: ValueId::new(43),
+                down_proj: ValueId::new(44),
+            },
+            4,
+            44,
+        );
+    }
+
+    #[test]
+    fn threadgroup_and_local_variants() {
+        check_op(
+            Op::ThreadgroupLoad { name: "tg".into(), index: ValueId::new(45) },
+            1,
+            45,
+        );
+        check_op(
+            Op::ThreadgroupStore {
+                name: "tg".into(),
+                index: ValueId::new(46),
+                value: ValueId::new(47),
+            },
+            2,
+            47,
+        );
+        check_op(Op::Barrier, 0, 0);
+        check_op(
+            Op::DeclareLocal { name: "l".into(), value: ValueId::new(48) },
+            1,
+            48,
+        );
+        check_op(Op::SetLocal { name: "l".into(), value: ValueId::new(49) }, 1, 49);
+    }
+
+    #[test]
+    fn simdgroup_matrix_variants() {
+        check_op(Op::SimdgroupAlloc { dtype: DType::F32, m: 8, n: 8 }, 0, 0);
+        check_op(Op::SimdgroupElemLoad { value: ValueId::new(50), index: 0 }, 1, 50);
+        check_op(
+            Op::SimdgroupElemStore { value: ValueId::new(51), index: 0, data: ValueId::new(52) },
+            2,
+            52,
+        );
+        // SimdgroupMatMul / SimdgroupAlloc reference named simdgroup slots
+        // (not SSA ValueIds), so remap treats them as having no refs.
+        check_op(
+            Op::SimdgroupMatMul {
+                a: ValueId::new(53),
+                b: ValueId::new(54),
+                c: ValueId::new(55),
+            },
+            0,
+            0,
+        );
+        check_op(Op::SimdLaneId, 0, 0);
+        check_op(Op::SimdGroupId, 0, 0);
+    }
+
+    #[test]
+    fn dequant_variant() {
+        check_op(
+            Op::Dequantize {
+                weights: "w".into(),
+                scales: "s".into(),
+                zeros: "z".into(),
+                group_size: 64,
+                bits: 4,
+            },
+            0,
+            0,
+        );
+    }
+
+    // ── op-classification predicates ──────────────────────────────────────
+
+    #[test]
+    fn predicate_loads_and_stores() {
+        // is_load / is_store / has_side_effects classification.
+        // Note: Load is NOT considered a side effect here — only Store /
+        // Atomic / Barrier / *Alloc / *Local are. Loads can be moved as
+        // long as the source isn't aliased by an interleaving Store.
+        let load = Op::Load {
+            src: "a".into(),
+            indices: vec![IndexExpr::Const(0)],
+            mask: None,
+            other: None,
+        };
+        assert!(is_load(&load));
+        assert!(!is_store(&load));
+        assert!(!has_side_effects(&load));
+
+        let store = Op::Store {
+            dst: "a".into(),
+            indices: vec![IndexExpr::Const(0)],
+            value: ValueId::new(1),
+            mask: None,
+        };
+        assert!(is_store(&store));
+        assert!(!is_load(&store));
+        assert!(has_side_effects(&store));
+
+        let vload = Op::VectorLoad { src: "a".into(), byte_offset: ValueId::new(1), len: 4 };
+        assert!(is_load(&vload));
+        assert!(!has_side_effects(&vload));
+
+        let vstore = Op::VectorStore {
+            dst: "a".into(),
+            byte_offset: ValueId::new(1),
+            len: 4,
+            value: ValueId::new(2),
+        };
+        assert!(is_store(&vstore));
+        assert!(has_side_effects(&vstore));
+
+        let tgload = Op::ThreadgroupLoad { name: "tg".into(), index: ValueId::new(1) };
+        assert!(is_load(&tgload));
+
+        let tgstore = Op::ThreadgroupStore {
+            name: "tg".into(),
+            index: ValueId::new(1),
+            value: ValueId::new(2),
+        };
+        assert!(is_store(&tgstore));
+        assert!(has_side_effects(&tgstore));
+    }
+
+    #[test]
+    fn predicate_barrier_and_atomic() {
+        assert!(is_barrier(&Op::Barrier));
+        assert!(has_side_effects(&Op::Barrier));
+        assert!(!is_load(&Op::Barrier));
+
+        let atomic = Op::Atomic {
+            op: AtomicKind::Add,
+            dst: "x".into(),
+            index: ValueId::new(0),
+            value: ValueId::new(1),
+        };
+        assert!(has_side_effects(&atomic));
+        assert!(!is_cheap_alu(&atomic));
+    }
+
+    #[test]
+    fn predicate_cheap_alu() {
+        // BinOp / UnaryOp / Const / Cast all qualify as cheap ALU and can
+        // be rematerialized or sunk by value_sink / LICM.
+        let binop =
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(0), rhs: ValueId::new(1) };
+        assert!(is_cheap_alu(&binop));
+        assert!(!has_side_effects(&binop));
+
+        let cst = Op::Const { value: 0 };
+        assert!(is_cheap_alu(&cst));
+
+        let cast = Op::Cast { value: ValueId::new(0), dtype: DType::F16 };
+        assert!(is_cheap_alu(&cast));
+    }
 }
