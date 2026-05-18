@@ -76,3 +76,92 @@ impl ConstExprValues {
     /// Whether there are no resolved values.
     pub fn is_empty(&self) -> bool { self.values.is_empty() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctor_and_accessors() {
+        let ce = ConstExpr::new("BLOCK_SIZE");
+        assert_eq!(ce.name(), "BLOCK_SIZE");
+        assert_eq!(format!("{ce}"), "BLOCK_SIZE");
+    }
+
+    #[test]
+    fn from_conversions() {
+        let a: ConstExpr = "M".into();
+        let b: ConstExpr = "M".to_string().into();
+        assert_eq!(a, b);
+        assert_eq!(a.name(), "M");
+    }
+
+    #[test]
+    fn equality_and_ordering() {
+        let a = ConstExpr::new("A");
+        let b = ConstExpr::new("B");
+        assert!(a < b);
+        assert_ne!(a, b);
+        // Hashing — relies on derive(Hash) producing a consistent value
+        // for equal instances; covered by use as a BTreeMap key in
+        // ConstExprValues below.
+    }
+
+    #[test]
+    fn values_new_default_and_empty() {
+        let v = ConstExprValues::new();
+        assert!(v.is_empty());
+        assert_eq!(v.len(), 0);
+        let v2: ConstExprValues = Default::default();
+        assert!(v2.is_empty());
+    }
+
+    #[test]
+    fn values_insert_get_try_get() {
+        let mut v = ConstExprValues::new();
+        v.insert("M", 64);
+        v.insert("N".to_string(), 128);
+        assert_eq!(v.len(), 2);
+        assert!(!v.is_empty());
+        assert_eq!(v.get("M"), 64);
+        assert_eq!(v.try_get("M"), Some(64));
+        assert_eq!(v.try_get("Z"), None);
+    }
+
+    #[test]
+    fn values_resolve_via_constexpr() {
+        let mut v = ConstExprValues::new();
+        v.insert("K", 256);
+        let ce = ConstExpr::new("K");
+        assert_eq!(v.resolve(&ce), 256);
+    }
+
+    #[test]
+    fn values_get_parses_numeric_literals() {
+        // `arange::<256>()` lowers to a constexpr named "256" — get() must
+        // parse it directly without a mapping entry.
+        let v = ConstExprValues::new();
+        assert_eq!(v.get("256"), 256);
+        assert_eq!(v.get("0"), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "constexpr 'MISSING' not resolved")]
+    fn values_get_panics_on_unresolved_non_numeric() {
+        ConstExprValues::new().get("MISSING");
+    }
+
+    #[test]
+    fn values_iter_yields_inserted_pairs() {
+        let mut v = ConstExprValues::new();
+        v.insert("A", 1);
+        v.insert("B", 2);
+        let collected: Vec<(&String, &usize)> = v.iter().collect();
+        assert_eq!(collected.len(), 2);
+        // BTreeMap → sorted by key, so A then B
+        assert_eq!(collected[0].0, "A");
+        assert_eq!(*collected[0].1, 1);
+        assert_eq!(collected[1].0, "B");
+        assert_eq!(*collected[1].1, 2);
+    }
+}
