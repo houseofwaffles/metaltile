@@ -207,6 +207,22 @@ fn expand_kernel(input_fn: ItemFn) -> TokenStream {
 
 /// Parse tensor parameters from function signature into IR param declarations.
 /// `type_vars` maps type-param names (e.g. "T") to their DType arg-variable tokens (e.g. `_t`).
+///
+/// ## Persistent state-buffer convention
+///
+/// A `mut Tensor<T>` parameter is marked `is_output: true` and emits MSL
+/// `device T*` (non-const). Within a single kernel dispatch, both `Op::Load`
+/// and `Op::Store` may target the same buffer — Metal's memory model
+/// supports read+write through a single pointer without undefined behavior.
+/// This is the supported pattern for **persistent state buffers** that the
+/// host re-binds to the same `MTLBuffer` across dispatches (e.g. AURA's
+/// rotating index buffer): declare a single `mut state: Tensor<u32>` param
+/// and intermix `load(state[..])` and `store(state[..], ..)` in the body.
+///
+/// Do *not* declare a separate `state_in: Tensor<T>` + `mut state_out: Tensor<T>`
+/// pair and bind the same buffer to both positions on the host side — Metal's
+/// `const device T*` qualifier on the read param would let the compiler
+/// assume no aliasing, producing undefined behavior.
 fn parse_kernel_params_generic(
     sig: &syn::Signature,
     type_vars: &std::collections::HashMap<String, proc_macro2::TokenStream>,
