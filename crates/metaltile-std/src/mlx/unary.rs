@@ -558,3 +558,28 @@ pub fn mt_erfinv<T>(a: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
     store(out[idx], erfinv(load(a[idx])));
 }
+
+// Numerically-stable softplus: softplus(x) = max(x, 0) + log1p(exp(-|x|)).
+// Avoids overflow at large positive x and underflow at large negative x —
+// the naive `log(1 + exp(x))` blows up for x > ~80 (f32) / ~10 (f16).
+// MLX has no dedicated softplus kernel (it composes log1p + exp at the
+// graph layer); FFAI Ops.softplus calls this fused per-element variant
+// directly because it lives on Mamba 2's hot path (`dt = softplus(dt_raw)`).
+#[bench_kernel(
+    op="unary",
+    subop="softplus",
+    class=Unary,
+    input=Signed,
+    tol=1e-4,
+)]
+#[kernel]
+pub fn mt_softplus<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    let x = load(a[idx]).cast::<f32>();
+    let zero = 0.0f32;
+    let pos = x > zero;
+    let m = select(pos, x, zero);
+    let ax = select(pos, x, zero - x);
+    let r = m + log(1.0f32 + exp(zero - ax));
+    store(out[idx], r.cast::<T>());
+}
