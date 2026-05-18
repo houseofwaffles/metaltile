@@ -20,9 +20,11 @@ use metaltile_core::ir::KernelMode;
 use metaltile_std::{bench_types::DType, spec::BenchSpec};
 
 use crate::{
-    flag_present, flag_val,
+    flag_present,
+    flag_val,
     kernel_utils::{dtype_label, effective_mode},
-    matches_filter, positional,
+    matches_filter,
+    positional,
     term::{Color, Style, paint_stdout},
 };
 
@@ -53,6 +55,14 @@ pub fn run(args: &[String]) {
     let ir_flag = flag_present(args, "--ir");
     let stats_flag = flag_present(args, "--stats");
     let pass_arg = flag_val(args, "--pass");
+    let dtype_override: Option<DType> = flag_val(args, "--dtype").and_then(|s| match s.as_str() {
+        "f32" => Some(DType::F32),
+        "f16" => Some(DType::F16),
+        "bf16" => Some(DType::BF16),
+        "i32" => Some(DType::I32),
+        "u32" => Some(DType::U32),
+        _ => None,
+    });
 
     // Collect all specs and group by kernel_name.
     let mut kernels: BTreeMap<&str, (&BenchSpec, Vec<DType>)> = BTreeMap::new();
@@ -161,7 +171,7 @@ pub fn run(args: &[String]) {
     }
 
     for (name, (spec, dtypes)) in &matched {
-        let dt = dtypes.first().copied().unwrap_or(DType::F32);
+        let dt = dtype_override.unwrap_or_else(|| dtypes.first().copied().unwrap_or(DType::F32));
 
         if ir_flag {
             // Print raw IR via Display impl
@@ -212,7 +222,9 @@ pub fn run(args: &[String]) {
             }
         } else {
             // Default: print MSL
-            let msl = generate_msl(spec, dtypes);
+            let eff_dt =
+                dtype_override.unwrap_or_else(|| dtypes.first().copied().unwrap_or(DType::F32));
+            let msl = generate_msl_dt(spec, eff_dt);
             if let Some(ref d) = dir {
                 let path = format!("{}/{}.metal", d, name);
                 std::fs::create_dir_all(d).expect("failed to create output directory");
@@ -262,6 +274,7 @@ fn mode_label(mode: KernelMode) -> &'static str {
         KernelMode::Elementwise => "Elementwise",
         KernelMode::Reduction => "Reduction",
         KernelMode::Tile2D => "Tile2D",
+        KernelMode::SimdGroup2D => "SimdGroup",
         KernelMode::Grid3D => "Grid3D",
     }
 }
@@ -279,7 +292,10 @@ fn make_generator(mode: KernelMode) -> MslGenerator {
 }
 
 fn generate_msl(spec: &BenchSpec, dtypes: &[DType]) -> String {
-    let dt = dtypes.first().copied().unwrap_or(DType::F32);
+    generate_msl_dt(spec, dtypes.first().copied().unwrap_or(DType::F32))
+}
+
+fn generate_msl_dt(spec: &BenchSpec, dt: DType) -> String {
     let mut k = (spec.kernel_ir)(dt);
     let mode = effective_mode(spec);
     k.mode = mode;

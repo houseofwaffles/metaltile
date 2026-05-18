@@ -20,7 +20,7 @@ use metaltile::{bench_kernel, kernel};
     metal_file="ternary.metal",
 )]
 #[kernel]
-pub fn mt_select<T>(cond: Tensor<T>, on_true: Tensor<T>, on_false: Tensor<T>, out: Tensor<T>) {
+pub fn mt_select<T>(cond: Tensor<u8>, on_true: Tensor<T>, on_false: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
     let c = load(cond[idx]);
     let t = load(on_true[idx]);

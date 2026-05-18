@@ -10,12 +10,11 @@ static SCAN_SHAPES: &[(usize, usize)] = &[(1_024, 4_096)];
     shapes=&SCAN_SHAPES,
     tpg=256,
     tol=1e-3,
-    mlx="contig_scan_inclusive_sum_float32_float32",
+    mlx="contig_scan_inclusive_sum_{tn}_{tn}",
     metal_file="scan.metal",
-    dtypes=crate::spec::F32_ONLY,
 )]
 #[kernel]
-pub fn mt_scan_f32(inp: Tensor<f32>, out: Tensor<f32>, #[constexpr] n: u32) {
+pub fn mt_scan<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
     let lane = simd_lane;
@@ -32,10 +31,10 @@ pub fn mt_scan_f32(inp: Tensor<f32>, out: Tensor<f32>, #[constexpr] n: u32) {
     let n_iters = (n + chunk - 1u32) / chunk;
     for _r in range(0, n_iters, 1) {
         let base = _r * chunk + lid * 4u32;
-        let v0 = select(base < n, load(inp[row_off + base]), zero_f);
-        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]), zero_f);
-        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]), zero_f);
-        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]), zero_f);
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), zero_f);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), zero_f);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), zero_f);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), zero_f);
         let s1 = v0 + v1;
         let s2 = s1 + v2;
         let s3 = s2 + v3;
@@ -56,16 +55,16 @@ pub fn mt_scan_f32(inp: Tensor<f32>, out: Tensor<f32>, #[constexpr] n: u32) {
         let warp_excl = threadgroup_load("sgs", sg);
         let base_prefix = cur_prefix + warp_excl + thread_excl;
         if base < n {
-            store(out[row_off + base], base_prefix + v0);
+            store(out[row_off + base], (base_prefix + v0).cast::<T>());
         }
         if base + 1u32 < n {
-            store(out[row_off + base + 1u32], base_prefix + s1);
+            store(out[row_off + base + 1u32], (base_prefix + s1).cast::<T>());
         }
         if base + 2u32 < n {
-            store(out[row_off + base + 2u32], base_prefix + s2);
+            store(out[row_off + base + 2u32], (base_prefix + s2).cast::<T>());
         }
         if base + 3u32 < n {
-            store(out[row_off + base + 3u32], base_prefix + s3);
+            store(out[row_off + base + 3u32], (base_prefix + s3).cast::<T>());
         }
         threadgroup_barrier();
         if lid == lsize - 1 {

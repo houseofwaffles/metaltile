@@ -12,13 +12,13 @@ use metaltile::{bench_kernel, kernel};
     d=128,
     n_per_group=4,
     tol=0.01,
+    mlx="rope_{tn}",
     metal_file="rope.metal",
-    dtypes=crate::spec::F16_ONLY,
 )]
 #[kernel]
-pub fn mt_rope_f16(
-    inp: Tensor<f16>,
-    out: Tensor<f16>,
+pub fn mt_rope<T>(
+    inp: Tensor<T>,
+    out: Tensor<T>,
     #[constexpr] h_stride: u32,
     #[constexpr] seq_stride: u32,
     #[constexpr] grid_x: u32,
@@ -43,7 +43,7 @@ pub fn mt_rope_f16(
         let x2 = load(inp[idx2]).cast::<f32>();
         let rx1 = x1 * cos_t - x2 * sin_t;
         let rx2 = x1 * sin_t + x2 * cos_t;
-        store(out[idx1], rx1.cast::<f16>());
-        store(out[idx2], rx2.cast::<f16>());
+        store(out[idx1], rx1.cast::<T>());
+        store(out[idx2], rx2.cast::<T>());
     }
 }

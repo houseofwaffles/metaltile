@@ -596,7 +596,14 @@ fn remap_values_in_op(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
             s(index);
             s(value);
         },
-        Op::ThreadgroupAlloc { .. } | Op::Barrier => {},
+        Op::ThreadgroupAlloc { .. } | Op::Barrier | Op::SimdLaneId | Op::SimdGroupId => {},
+        Op::SimdgroupAlloc { .. } | Op::SimdgroupMatMul { .. } => {},
+        Op::SimdgroupElemLoad { value, .. } => s(value),
+        Op::SimdgroupElemStore { value, data, .. } => {
+            s(value);
+            s(data);
+        },
+        Op::SimdScan { value, .. } => s(value),
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => s(value),
         Op::ArgReduce { value, .. } => s(value),
         Op::StrideScan { offset, end, .. } => {

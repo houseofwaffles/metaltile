@@ -447,6 +447,7 @@ impl DslBodyParser {
             syn::BinOp::BitXor(_) => quote! { BinOpKind::BitXor },
             syn::BinOp::Shl(_) => quote! { BinOpKind::Shl },
             syn::BinOp::Shr(_) => quote! { BinOpKind::Shr },
+            syn::BinOp::Rem(_) => quote! { BinOpKind::Mod },
             syn::BinOp::And(_) => quote! { BinOpKind::And },
             syn::BinOp::Or(_) => quote! { BinOpKind::Or },
             _ => quote! { BinOpKind::Add },
@@ -489,9 +490,25 @@ impl DslBodyParser {
             "reduce_max" => self.parse_unary_call(call, "reduce_max"),
             "reduce_sum" => self.parse_unary_call(call, "reduce_sum"),
             "reduce_min" => self.parse_unary_call(call, "reduce_min"),
+            "reduce_product" => self.parse_unary_call(call, "reduce_product"),
             "erf" => self.parse_unary_call(call, "erf"),
             "sign" => self.parse_unary_call(call, "sign"),
             "round" => self.parse_unary_call(call, "round"),
+            "trunc" => self.parse_unary_call(call, "trunc"),
+            "sinh" => self.parse_unary_call(call, "sinh"),
+            "cosh" => self.parse_unary_call(call, "cosh"),
+            "tan" => self.parse_unary_call(call, "tan"),
+            "asin" => self.parse_unary_call(call, "asin"),
+            "atan" => self.parse_unary_call(call, "atan"),
+            "asinh" => self.parse_unary_call(call, "asinh"),
+            "acos" => self.parse_unary_call(call, "acos"),
+            "acosh" => self.parse_unary_call(call, "acosh"),
+            "atanh" => self.parse_unary_call(call, "atanh"),
+            "expm1" => self.parse_unary_call(call, "expm1"),
+            "log10" => self.parse_unary_call(call, "log10"),
+            "erfinv" => self.parse_unary_call(call, "erfinv"),
+            "atan2" => self.parse_binary_call(call, "ATan2"),
+            "remainder" => self.parse_binary_call(call, "Rem"),
             "max" => self.parse_binary_call(call, "Max"),
             "min" => self.parse_binary_call(call, "Min"),
             "cast" => self.parse_cast_call(call),
@@ -506,6 +523,12 @@ impl DslBodyParser {
             "threadgroup_store" => self.parse_threadgroup_store(call),
             "simd_scan_inclusive" => self.parse_simd_scan(call, false),
             "simd_scan_exclusive" => self.parse_simd_scan(call, true),
+            "simdgroup_alloc" => self.parse_simdgroup_alloc(call),
+            "simdgroup_elem_load" => self.parse_simdgroup_elem_load(call),
+            "simdgroup_elem_store" => self.parse_simdgroup_elem_store(call),
+            "simdgroup_matmul" => self.parse_simdgroup_matmul(call),
+            "simd_lane_id" => self.parse_simd_lane_id(call),
+            "simd_group_id" => self.parse_simd_group_id(call),
             "neg_infinity" => self.parse_special_const(call, "-INFINITY"),
             "infinity" => self.parse_special_const(call, "INFINITY"),
             "strided_reduce" => self.parse_strided_reduce(call),
@@ -608,7 +631,9 @@ impl DslBodyParser {
         let result = self.alloc_vid();
         match fn_name {
             "exp" | "exp2" | "log" | "log2" | "sqrt" | "rsqrt" | "abs" | "sin" | "cos" | "ceil"
-            | "floor" | "recip" | "erf" | "sign" | "round" => {
+            | "floor" | "recip" | "erf" | "sign" | "round" | "trunc" | "sinh" | "cosh" | "tan"
+            | "asin" | "acos" | "atan" | "asinh" | "acosh" | "atanh" | "expm1" | "log10"
+            | "erfinv" => {
                 let op_tokens = match fn_name {
                     "exp" => quote! { UnaryOpKind::Exp },
                     "exp2" => quote! { UnaryOpKind::Exp2 },
@@ -625,6 +650,19 @@ impl DslBodyParser {
                     "erf" => quote! { UnaryOpKind::Erf },
                     "sign" => quote! { UnaryOpKind::Sign },
                     "round" => quote! { UnaryOpKind::Round },
+                    "sinh" => quote! { UnaryOpKind::Sinh },
+                    "cosh" => quote! { UnaryOpKind::Cosh },
+                    "tan" => quote! { UnaryOpKind::Tan },
+                    "asin" => quote! { UnaryOpKind::Asin },
+                    "atan" => quote! { UnaryOpKind::Atan },
+                    "asinh" => quote! { UnaryOpKind::Asinh },
+                    "trunc" => quote! { UnaryOpKind::Trunc },
+                    "acos" => quote! { UnaryOpKind::Acos },
+                    "acosh" => quote! { UnaryOpKind::Acosh },
+                    "atanh" => quote! { UnaryOpKind::Atanh },
+                    "expm1" => quote! { UnaryOpKind::Expm1 },
+                    "log10" => quote! { UnaryOpKind::Log10 },
+                    "erfinv" => quote! { UnaryOpKind::ErfInv },
                     _ => quote! { UnaryOpKind::Exp },
                 };
                 self.push_op(
@@ -650,11 +688,12 @@ impl DslBodyParser {
                     result,
                 );
             },
-            "reduce_sum" | "reduce_max" | "reduce_min" => {
+            "reduce_sum" | "reduce_max" | "reduce_min" | "reduce_product" => {
                 let op = match fn_name {
                     "reduce_sum" => quote! { ReduceKind::Sum },
                     "reduce_max" => quote! { ReduceKind::Max },
                     "reduce_min" => quote! { ReduceKind::Min },
+                    "reduce_product" => quote! { ReduceKind::Product },
                     _ => quote! { ReduceKind::Sum },
                 };
                 self.push_op(
@@ -685,6 +724,8 @@ impl DslBodyParser {
             "Max" => quote! { BinOpKind::Max },
             "Min" => quote! { BinOpKind::Min },
             "Pow" => quote! { BinOpKind::Pow },
+            "ATan2" => quote! { BinOpKind::ATan2 },
+            "Rem" => quote! { BinOpKind::Rem },
             _ => quote! { BinOpKind::Add },
         };
         self.push_op(
@@ -745,6 +786,7 @@ impl DslBodyParser {
             "sum" => quote! { ReduceKind::Sum },
             "max" => quote! { ReduceKind::Max },
             "min" => quote! { ReduceKind::Min },
+            "product" => quote! { ReduceKind::Product },
             _ => quote! { ReduceKind::Sum },
         };
         let result = self.alloc_vid();
@@ -1208,14 +1250,37 @@ impl DslBodyParser {
     }
 
     /// `threadgroup_alloc("name", size)` → Op::ThreadgroupAlloc (no result).
+    /// Optional third argument: `T` uses kernel's generic type, any other type
+    /// name (`f32`, `f16`, etc.) uses that specific dtype. Defaults to F32.
     fn parse_threadgroup_alloc(&mut self, call: &ExprCall) -> u32 {
         let args: Vec<_> = call.args.iter().collect();
         let name = string_lit_from_expr(args.first().unwrap_or(&&*call.func));
         let size: usize = usize_lit_from_expr(args.get(1).copied());
         let size_u32 = size as u32;
+        let dtype_ts = if let Some(ty_arg) = args.get(2) {
+            // Explicit dtype: `T` resolves to kernel generic type.
+            let ty_str = quote! { #ty_arg }.to_string();
+            match ty_str.trim() {
+                "T" => {
+                    if let Some(tok) = self.type_vars.get("T") {
+                        tok.clone()
+                    } else {
+                        quote! { DType::F32 }
+                    }
+                },
+                "f32" => quote! { DType::F32 },
+                "f16" => quote! { DType::F16 },
+                "bf16" => quote! { DType::BF16 },
+                "i32" => quote! { DType::I32 },
+                "u32" => quote! { DType::U32 },
+                _ => quote! { DType::F32 },
+            }
+        } else {
+            quote! { DType::F32 }
+        };
         self.push_op_no_result(quote! {
             Op::ThreadgroupAlloc {
-                dtype: DType::F32,
+                dtype: #dtype_ts,
                 size: #size_u32,
                 name: #name.to_string(),
             }
@@ -1257,22 +1322,99 @@ impl DslBodyParser {
         0
     }
 
-    /// `simd_scan_inclusive(x)` / `simd_scan_exclusive(x)` → Op::Scan
+    /// `simd_scan_inclusive(x)` / `simd_scan_exclusive(x)` → Op::SimdScan
     fn parse_simd_scan(&mut self, call: &ExprCall, exclusive: bool) -> u32 {
         let args: Vec<_> = call.args.iter().collect();
         let val_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
         let result = self.alloc_vid();
         self.push_op(
             quote! {
-                Op::Scan {
+                Op::SimdScan {
                     value: ValueId::new(#val_vid),
                     op: ReduceKind::Sum,
                     exclusive: #exclusive,
-                    axis: 0,
                 }
             },
             result,
         );
+        result
+    }
+
+    /// `simdgroup_alloc::<T, M, N>()` → Op::SimdgroupAlloc
+    fn parse_simdgroup_alloc(&mut self, call: &ExprCall) -> u32 {
+        let result = self.alloc_vid();
+        let dtype_tokens = extract_turbofish_dtype_and_mn(&call.func)
+            .map(|(d, ..)| d)
+            .unwrap_or_else(|| quote! { DType::F16 });
+        let m_val = extract_turbofish_dtype_and_mn(&call.func).map(|(_, m, _)| m).unwrap_or(8u32);
+        let n_val = extract_turbofish_dtype_and_mn(&call.func).map(|(_, _, n)| n).unwrap_or(8u32);
+        self.push_op(
+            quote! {
+                Op::SimdgroupAlloc { dtype: #dtype_tokens, m: #m_val, n: #n_val }
+            },
+            result,
+        );
+        result
+    }
+
+    /// `simdgroup_elem_load(sm, index)` → Op::SimdgroupElemLoad
+    fn parse_simdgroup_elem_load(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let sm_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
+        let idx = args.get(1).map(|a| literal_u32(a)).unwrap_or(0);
+        let result = self.alloc_vid();
+        self.push_op(
+            quote! {
+                Op::SimdgroupElemLoad { value: ValueId::new(#sm_vid), index: #idx }
+            },
+            result,
+        );
+        result
+    }
+
+    /// `simdgroup_elem_store(sm, index, data)` → Op::SimdgroupElemStore (no result)
+    fn parse_simdgroup_elem_store(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let sm_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
+        let idx = args.get(1).map(|a| literal_u32(a)).unwrap_or(0);
+        let data_vid = args.get(2).map(|a| self.parse_expr(a)).unwrap_or(0);
+        self.push_op_no_result(quote! {
+            Op::SimdgroupElemStore {
+                value: ValueId::new(#sm_vid),
+                index: #idx,
+                data: ValueId::new(#data_vid),
+            }
+        });
+        0
+    }
+
+    /// `simdgroup_matmul(a, b, c)` → Op::SimdgroupMatMul (c = a * b + c, no result)
+    fn parse_simdgroup_matmul(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let a_vid = args.first().map(|a| self.parse_expr(a)).unwrap_or(0);
+        let b_vid = args.get(1).map(|a| self.parse_expr(a)).unwrap_or(0);
+        let c_vid = args.get(2).map(|a| self.parse_expr(a)).unwrap_or(0);
+        self.push_op_no_result(quote! {
+            Op::SimdgroupMatMul {
+                a: ValueId::new(#a_vid),
+                b: ValueId::new(#b_vid),
+                c: ValueId::new(#c_vid),
+            }
+        });
+        0
+    }
+
+    /// `simd_lane_id()` → Op::SimdLaneId
+    fn parse_simd_lane_id(&mut self, _call: &ExprCall) -> u32 {
+        let result = self.alloc_vid();
+        self.push_op(quote! { Op::SimdLaneId }, result);
+        result
+    }
+
+    /// `simd_group_id()` → Op::SimdGroupId
+    fn parse_simd_group_id(&mut self, _call: &ExprCall) -> u32 {
+        let result = self.alloc_vid();
+        self.push_op(quote! { Op::SimdGroupId }, result);
         result
     }
 
@@ -1353,6 +1495,64 @@ fn dtype_tokens_for_name(name: &str) -> proc_macro2::TokenStream {
         "u32" | "uint" => quote! { DType::U32 },
         "i32" | "int" => quote! { DType::I32 },
         _ => quote! { DType::F32 },
+    }
+}
+
+/// Extract (dtype_tokens, M, N) from a turbofish like `::<f16, 8, 8>`.
+/// Used by `simdgroup_alloc::<dtype, M, N>()`.
+fn extract_turbofish_dtype_and_mn(expr: &Expr) -> Option<(proc_macro2::TokenStream, u32, u32)> {
+    if let Expr::Path(path) = expr {
+        for seg in &path.path.segments {
+            if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                let mut iter = args.args.iter();
+                let dtype = iter.next().and_then(|arg| {
+                    if let syn::GenericArgument::Type(syn::Type::Path(tp)) = arg
+                        && let Some(last) = tp.path.segments.last()
+                    {
+                        Some(dtype_tokens_for_name(&last.ident.to_string()))
+                    } else {
+                        None
+                    }
+                });
+                let m = iter.next().and_then(|arg| {
+                    if let syn::GenericArgument::Const(syn::Expr::Lit(lit)) = arg
+                        && let syn::Lit::Int(n) = &lit.lit
+                        && let Ok(val) = n.base10_parse::<u32>()
+                    {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                });
+                let n = iter.next().and_then(|arg| {
+                    if let syn::GenericArgument::Const(syn::Expr::Lit(lit)) = arg
+                        && let syn::Lit::Int(n) = &lit.lit
+                        && let Ok(val) = n.base10_parse::<u32>()
+                    {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                });
+                if let (Some(dt), Some(mm), Some(nn)) = (dtype, m, n) {
+                    return Some((dt, mm, nn));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract a u32 from a literal expression (e.g. `0u32`, `1u32`).
+fn literal_u32(expr: &Expr) -> u32 {
+    if let Expr::Lit(lit) = expr {
+        match &lit.lit {
+            syn::Lit::Int(n) => n.base10_parse::<u32>().unwrap_or(0),
+            syn::Lit::Float(f) => f.base10_parse::<f64>().map(|v| v as u32).unwrap_or(0),
+            _ => 0,
+        }
+    } else {
+        0
     }
 }
 

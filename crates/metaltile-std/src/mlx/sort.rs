@@ -10,15 +10,14 @@ use metaltile::{bench_kernel, kernel};
     n=1024,
     tpg=256,
     tol=0.0,
-    mlx="c_block_sort_float32_float32_bn256_tn4",
+    mlx="c_block_sort_{tn}_{tn}_bn256_tn4",
     metal_file="sort.metal",
-    dtypes=crate::spec::F32_ONLY,
 )]
 #[kernel]
-pub fn mt_sort_f32(inp: Tensor<f32>, out: Tensor<f32>, #[constexpr] n: u32) {
+pub fn mt_sort<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let block_id = program_id::<0>();
     let t = tid;
-    threadgroup_alloc("shared", 1024);
+    threadgroup_alloc("shared", 1024, T);
     let base = block_id * n;
     threadgroup_store("shared", t * 4u32, load(inp[base + t * 4u32]));
     threadgroup_store("shared", t * 4u32 + 1u32, load(inp[base + t * 4u32 + 1u32]));
@@ -28,7 +27,9 @@ pub fn mt_sort_f32(inp: Tensor<f32>, out: Tensor<f32>, #[constexpr] n: u32) {
     for _k in range(1u32, 11u32, 1u32) {
         for _jb in range(0u32, _k, 1u32) {
             let flip = _k - _jb - 1u32;
-            threadgroup_barrier();
+            if flip >= 7u32 {
+                threadgroup_barrier();
+            }
             for _e in range(0u32, 4u32, 1u32) {
                 let gi = t * 4u32 + _e;
                 let partner = gi ^ (1u32 << flip);

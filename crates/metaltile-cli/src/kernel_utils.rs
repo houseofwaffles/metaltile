@@ -14,9 +14,8 @@ use metaltile_std::{
 /// instead of calling this directly.
 pub fn first_mode(spec: &BenchSpec) -> KernelMode {
     match &spec.dispatch {
-        BenchDispatch::Generic => {
-            spec.shapes.first().map(|s| s.mode).unwrap_or(KernelMode::Elementwise)
-        },
+        BenchDispatch::Generic =>
+            spec.shapes.first().map(|s| s.mode).unwrap_or(KernelMode::Elementwise),
         BenchDispatch::Sort { .. }
         | BenchDispatch::Scan { .. }
         | BenchDispatch::ArgReduce { .. }
@@ -28,6 +27,7 @@ pub fn first_mode(spec: &BenchSpec) -> KernelMode {
         | BenchDispatch::FpQuantized { .. }
         | BenchDispatch::AffineDequantize { .. } => KernelMode::Elementwise,
         BenchDispatch::Rope { .. } | BenchDispatch::StridedCopy { .. } => KernelMode::Grid3D,
+        BenchDispatch::SteelGemm { .. } => KernelMode::SimdGroup2D,
     }
 }
 

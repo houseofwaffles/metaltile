@@ -101,7 +101,8 @@ impl BufInit {
                 })
                 .collect(),
             BufInit::Positive => (0..n).map(|i| 0.25 + (i % 16) as f32 * 0.25).collect(),
-            BufInit::Unit => vec![1.0; n],
+            BufInit::Unit =>
+                (0..n).map(|i| [-0.9f32, -0.5, -0.1, 0.0, 0.1, 0.5, 0.9][i % 7]).collect(),
             BufInit::Fill(v) => vec![v; n],
             BufInit::AltZeroOne => (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
         }
@@ -274,6 +275,18 @@ pub enum BenchDispatch {
         batch: usize,
         tpg: usize,
     },
+    /// Tiled simdgroup GEMM (steel_gemm_fused).
+    SteelGemm {
+        m: usize,
+        n: usize,
+        k: usize,
+        check_m: usize,
+        check_n: usize,
+        check_k: usize,
+        bm: usize,
+        bn: usize,
+        tpg: usize,
+    },
 }
 
 // ── BenchSpec ───────────────────────────────────────────────────────────
@@ -316,4 +329,9 @@ pub fn bytes_mat_vec(n: usize, b: usize, _reads: usize, out: usize, eb: usize) -
 
 pub fn bytes_mat_vec_masked(n: usize, b: usize, _reads: usize, out: usize, eb: usize) -> usize {
     (b * n + 2 * n + out) * eb
+}
+
+/// Select: cond is always 1-byte bool (matching MLX v_Select{T} interface).
+pub fn bytes_select(n: usize, _b: usize, _reads: usize, _out: usize, eb: usize) -> usize {
+    n + 3 * n * eb // cond(1 byte) + on_true(eb) + on_false(eb) + out(eb)
 }

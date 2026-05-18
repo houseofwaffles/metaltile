@@ -98,13 +98,15 @@ macro_rules! quantize_kv_body {
         store(out_s[dst_sb_idx], safe_scale.cast::<T>());
         store(out_b[dst_sb_idx], mn.cast::<T>());
 
-        let dst_w_base = (h * max_seq + position) * (head_dim / vals_per_pack) + d_start / vals_per_pack;
+        let dst_w_base =
+            (h * max_seq + position) * (head_dim / vals_per_pack) + d_start / vals_per_pack;
         for p in range(0u32, group_size / vals_per_pack, 1u32) {
             let mut packed = 0u32;
             for i in range(0u32, vals_per_pack, 1u32) {
                 let v = load(src[src_base + d_start + p * vals_per_pack + i]).cast::<f32>();
                 let q_f = (v - mn) * inv_scale + 0.5f32;
-                let q_clamped_f = select(q_f > max_quant_f, max_quant_f, select(q_f < 0.0f32, 0.0f32, q_f));
+                let q_clamped_f =
+                    select(q_f > max_quant_f, max_quant_f, select(q_f < 0.0f32, 0.0f32, q_f));
                 let q = q_clamped_f.cast::<u32>();
                 packed = packed | (q << (i * $bits));
             }
@@ -191,20 +193,20 @@ macro_rules! bulk_dequant_kv_body {
 
         let idx = program_id::<0>();
         let total_per_head = n_positions * head_dim;
-        let h    = idx / total_per_head;
+        let h = idx / total_per_head;
         let rest = idx - h * total_per_head;
-        let pos  = rest / head_dim;
-        let d    = rest - pos * head_dim;
+        let pos = rest / head_dim;
+        let d = rest - pos * head_dim;
 
         let groups_per_head = head_dim / group_size;
         let g = d / group_size;
         let scale = load(in_s[(h * max_seq + pos) * groups_per_head + g]).cast::<f32>();
-        let bias  = load(in_b[(h * max_seq + pos) * groups_per_head + g]).cast::<f32>();
+        let bias = load(in_b[(h * max_seq + pos) * groups_per_head + g]).cast::<f32>();
 
         let pack_idx = (h * max_seq + pos) * (head_dim / vals_per_pack) + d / vals_per_pack;
-        let lane   = d & (vals_per_pack - 1u32);
+        let lane = d & (vals_per_pack - 1u32);
         let packed = load(in_w[pack_idx]);
-        let q      = (packed >> (lane * $bits)) & mask;
+        let q = (packed >> (lane * $bits)) & mask;
         let w_real = q.cast::<f32>() * scale + bias;
 
         let dst_idx = h * max_seq * head_dim + pos * head_dim + d;

@@ -97,7 +97,7 @@ macro_rules! dequant_gather_body {
         let q = lo | hi;
 
         let scale = load(scales[token_id * groups_per_row + g]).cast::<f32>();
-        let bias  = load(biases[token_id * groups_per_row + g]).cast::<f32>();
+        let bias = load(biases[token_id * groups_per_row + g]).cast::<f32>();
         let w_real = q.cast::<f32>() * scale + bias;
         store(out[idx], w_real.cast::<T>());
     };

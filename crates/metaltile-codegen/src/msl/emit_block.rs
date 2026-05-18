@@ -75,6 +75,12 @@ impl MslGenerator {
                             1 => wl!(out, "{pad}uint {v} = tgid.y;"),
                             _ => wl!(out, "{pad}uint {v} = 0;"),
                         },
+                        KernelMode::SimdGroup2D => match axis {
+                            0 => wl!(out, "{pad}uint {v} = tid.x;"),
+                            1 => wl!(out, "{pad}uint {v} = tid.y;"),
+                            2 => wl!(out, "{pad}uint {v} = tid.z;"),
+                            _ => wl!(out, "{pad}uint {v} = 0;"),
+                        },
                     }
                 },
 
@@ -112,10 +118,16 @@ impl MslGenerator {
                 // ---- memory --------------------------------------------
                 Op::Load { src, indices, .. } => {
                     let v = self.vname(vid, block, extra_names);
-                    let src_dtype = kernel.params.iter().find(|p| p.name == *src).map(|p| p.dtype);
+                    // `simd_id` is a DSL alias for the simdgroup index; the
+                    // Metal kernel parameter is named `simd_group`.
+                    let src = if src.as_str() == "simd_id" { "simd_group" } else { src.as_str() };
+                    let src_dtype = kernel.params.iter().find(|p| p.name == src).map(|p| p.dtype);
                     let promote_bf16 = self.config.native_bfloat
                         && src_dtype == Some(DType::BF16)
-                        && kernel.mode == KernelMode::Elementwise;
+                        && matches!(
+                            kernel.mode,
+                            KernelMode::Elementwise | KernelMode::SimdGroup2D
+                        );
                     if indices.is_empty() {
                         if promote_bf16 {
                             wl!(out, "{pad}float {v} = float({src});");
@@ -246,7 +258,11 @@ impl MslGenerator {
                         .map(|tv| matches!(tv.dtype, DType::F32 | DType::F16 | DType::BF16))
                         .unwrap_or(false);
                     match op {
-                        BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow => {
+                        BinOpKind::Max
+                        | BinOpKind::Min
+                        | BinOpKind::Pow
+                        | BinOpKind::ATan2
+                        | BinOpKind::Rem => {
                             wl!(out, "{pad}auto {v} = {}({l}, {r});", op.msl_symbol())
                         },
                         BinOpKind::And => wl!(out, "{pad}auto {v} = ({l} && {r});"),
@@ -257,6 +273,7 @@ impl MslGenerator {
                         BinOpKind::BitXor => wl!(out, "{pad}auto {v} = ({l} ^ {r});"),
                         BinOpKind::Shl => wl!(out, "{pad}auto {v} = ({l} << {r});"),
                         BinOpKind::Shr => wl!(out, "{pad}auto {v} = ({l} >> {r});"),
+                        BinOpKind::Mod => wl!(out, "{pad}auto {v} = ({l} % {r});"),
                         BinOpKind::Add => {
                             // FMA recognition: Mul + Add → fma() (floats only)
                             match (
@@ -352,6 +369,7 @@ impl MslGenerator {
                         ReduceKind::Sum | ReduceKind::Mean => "0.0f",
                         ReduceKind::Max => "-INFINITY",
                         ReduceKind::Min => "INFINITY",
+                        ReduceKind::Product => "1.0f",
                     };
                     let base_elem = if let Some(sec_src) = secondary_src {
                         let base_v = self.vname(*secondary_base, block, extra_names);
@@ -391,6 +409,7 @@ impl MslGenerator {
                             ReduceKind::Sum | ReduceKind::Mean => format!("{v} += {elem_expr};"),
                             ReduceKind::Max => format!("{v} = max({v}, {elem_expr});"),
                             ReduceKind::Min => format!("{v} = min({v}, {elem_expr});"),
+                            ReduceKind::Product => format!("{v} *= {elem_expr};"),
                         };
                         wl!(out, "{pad}float {v} = {init};");
                         wl!(out, "{pad}{{");
@@ -421,6 +440,7 @@ impl MslGenerator {
                             ReduceKind::Sum | ReduceKind::Mean => format!("{v} += {elem_expr};"),
                             ReduceKind::Max => format!("{v} = max({v}, {elem_expr});"),
                             ReduceKind::Min => format!("{v} = min({v}, {elem_expr});"),
+                            ReduceKind::Product => format!("{v} *= {elem_expr};"),
                         };
                         wl!(out, "{pad}float {v} = {init};");
                         wl!(out, "{pad}for (uint _i = {off}; _i < {en}; _i += {st}) {{");
@@ -674,6 +694,7 @@ impl MslGenerator {
                             let init = match rk {
                                 ReduceKind::Max => "-INFINITY",
                                 ReduceKind::Min => "INFINITY",
+                                ReduceKind::Product => "1.0f",
                                 _ => "0.0f",
                             };
                             // TODO: lower min/max scans via simd_shuffle_xor
@@ -788,6 +809,8 @@ impl MslGenerator {
                             wl!(out, "{pad}float {v} = simd_sum(float({rv}));"),
                         ReduceKind::Max => wl!(out, "{pad}float {v} = simd_max(float({rv}));"),
                         ReduceKind::Min => wl!(out, "{pad}float {v} = simd_min(float({rv}));"),
+                        ReduceKind::Product =>
+                            wl!(out, "{pad}float {v} = __mt_simd_product(float({rv}));"),
                     }
                 },
 
@@ -810,6 +833,61 @@ impl MslGenerator {
 
                 Op::Barrier => {
                     wl!(out, "{pad}threadgroup_barrier(mem_flags::mem_threadgroup);");
+                },
+
+                // ---- simdgroup matrix ops ---------------------------------
+                Op::SimdLaneId => {
+                    let v = self.vname(vid, block, extra_names);
+                    wl!(out, "{pad}uint {v} = simd_lane;");
+                },
+
+                Op::SimdGroupId => {
+                    let v = self.vname(vid, block, extra_names);
+                    wl!(out, "{pad}uint {v} = simd_group;");
+                },
+
+                Op::SimdgroupAlloc { dtype, m, n } => {
+                    let t = self.msl_type_name(*dtype);
+                    let v = self.vname(vid, block, extra_names);
+                    hoists.push(format!("simdgroup_matrix<{t}, {m}, {n}> {v};"));
+                },
+
+                Op::SimdgroupElemLoad { value, index } => {
+                    let v = self.vname(vid, block, extra_names);
+                    let sv = self.vname(Some(*value), block, extra_names);
+                    wl!(out, "{pad}auto {v} = {sv}.thread_elements()[{index}];");
+                },
+
+                Op::SimdgroupElemStore { value, index, data } => {
+                    let sv = self.vname(Some(*value), block, extra_names);
+                    let dv = self.vname(Some(*data), block, extra_names);
+                    wl!(out, "{pad}{sv}.thread_elements()[{index}] = {dv};");
+                },
+
+                Op::SimdgroupMatMul { a, b, c } => {
+                    let av = self.vname(Some(*a), block, extra_names);
+                    let bv = self.vname(Some(*b), block, extra_names);
+                    let cv = self.vname(Some(*c), block, extra_names);
+                    // simdgroup_multiply_accumulate(dst, A, B, C) — 4 args:
+                    //   dst = result, C = addend (both are the accumulator cv)
+                    wl!(out, "{pad}simdgroup_multiply_accumulate({cv}, {av}, {bv}, {cv});");
+                },
+
+                // ---- simd prefix scan -------------------------------------
+                Op::SimdScan { value, op: rk, exclusive } => {
+                    let v = self.vname(vid, block, extra_names);
+                    let rv = self.vname(Some(*value), block, extra_names);
+                    let prefix = if *exclusive { "exclusive" } else { "inclusive" };
+                    match rk {
+                        ReduceKind::Sum | ReduceKind::Mean =>
+                            wl!(out, "{pad}float {v} = simd_prefix_{prefix}_sum({rv});"),
+                        ReduceKind::Product =>
+                            wl!(out, "{pad}float {v} = simd_prefix_{prefix}_product({rv});"),
+                        ReduceKind::Max =>
+                            wl!(out, "{pad}float {v} = simd_prefix_{prefix}_max({rv});"),
+                        ReduceKind::Min =>
+                            wl!(out, "{pad}float {v} = simd_prefix_{prefix}_min({rv});"),
+                    }
                 },
 
                 // ---- mutable local variables ----------------------------

@@ -311,8 +311,10 @@ pub fn mt_square<T>(a: Tensor<T>, out: Tensor<T>) {
 #[kernel]
 pub fn mt_sigmoid<T>(a: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
-    let x = load(a[idx]);
-    store(out[idx], 1.0f32.cast::<T>() / (1.0f32.cast::<T>() + exp(-x)));
+    // Compute in f32 to match MLX precision (convert back to T at store).
+    let x = load(a[idx]).cast::<f32>();
+    let result = 1.0f32 / (1.0f32 + exp(-x));
+    store(out[idx], result.cast::<T>());
 }
 
 #[bench_kernel(
@@ -329,4 +331,230 @@ pub fn mt_log1p<T>(a: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
     let x = load(a[idx]);
     store(out[idx], log(1.0f32.cast::<T>() + x));
+}
+
+// ─── Transcendental ops shipped as discrete MLX kernels ───────────────
+// Every op below has a matching `instantiate_unary_float` in MLX's
+// unary.metal and produces a kernel named `v_<Op>{tn}{tn}`.
+
+#[bench_kernel(
+    op="unary",
+    subop="sinh",
+    class=Unary,
+    input=Signed,
+    tol=1e-4,
+    mlx="v_Sinh{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_sinh<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], sinh(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="cosh",
+    class=Unary,
+    input=Signed,
+    tol=1e-4,
+    mlx="v_Cosh{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_cosh<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], cosh(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="tan",
+    class=Unary,
+    input=Signed,
+    // tol=1e-3 — f16 tan has poles near π/2 + kπ where values diverge;
+    // even on moderate inputs (~1.0) the f16 ULP drift is ~5e-4.
+    tol=1e-3,
+    mlx="v_Tan{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_tan<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], tan(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="tanh",
+    class=Unary,
+    input=Signed,
+    // tol=1e-3 — f16 tanh compounds exp and div; worst-case drift ~4e-4.
+    tol=1e-3,
+    mlx="v_Tanh{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_tanh_op<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], tanh(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="asin",
+    class=Unary,
+    input=Unit,
+    // tol=1e-4 — asin has poles at ±1; input clamped to [-1, 1] via
+    // the Unit shape generator, so no pole-induced blowup.
+    tol=1e-4,
+    mlx="v_ArcSin{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_asin<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], asin(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="atan",
+    class=Unary,
+    input=Signed,
+    // tol=1e-3 — f16 atan drifts ~3e-4 on large-magnitude inputs.
+    tol=1e-3,
+    mlx="v_ArcTan{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_atan<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], atan(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="asinh",
+    class=Unary,
+    input=Signed,
+    tol=1e-4,
+    mlx="v_ArcSinh{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_asinh<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], asinh(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="acos",
+    class=Unary,
+    input=Unit,
+    // acos has domain [-1, 1]; Unit input clamps to [-1+ε, 1-ε].
+    tol=1e-4,
+    mlx="v_ArcCos{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_acos<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], acos(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="trunc",
+    class=Unary,
+    input=Signed,
+    // trunc is exact (sets the integer-part bits to zero).
+    tol=1e-6,
+)]
+#[kernel]
+pub fn mt_trunc<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], trunc(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="acosh",
+    class=Unary,
+    input=Positive,
+    // input=Positive ensures x ≥ 1e-6, safely inside the domain x ≥ 1.
+    tol=1e-4,
+    mlx="v_ArcCosh{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_acosh<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], acosh(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="atanh",
+    class=Unary,
+    input=Unit,
+    // atanh has poles at ±1; Unit input clamps to [-1+ε, 1-ε].
+    tol=1e-4,
+    mlx="v_ArcTanh{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_atanh<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], atanh(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="expm1",
+    class=Unary,
+    input=Signed,
+    // tol=5e-3 — for large inputs (|x|≈3) two IEEE-754 expm1 impls can diverge
+    // by ~1e-4 in f32 and ~4e-3 in bf16 (half-ULP at that magnitude).
+    tol=5e-3,
+    mlx="v_Expm1{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_expm1<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], expm1(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="log10",
+    class=Unary,
+    input=Positive,
+    tol=1e-4,
+    mlx="v_Log10{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_log10<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], log10(load(a[idx])));
+}
+
+#[bench_kernel(
+    op="unary",
+    subop="erfinv",
+    class=Unary,
+    input=Unit,
+    // tol=1e-2 — erfinv is a degree-9/10 polynomial approximation;
+    // f16 compounds ~1e-3 ULP error per FMA (×9 ≈ 1e-2 in worst case).
+    tol=1e-2,
+    mlx="v_ErfInv{tn}{tn}",
+    metal_file="unary.metal",
+)]
+#[kernel]
+pub fn mt_erfinv<T>(a: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], erfinv(load(a[idx])));
 }

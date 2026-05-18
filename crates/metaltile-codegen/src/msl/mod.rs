@@ -36,8 +36,21 @@ macro_rules! wl {
 /// Return `true` if any op in the kernel (body + all child blocks) is
 /// `Op::ProgramId { axis }` for the given axis value.
 fn kernel_uses_program_id_axis(kernel: &Kernel, axis: u32) -> bool {
-    let check =
-        |ops: &[Op]| ops.iter().any(|op| matches!(op, Op::ProgramId { axis: a } if *a == axis));
+    // Match either Op::ProgramId { axis } or a direct Op::Load { src: "tgid_y" }
+    // (DSL kernels that use `tgid_y` directly instead of `program_id::<1>()`).
+    let tgid_name = match axis {
+        0 => "tgid_x",
+        1 => "tgid_y",
+        2 => "tgid_z",
+        _ => "",
+    };
+    let check = |ops: &[Op]| {
+        ops.iter().any(|op| match op {
+            Op::ProgramId { axis: a } => *a == axis,
+            Op::Load { src, indices, .. } => indices.is_empty() && src.as_str() == tgid_name,
+            _ => false,
+        })
+    };
     check(&kernel.body.ops) || kernel.blocks.values().any(|b| check(&b.ops))
 }
 
@@ -77,7 +90,7 @@ impl MslGenerator {
         if feat.needs_bf16_struct && !self.config.native_bfloat {
             self.emit_bf16_preamble(&mut out);
         }
-        if self.config.use_simd_matrix {
+        if self.config.use_simd_matrix || feat.needs_simdgroup_matrix {
             wl!(out);
             wl!(out, "#include <metal_simdgroup_matrix>");
         }
@@ -177,16 +190,20 @@ impl MslGenerator {
                 write!(out, "\n    uint2 tid  [[thread_position_in_threadgroup]],").unwrap();
                 write!(out, "\n    uint2 tgid [[threadgroup_position_in_grid]]").unwrap();
             },
+            KernelMode::SimdGroup2D => {
+                write!(out, "\n    uint3 lid [[thread_position_in_threadgroup]],").unwrap();
+                write!(out, "\n    uint3 tid [[threadgroup_position_in_grid]]").unwrap();
+                write!(out, ",\n    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
+                write!(out, ",\n    uint simd_group [[simdgroup_index_in_threadgroup]]").unwrap();
+            },
         }
-        if feat.needs_simd_lane {
+        // NOTE: SimdGroup2D mode emits simd_lane and simd_group inline above.
+        // Other modes add them conditionally here.
+        if feat.needs_simd_lane && !matches!(kernel.mode, KernelMode::SimdGroup2D) {
             write!(out, ",\n    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
         }
-        if feat.needs_simd_group && !feat.is_matmul {
-            write!(out, ",\n    uint simd_id [[simdgroup_index_in_threadgroup]]").unwrap();
-        }
-        if self.config.use_simd_matrix && feat.is_matmul {
+        if feat.needs_simd_group && !matches!(kernel.mode, KernelMode::SimdGroup2D) {
             write!(out, ",\n    uint simd_group [[simdgroup_index_in_threadgroup]]").unwrap();
-            write!(out, ",\n    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
         }
 
         wl!(out, "\n) {{");

@@ -199,16 +199,26 @@ pub fn run(args: &[String]) {
 
             // Compile-check via generate.
             let msl_result = generator.generate(&k);
-            match msl_result {
-                Ok(_) => {
-                    dtypes_ok.push(dt);
-                },
+            let msl = match msl_result {
+                Ok(msl) => msl,
                 Err(e) => {
                     dtypes_err.push((dt, format!("{e:?}")));
                     errors += 1;
                     continue;
                 },
+            };
+
+            // Metal compile-check on macOS (catches invalid simdgroup signatures, etc.)
+            if cfg!(target_os = "macos") {
+                let air_check = check_metal_compile(&msl, &k.name);
+                if let Err(e) = air_check {
+                    dtypes_err.push((dt, e));
+                    errors += 1;
+                    continue;
+                }
             }
+
+            dtypes_ok.push(dt);
 
             // Emit on success.
             if let Some(dir) = &kernels_dir
@@ -301,7 +311,7 @@ fn monomorphized_name(base: &str, dt: DType, n_dtypes: usize) -> String {
 }
 
 fn msl_generator_for(mode: KernelMode) -> MslGenerator {
-    if matches!(mode, KernelMode::Tile2D) {
+    if matches!(mode, KernelMode::Tile2D | KernelMode::SimdGroup2D) {
         MslGenerator::new(MslConfig {
             tile_schedule: TileSchedule::default(),
             use_simd_matrix: true,
@@ -374,4 +384,47 @@ fn emit_artifacts(
         }
     }
     let _ = emit::dtype_suffix; // anchor public API surface for re-export checks
+}
+
+/// Quickly compile a Metal shader with xcrun to catch type errors.
+/// Returns Ok(()) if compilation succeeds, Err(msg) if it fails.
+#[cfg(target_os = "macos")]
+fn check_metal_compile(msl: &str, kernel_name: &str) -> Result<(), String> {
+    use std::process::Command;
+
+    let dir = std::env::temp_dir().join("tile-build-check");
+    let _ = std::fs::create_dir_all(&dir);
+    let metal_path = dir.join(format!("{kernel_name}.metal"));
+    let air_path = dir.join(format!("{kernel_name}.air"));
+
+    if let Err(e) = std::fs::write(&metal_path, msl) {
+        return Err(format!("write temp .metal: {e}"));
+    }
+
+    let output = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "-c"])
+        .arg(&metal_path)
+        .arg("-o")
+        .arg(&air_path)
+        .output()
+        .map_err(|e| format!("invoke xcrun metal: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Keep just the first meaningful error line.
+        let short =
+            stderr.lines().filter(|l| l.contains("error:")).take(3).collect::<Vec<_>>().join("\n");
+        let msg = if short.is_empty() { stderr.into_owned() } else { short };
+        return Err(msg);
+    }
+
+    // Clean up temp files on success.
+    let _ = std::fs::remove_file(&metal_path);
+    let _ = std::fs::remove_file(&air_path);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_metal_compile(_msl: &str, _kernel_name: &str) -> Result<(), String> {
+    Ok(()) // Skip Metal compile-check on non-macOS.
 }

@@ -133,6 +133,30 @@ pub enum UnaryOpKind {
     Sign,
     Round,
     Trunc,
+    /// Hyperbolic sine: `sinh(x)`.
+    Sinh,
+    /// Hyperbolic cosine: `cosh(x)`.
+    Cosh,
+    /// Tangent: `tan(x)`.
+    Tan,
+    /// Arc sine: `asin(x)`.
+    Asin,
+    /// Arc tangent: `atan(x)`.
+    Atan,
+    /// Inverse hyperbolic sine: `asinh(x)`.
+    Asinh,
+    /// Arc cosine: `acos(x)`.
+    Acos,
+    /// Inverse hyperbolic cosine: `acosh(x)`.
+    Acosh,
+    /// Inverse hyperbolic tangent: `atanh(x)`.
+    Atanh,
+    /// exp(x)-1 with high precision for small x: `expm1(x)`.
+    Expm1,
+    /// Base-10 logarithm: `log10(x)`.
+    Log10,
+    /// Inverse error function: `erfinv(x)`.
+    ErfInv,
 }
 
 impl UnaryOpKind {
@@ -159,6 +183,18 @@ impl UnaryOpKind {
             // ~2× slower. MLX also uses rint() for its Round op (see unary.metal).
             UnaryOpKind::Round => format!("rint({arg})"),
             UnaryOpKind::Trunc => format!("trunc({arg})"),
+            UnaryOpKind::Sinh => format!("sinh({arg})"),
+            UnaryOpKind::Cosh => format!("cosh({arg})"),
+            UnaryOpKind::Tan => format!("tan({arg})"),
+            UnaryOpKind::Asin => format!("asin({arg})"),
+            UnaryOpKind::Atan => format!("atan({arg})"),
+            UnaryOpKind::Asinh => format!("asinh({arg})"),
+            UnaryOpKind::Acos => format!("acos({arg})"),
+            UnaryOpKind::Acosh => format!("acosh({arg})"),
+            UnaryOpKind::Atanh => format!("atanh({arg})"),
+            UnaryOpKind::Expm1 => format!("mt_expm1_impl({arg})"),
+            UnaryOpKind::Log10 => format!("log10({arg})"),
+            UnaryOpKind::ErfInv => format!("mt_erfinv_impl({arg})"),
         }
     }
 }
@@ -215,6 +251,10 @@ pub enum BinOpKind {
     CmpNe,
     /// Power: a^b (maps to MSL `pow(a, b)`).
     Pow,
+    /// Arc tangent of y/x: `atan2(y, x)`.
+    ATan2,
+    /// Floating-point remainder: `fmod(a, b)`.
+    Rem,
     /// Left shift: a << b.
     Shl,
     /// Right shift: a >> b.
@@ -225,6 +265,8 @@ pub enum BinOpKind {
     BitOr,
     /// Bitwise XOR (integer).
     BitXor,
+    /// Integer modulo: `a % b`.
+    Mod,
 }
 
 impl BinOpKind {
@@ -246,11 +288,14 @@ impl BinOpKind {
             BinOpKind::CmpEq => "==",
             BinOpKind::CmpNe => "!=",
             BinOpKind::Pow => "pow",
+            BinOpKind::ATan2 => "atan2",
+            BinOpKind::Rem => "fmod",
             BinOpKind::Shl => "<<",
             BinOpKind::Shr => ">>",
             BinOpKind::BitAnd => "&",
             BinOpKind::BitOr => "|",
             BinOpKind::BitXor => "^",
+            BinOpKind::Mod => "%",
         }
     }
 
@@ -269,7 +314,10 @@ impl BinOpKind {
 
     /// Whether this op is emitted as `fn(a, b)` rather than infix `a op b`.
     pub fn is_fn_call(self) -> bool {
-        matches!(self, BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow)
+        matches!(
+            self,
+            BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow | BinOpKind::ATan2 | BinOpKind::Rem
+        )
     }
 }
 
@@ -280,6 +328,7 @@ pub enum ReduceKind {
     Max,
     Min,
     Mean,
+    Product,
 }
 
 /// Atomic operation kind.
@@ -554,6 +603,32 @@ pub enum Op {
     /// Maps to `simd_sum(v)`, `simd_max(v)`, `simd_min(v)` (Metal 2.1+).
     SimdReduce { value: ValueId, op: ReduceKind },
 
+    /// Allocate a simdgroup matrix of shape M×N with given element type.
+    /// Emits `simdgroup_matrix<T, M, N> name;` in MSL.
+    SimdgroupAlloc { dtype: DType, m: u32, n: u32 },
+
+    /// Load one element from a simdgroup matrix: `result = name.thread_elements()[index]`.
+    /// Produces a scalar value.
+    SimdgroupElemLoad { value: ValueId, index: u32 },
+
+    /// Store one element into a simdgroup matrix: `name.thread_elements()[index] = data`.
+    /// No result (side-effecting).
+    SimdgroupElemStore { value: ValueId, index: u32, data: ValueId },
+
+    /// simdgroup multiply-accumulate: `C = A * B + C`.
+    /// All three operands must be simdgroup matrices of compatible shapes.
+    SimdgroupMatMul { a: ValueId, b: ValueId, c: ValueId },
+
+    /// Built-in: returns the SIMD lane index (thread_index_in_simdgroup).
+    SimdLaneId,
+
+    /// Built-in: returns the SIMD group index (simdgroup_index_in_threadgroup).
+    SimdGroupId,
+
+    /// SIMD-group inclusive prefix scan.
+    /// Maps to `simd_scan_inclusive_<op>(v)` (Metal 3.0+).
+    SimdScan { value: ValueId, op: ReduceKind, exclusive: bool },
+
     /// Allocate a named threadgroup (shared) memory array.
     /// Emits `threadgroup T name[size]` in the kernel body.
     ThreadgroupAlloc {
@@ -610,6 +685,10 @@ pub enum KernelMode {
     /// `uint2 tid [[thread_position_in_threadgroup]] + uint2 tgid`
     /// Used for tiled 2-D kernels (gemv, matmul).
     Tile2D,
+    /// `uint3 tid [[threadgroup_position_in_grid]]` + `uint3 lid` +
+    /// `uint simd_lane` + `uint simd_group`.
+    /// Used for tiled simdgroup-matmul kernels (steel GEMM).
+    SimdGroup2D,
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +830,7 @@ impl std::fmt::Display for Kernel {
             KernelMode::Reduction => "Reduction",
             KernelMode::Grid3D => "Grid3D",
             KernelMode::Tile2D => "Tile2D",
+            KernelMode::SimdGroup2D => "SimdGroup2D",
         };
         let params_str: Vec<String> = self
             .params
@@ -1045,6 +1125,23 @@ impl Op {
             },
             Op::ArgReduce { value, axis, op } => {
                 write!(f, "ArgReduce(v{}, axis={axis}, {op:?})", value.as_u32())
+            },
+            Op::SimdgroupAlloc { dtype, m, n } => {
+                write!(f, "SimdgroupAlloc({dtype:?}, {m}×{n})")
+            },
+            Op::SimdgroupElemLoad { value, index } => {
+                write!(f, "SimdgroupElemLoad(v{}, [{index}])", value.as_u32())
+            },
+            Op::SimdgroupElemStore { value, index, data } => {
+                write!(f, "SimdgroupElemStore(v{}, [{index}], v{})", value.as_u32(), data.as_u32())
+            },
+            Op::SimdgroupMatMul { a, b, c } => {
+                write!(f, "SimdgroupMatMul(v{}, v{}, v{})", a.as_u32(), b.as_u32(), c.as_u32())
+            },
+            Op::SimdLaneId => write!(f, "SimdLaneId"),
+            Op::SimdGroupId => write!(f, "SimdGroupId"),
+            Op::SimdScan { value, op, exclusive } => {
+                write!(f, "SimdScan(v{}, {op:?}, exclusive={exclusive})", value.as_u32())
             },
         }
     }

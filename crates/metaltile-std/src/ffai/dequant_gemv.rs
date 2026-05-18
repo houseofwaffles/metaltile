@@ -84,14 +84,15 @@ macro_rules! dequant_gemv_pow2_body {
             if pack_idx < n_packs_per_row {
                 let g = pack_idx / packs_per_group;
                 let scale = load(scales[row_group_off + g]).cast::<f32>();
-                let bias  = load(biases[row_group_off + g]).cast::<f32>();
+                let bias = load(biases[row_group_off + g]).cast::<f32>();
 
                 let packed = load(weight[row_pack_off + pack_idx]);
-                let p_off  = pack_idx * vals_per_pack;
+                let p_off = pack_idx * vals_per_pack;
 
                 for i in range(0u32, vals_per_pack, 1u32) {
                     let q = (packed >> (i * $bits)) & mask;
-                    acc = acc + (q.cast::<f32>() * scale + bias) * load(input[p_off + i]).cast::<f32>();
+                    acc = acc
+                        + (q.cast::<f32>() * scale + bias) * load(input[p_off + i]).cast::<f32>();
                 }
             }
         }
@@ -127,22 +128,22 @@ macro_rules! dequant_gemv_odd_body {
             if d < in_dim {
                 let g = d / group_size;
                 let scale = load(scales[row_group_off + g]).cast::<f32>();
-                let bias  = load(biases[row_group_off + g]).cast::<f32>();
+                let bias = load(biases[row_group_off + g]).cast::<f32>();
 
-                let bit_off    = d * $bits;
-                let word_idx   = bit_off / 32u32;
-                let bit_in_w   = bit_off & 31u32;
+                let bit_off = d * $bits;
+                let word_idx = bit_off / 32u32;
+                let bit_in_w = bit_off & 31u32;
                 let bits_in_w0 = 32u32 - bit_in_w;
-                let lo_bits    = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
-                let spill      = $bits - lo_bits;
+                let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
+                let spill = $bits - lo_bits;
 
-                let w0    = load(weight[row_u32_off + word_idx]);
+                let w0 = load(weight[row_u32_off + word_idx]);
                 let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
-                let w1    = load(weight[row_u32_off + w1idx]);
+                let w1 = load(weight[row_u32_off + w1idx]);
 
                 let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
                 let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
-                let q  = lo | hi;
+                let q = lo | hi;
 
                 acc = acc + (q.cast::<f32>() * scale + bias) * load(input[d]).cast::<f32>();
             }

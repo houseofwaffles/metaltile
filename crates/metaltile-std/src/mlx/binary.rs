@@ -116,6 +116,40 @@ pub fn mt_pow<T>(a: Tensor<T>, b: Tensor<T>, out: Tensor<T>) {
 
 #[bench_kernel(
     op="binary",
+    subop="atan2",
+    class=Binary,
+    input_a=Signed,
+    input_b=Half,
+    // tol=1e-3 — f16 atan2 compounds two-input ULP drift (~3e-4).
+    tol=1e-3,
+    mlx="vvn_ArcTan2{tn}",
+    metal_file="binary.metal",
+)]
+#[kernel]
+pub fn mt_atan2<T>(y: Tensor<T>, x: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], atan2(load(y[idx]), load(x[idx])));
+}
+
+#[bench_kernel(
+    op="binary",
+    subop="remainder",
+    class=Binary,
+    input_a=Signed,
+    input_b=Half,
+    // tol=1e-4 — f16 fmod(dividend, divisor) stays within ULP of MLX.
+    tol=1e-4,
+    mlx="vvn_Remainder{tn}",
+    metal_file="binary.metal",
+)]
+#[kernel]
+pub fn mt_remainder<T>(a: Tensor<T>, b: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    store(out[idx], remainder(load(a[idx]), load(b[idx])));
+}
+
+#[bench_kernel(
+    op="binary",
     subop="logaddexp",
     class=Binary,
     input_a=Signed,

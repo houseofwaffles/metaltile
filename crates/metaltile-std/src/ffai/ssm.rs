@@ -215,7 +215,7 @@ inventory::submit! {
         subop: "mt_step",
         kernel_name: "mt_ssm_step",
         kernel_ir: mt_ssm_step::kernel_ir_for,
-        dtypes: crate::spec::F16_ONLY,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
         tol: 0.0,
         mlx_src: None,
         mlx_pattern: None,

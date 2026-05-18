@@ -36,6 +36,7 @@ pub mod scan;
 pub mod sdpa_vector;
 pub mod softmax;
 pub mod sort;
+pub mod steel;
 pub mod strided;
 pub mod ternary;
 pub mod unary;

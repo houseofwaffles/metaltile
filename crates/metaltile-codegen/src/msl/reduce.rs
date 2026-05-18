@@ -38,6 +38,7 @@ impl super::MslGenerator {
                 ReduceKind::Sum | ReduceKind::Mean => ("simd_sum", "0.0f"),
                 ReduceKind::Max => ("simd_max", "-INFINITY"),
                 ReduceKind::Min => ("simd_min", "INFINITY"),
+                ReduceKind::Product => ("__mt_simd_product", "1.0f"),
             };
 
             // Phase 1: intra-warp reduction via simd_sum/max/min.
@@ -45,10 +46,10 @@ impl super::MslGenerator {
             wl!(out, "{pad}{{");
             wl!(out, "{pad}    float _sv = {simd_fn}(float({input_var}));");
             // Phase 2: lane 0 of each SIMD group writes its total.
-            wl!(out, "{pad}    if (simd_lane == 0) {tg_name}[simd_id] = _sv;");
+            wl!(out, "{pad}    if (simd_lane == 0) {tg_name}[simd_group] = _sv;");
             wl!(out, "{pad}    threadgroup_barrier(mem_flags::mem_threadgroup);");
             // Phase 3: first SIMD group reduces warp totals and broadcasts via [0].
-            wl!(out, "{pad}    if (simd_id == 0) {{");
+            wl!(out, "{pad}    if (simd_group == 0) {{");
             wl!(
                 out,
                 "{pad}        float _wv = simd_lane < n_simd ? {tg_name}[simd_lane] : {pad_val};"
@@ -70,6 +71,8 @@ impl super::MslGenerator {
             ReduceKind::Sum => wl!(out, "{pad}float {result_var} = simd_sum(float({input_var}));"),
             ReduceKind::Max => wl!(out, "{pad}float {result_var} = simd_max(float({input_var}));"),
             ReduceKind::Min => wl!(out, "{pad}float {result_var} = simd_min(float({input_var}));"),
+            ReduceKind::Product =>
+                wl!(out, "{pad}float {result_var} = __mt_simd_product(float({input_var}));"),
             ReduceKind::Mean => {
                 wl!(
                     out,

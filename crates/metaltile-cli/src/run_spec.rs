@@ -5,13 +5,19 @@ use metaltile_codegen::msl::MslGenerator;
 use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_std::{
     bench_types::{
-        DtypeCtx, EquivResult, EquivTolerance, OpBench, OpResult, check_equiv, check_equiv_with,
+        DtypeCtx,
+        EquivResult,
+        EquivTolerance,
+        OpBench,
+        OpResult,
+        check_equiv,
+        check_equiv_with,
     },
     spec::{BenchDispatch, BenchSpec, MlxArg, ScalarBufSpec, ShapeSpec},
 };
 
 use crate::{
-    measure::{bench_gbps, buffer_typed, run_typed_once, zeros_typed},
+    measure::{bench_gbps, buffer_typed, read_typed, run_typed_once, zeros_typed},
     runner::{GpuBuffer, GpuRunner},
 };
 
@@ -21,26 +27,20 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
         BenchDispatch::Generic => run_generic(spec, runner, dt, &bench),
         BenchDispatch::Sort { b, n, tpg } => run_sort(spec, runner, dt, &bench, *b, *n, *tpg),
         BenchDispatch::Scan { shapes, tpg } => run_scan(spec, runner, dt, &bench, shapes, *tpg),
-        BenchDispatch::ArgReduce { n, check_n, tpg } => {
-            run_arg_reduce(spec, runner, dt, &bench, *n, *check_n, *tpg)
-        },
+        BenchDispatch::ArgReduce { n, check_n, tpg } =>
+            run_arg_reduce(spec, runner, dt, &bench, *n, *check_n, *tpg),
         BenchDispatch::Random { n, tpg } => run_random(spec, runner, dt, &bench, *n, *tpg),
-        BenchDispatch::FpQuantized { n, tpg } => {
-            run_fp_quantized(spec, runner, dt, &bench, *n, *tpg)
-        },
-        BenchDispatch::QuantizedMatVec { shapes, group_size, tpg } => {
-            run_quantized_mat_vec(spec, runner, dt, &bench, shapes, *group_size, *tpg)
-        },
-        BenchDispatch::Rope { b, h, l, d, n_per_group } => {
-            run_rope(spec, runner, dt, &bench, *b, *h, *l, *d, *n_per_group)
-        },
-        BenchDispatch::Attention { shapes, tpg } => {
-            run_attention(spec, runner, dt, &bench, shapes, *tpg)
-        },
-        BenchDispatch::StridedCopy { m, n, pad } => {
-            run_strided_copy(spec, runner, dt, &bench, *m, *n, *pad)
-        },
-        BenchDispatch::AffineDequantize { bits, group_size, n_groups, batch, tpg } => {
+        BenchDispatch::FpQuantized { n, tpg } =>
+            run_fp_quantized(spec, runner, dt, &bench, *n, *tpg),
+        BenchDispatch::QuantizedMatVec { shapes, group_size, tpg } =>
+            run_quantized_mat_vec(spec, runner, dt, &bench, shapes, *group_size, *tpg),
+        BenchDispatch::Rope { b, h, l, d, n_per_group } =>
+            run_rope(spec, runner, dt, &bench, *b, *h, *l, *d, *n_per_group),
+        BenchDispatch::Attention { shapes, tpg } =>
+            run_attention(spec, runner, dt, &bench, shapes, *tpg),
+        BenchDispatch::StridedCopy { m, n, pad } =>
+            run_strided_copy(spec, runner, dt, &bench, *m, *n, *pad),
+        BenchDispatch::AffineDequantize { bits, group_size, n_groups, batch, tpg } =>
             run_affine_dequantize(
                 spec,
                 runner,
@@ -51,9 +51,8 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
                 *n_groups,
                 *batch,
                 *tpg,
-            )
-        },
-        BenchDispatch::AffineQuantize { bits, group_size, n_groups, batch, tpg } => {
+            ),
+        BenchDispatch::AffineQuantize { bits, group_size, n_groups, batch, tpg } =>
             run_affine_quantize(
                 spec,
                 runner,
@@ -64,9 +63,8 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
                 *n_groups,
                 *batch,
                 *tpg,
-            )
-        },
-        BenchDispatch::SdpaVector { head_dim, n_kv, n_q_heads, gqa_factor, batch, tpg } => {
+            ),
+        BenchDispatch::SdpaVector { head_dim, n_kv, n_q_heads, gqa_factor, batch, tpg } =>
             run_sdpa_vector(
                 spec,
                 runner,
@@ -78,8 +76,11 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
                 *gqa_factor,
                 *batch,
                 *tpg,
-            )
-        },
+            ),
+        BenchDispatch::SteelGemm { m, n, k, check_m, check_n, check_k, bm, bn, tpg } =>
+            run_steel_gemm(
+                spec, runner, dt, &bench, *m, *n, *k, *check_m, *check_n, *check_k, *bm, *bn, *tpg,
+            ),
     }
 }
 
@@ -101,18 +102,31 @@ fn msl_grid3d(spec: &BenchSpec, dt: DType) -> Option<String> {
 fn msl_for_mode(spec: &BenchSpec, dt: DType, mode: KernelMode) -> Option<String> {
     match mode {
         KernelMode::Elementwise => msl_elementwise(spec, dt),
-        KernelMode::Reduction | KernelMode::Tile2D => msl_reduction(spec, dt),
+        KernelMode::Reduction | KernelMode::Tile2D | KernelMode::SimdGroup2D =>
+            msl_reduction(spec, dt),
         KernelMode::Grid3D => msl_grid3d(spec, dt),
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn mlx_name(pat: &str, tn: &str) -> String {
-    pat.replace("{tn}", tn)
-}
+fn mlx_name(pat: &str, tn: &str) -> String { pat.replace("{tn}", tn) }
 fn compile_mt(runner: &GpuRunner, msl: &str, name: &str) -> Option<crate::runner::CompiledKernel> {
-    runner.compile(msl, name).ok()
+    match runner.compile(msl, name) {
+        Ok(k) => Some(k),
+        Err(e) => {
+            eprintln!(
+                "{} compile '{}': {}",
+                crate::term::paint_stderr(
+                    "[error]",
+                    crate::term::Style::new().fg(crate::term::Color::Red).bold(),
+                ),
+                name,
+                e,
+            );
+            None
+        },
+    }
 }
 fn compile_mlx(
     runner: &GpuRunner,
@@ -137,7 +151,7 @@ fn run_generic(spec: &BenchSpec, runner: &GpuRunner, dt: DType, bench: &OpBench)
         std::collections::HashMap::new();
     let mode_key = |m: KernelMode| match m {
         KernelMode::Elementwise => 0u8,
-        KernelMode::Reduction | KernelMode::Tile2D => 1,
+        KernelMode::Reduction | KernelMode::Tile2D | KernelMode::SimdGroup2D => 1,
         KernelMode::Grid3D => 2,
     };
 
@@ -150,7 +164,8 @@ fn run_generic(spec: &BenchSpec, runner: &GpuRunner, dt: DType, bench: &OpBench)
 
     for shape in spec.shapes {
         let ctx = match shape.mode {
-            KernelMode::Reduction | KernelMode::Tile2D => DtypeCtx::reduce(dt),
+            KernelMode::Reduction | KernelMode::Tile2D | KernelMode::SimdGroup2D =>
+                DtypeCtx::reduce(dt),
             _ => DtypeCtx::elementwise(dt),
         };
         let mk = match compiled.entry(mode_key(shape.mode)) {
@@ -176,7 +191,7 @@ fn run_generic(spec: &BenchSpec, runner: &GpuRunner, dt: DType, bench: &OpBench)
         // program_id::<0>() also lands in ValueId(0). For rows ≥ 2, pid > 0
         // corrupts the stride. With check_b=1, pid is always 0, stride = max(0,1) = 1.
         let check_b = match shape.mode {
-            KernelMode::Reduction | KernelMode::Tile2D => 1,
+            KernelMode::Reduction | KernelMode::Tile2D | KernelMode::SimdGroup2D => 1,
             _ => shape.check_b,
         };
         let primary_out_idx = params.iter().position(|p| p.is_output);
@@ -340,13 +355,14 @@ fn mlx_buf(
 fn run_sort(
     spec: &BenchSpec,
     runner: &GpuRunner,
-    _dt: DType,
+    dt: DType,
     bench: &OpBench,
     b: usize,
     n: usize,
     tpg: usize,
 ) -> Vec<OpResult> {
-    let msl = match msl_reduction(spec, DType::F32) {
+    let ctx = DtypeCtx::reduce(dt);
+    let msl = match msl_reduction(spec, dt) {
         Some(s) => s,
         None => return vec![],
     };
@@ -354,20 +370,17 @@ fn run_sort(
         Some(k) => k,
         None => return vec![],
     };
-    let ref_kernel = compile_mlx(runner, spec.mlx_src, spec.mlx_pattern, "float32");
+    let ref_kernel = compile_mlx(runner, spec.mlx_src, spec.mlx_pattern, ctx.tn);
 
     let check_b = 4usize;
-    let check_data: Vec<f32> = (0..check_b * n).map(|i| (check_b * n - i) as f32).collect();
-    let ref_out = {
-        let mut out = check_data.clone();
-        for chunk in out.chunks_mut(n) {
-            chunk.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        }
-        out
-    };
-    let inp_c = buffer_typed(runner, &check_data, DType::F32);
+    // Values 0..n reversed — unique per-element inputs guaranteed distinct within each batch.
+    // Correctness: verify the output is non-decreasing (sorted). We don't compare against an
+    // f32 reference because bf16 precision (7 mantissa bits) doesn't exactly represent all
+    // integers beyond 128, causing false failures when comparing dtype-rounded values to f32.
+    let check_data: Vec<f32> = (0..check_b).flat_map(|_| (0..n).rev().map(|i| i as f32)).collect();
+    let inp_c = buffer_typed(runner, &check_data, dt);
     let n_buf_c = runner.buffer_u32(n as u32);
-    let out_c = zeros_typed(runner, check_b * n, DType::F32);
+    let out_c = zeros_typed(runner, check_b * n, dt);
     let mt_chk = run_typed_once(
         runner,
         &mk,
@@ -376,9 +389,13 @@ fn run_sort(
         check_b * n,
         [check_b, 1, 1],
         [tpg, 1, 1],
-        DType::F32,
+        dt,
     );
-    let n_bad = ref_out.iter().zip(&mt_chk).filter(|(a, b)| a != b).count();
+    // A sort is correct iff each batch is non-decreasing.
+    let n_bad: usize = mt_chk
+        .chunks(n)
+        .map(|chunk| chunk.windows(2).filter(|w| w[0] > w[1] + spec.tol).count())
+        .sum();
     let equiv = EquivResult {
         n_checked: check_b * n,
         max_abs_err: if n_bad == 0 { 0.0 } else { f32::INFINITY },
@@ -387,12 +404,12 @@ fn run_sort(
     };
 
     let data: Vec<f32> = (0..b * n).map(|i| (b * n - i) as f32).collect();
-    let inp = buffer_typed(runner, &data, DType::F32);
-    let bytes = (b * n * 4 * 2) as f64;
+    let inp = buffer_typed(runner, &data, dt);
+    let bytes = (b * n * ctx.eb * 2) as f64;
     let n_buf = runner.buffer_u32(n as u32);
 
     let ref_perf = ref_kernel.as_ref().and_then(|rk| {
-        let out = zeros_typed(runner, b * n, DType::F32);
+        let out = zeros_typed(runner, b * n, dt);
         let size = runner.buffer_i32(n as i32);
         let stride1 = runner.buffer_i32(1i32);
         let stride_n = runner.buffer_i32(n as i32);
@@ -406,12 +423,12 @@ fn run_sort(
         )
     });
     let mt_perf = {
-        let out = zeros_typed(runner, b * n, DType::F32);
+        let out = zeros_typed(runner, b * n, dt);
         bench_gbps(runner, &mk, &[&inp, &out, &n_buf], [b, 1, 1], [tpg, 1, 1], bytes)
     };
     vec![bench.result_sub(
         Some(spec.subop),
-        format!("B={b} N={n} f32"),
+        format!("B={b} N={n} {}", ctx.label),
         ref_perf,
         mt_perf,
         Some(equiv),
@@ -1667,4 +1684,118 @@ fn run_sdpa_vector(
 
     let label = format!("H={n_q_heads} N={n_kv} D={head_dim} gqa={gqa_factor} {}", ctx.label);
     vec![bench.result_sub(Some(spec.subop), label, ref_perf, mt_perf, equiv)]
+}
+
+// ── SteelGemm (simdgroup tiled GEMM) ────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn run_steel_gemm(
+    spec: &BenchSpec,
+    runner: &GpuRunner,
+    dt: DType,
+    bench: &OpBench,
+    m: usize,
+    n: usize,
+    k: usize,
+    check_m: usize,
+    check_n: usize,
+    check_k: usize,
+    bm: usize,
+    bn: usize,
+    tpg: usize,
+) -> Vec<OpResult> {
+    let ctx = DtypeCtx::elementwise(dt);
+
+    // Compile MT kernel — must use SimdGroup2D so program_id axes map to
+    // threadgroup indices (tid.x/tid.y) rather than the global thread index.
+    let mut kernel = (spec.kernel_ir)(dt);
+    kernel.mode = KernelMode::SimdGroup2D;
+    let msl = match MslGenerator::default().generate(&kernel) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let mk = match runner.compile(&msl, spec.kernel_name) {
+        Ok(k) => k,
+        Err(_) => return Vec::new(),
+    };
+
+    // Compile MLX reference kernel with function constants
+    let mlx_k = spec.mlx_src.and_then(|src| {
+        spec.mlx_pattern.and_then(|pat| {
+            let name = pat.replace("{tn}", DtypeCtx::elementwise(dt).tn);
+            // has_batch(10)=false, use_out_source(100)=false, do_axpby(110)=false,
+            // align_M(200)=true, align_N(201)=true, align_K(202)=true
+            runner.compile_with_bool_constants(
+                src, &name,
+                &[(10, false), (100, false), (110, false), (200, true), (201, true), (202, true)],
+            ).ok()
+        })
+    });
+
+    // Build check buffers
+    let a_buf = buffer_typed(runner, &vec![1.0f32; check_m * check_k], dt);
+    let b_buf = buffer_typed(runner, &vec![1.0f32; check_k * check_n], dt);
+    let d_buf = zeros_typed(runner, check_m * check_n, dt);
+    let mlx_d_buf = zeros_typed(runner, check_m * check_n, dt);
+    let m_buf = buffer_typed(runner, &[check_m as f32], DType::U32);
+    let n_buf = buffer_typed(runner, &[check_n as f32], DType::U32);
+    let k_buf = buffer_typed(runner, &[check_k as f32], DType::U32);
+
+    // Build GEMMParams for MLX reference
+    // C++ struct layout (Metal = C++ ABI):
+    //   int M,N,K,lda,ldb,ldd; int tiles_n,tiles_m;  (8×4 = 32 bytes, aligned to 8)
+    //   int64_t batch_stride_a,b,d;                   (3×8 = 24 bytes)
+    //   int swizzle_log, gemm_k_iter, batch_ndim;    (3×4 = 12 bytes)
+    // Total: 68 bytes, no padding needed (32 is 8-aligned)
+    let lda = check_k as i32;
+    let ldb = check_n as i32;
+    let ldd = check_n as i32;
+    let params_bytes: Vec<u8> = {
+        let mut v = Vec::with_capacity(72);
+        v.extend_from_slice(&(check_m as i32).to_le_bytes());  // M
+        v.extend_from_slice(&(check_n as i32).to_le_bytes());  // N
+        v.extend_from_slice(&(check_k as i32).to_le_bytes());  // K
+        v.extend_from_slice(&lda.to_le_bytes());                // lda
+        v.extend_from_slice(&ldb.to_le_bytes());                // ldb
+        v.extend_from_slice(&ldd.to_le_bytes());                // ldd
+        v.extend_from_slice(&((check_n / bn) as i32).to_le_bytes()); // tiles_n
+        v.extend_from_slice(&((check_m / bm) as i32).to_le_bytes()); // tiles_m
+        // No padding: offset 32 is already 8-byte aligned
+        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_a
+        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_b
+        v.extend_from_slice(&0i64.to_le_bytes());               // batch_stride_d
+        v.extend_from_slice(&0i32.to_le_bytes());               // swizzle_log
+        v.extend_from_slice(&((check_k / 16) as i32).to_le_bytes()); // gemm_k_iterations_aligned
+        v.extend_from_slice(&0i32.to_le_bytes());               // batch_ndim
+        v
+    };
+    let params_buf = runner.buffer_bytes(&params_bytes);
+    let addmm_buf = runner.buffer_zeros(32); // unused (use_out_source=false)
+    let batch_shape_buf = runner.buffer_zeros(4); // unused
+    let batch_strides_buf = runner.buffer_zeros(8); // unused
+
+    let grid = [check_n / bn, check_m / bm, 1];
+    let tpg_arr = [tpg, 1, 1];
+    let all_bufs: [&GpuBuffer; 6] = [&a_buf, &b_buf, &d_buf, &m_buf, &n_buf, &k_buf];
+    let mlx_bufs: [&GpuBuffer; 8] = [&a_buf, &b_buf, &mlx_d_buf, &mlx_d_buf, &params_buf, &addmm_buf, &batch_shape_buf, &batch_strides_buf];
+
+    // Run MLX reference
+    let ref_perf = mlx_k.as_ref().and_then(|rk| {
+        runner.measure(rk, &mlx_bufs, grid, tpg_arr, 0, 1);
+        bench_gbps(runner, rk, &mlx_bufs, grid, tpg_arr, ((check_m * check_k + check_k * check_n + check_m * check_n) * ctx.eb) as f64)
+    });
+    let ref_vals: Vec<f32> = mlx_k.as_ref().map(|_| read_typed(runner, &mlx_d_buf, check_m * check_n, dt)).unwrap_or_else(|| (0..check_m * check_n).map(|_| check_k as f32).collect());
+
+    // Run MT
+    runner.measure(&mk, &all_bufs, grid, tpg_arr, 0, 1);
+    let mt_vals = read_typed(runner, &d_buf, check_m * check_n, dt);
+
+    let equiv = check_equiv(&ref_vals, &mt_vals, 1e-2);
+    let label = format!("M={m} N={n} K={k} BM={bm} BN={bn} {}", ctx.label);
+    let mt_perf = bench_gbps(
+        runner, &mk, &all_bufs, grid, tpg_arr,
+        ((check_m * check_k + check_k * check_n + check_m * check_n) * ctx.eb) as f64,
+    );
+
+    vec![bench.result_sub(Some(spec.subop), label, ref_perf, mt_perf, Some(equiv))]
 }

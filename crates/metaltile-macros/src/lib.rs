@@ -267,9 +267,7 @@ fn has_mutable_tensor_param(input: &syn::FnArg) -> bool {
     false
 }
 
-fn is_legacy_output_name(name: &str) -> bool {
-    matches!(name, "out" | "c" | "output")
-}
+fn is_legacy_output_name(name: &str) -> bool { matches!(name, "out" | "c" | "output") }
 
 /// Extract parameter names from the signature.
 fn extract_param_names(sig: &syn::Signature) -> Vec<String> {
@@ -392,6 +390,7 @@ fn parse_dtype_generic(
             "i32" => quote! { DType::I32 },
             "u32" => quote! { DType::U32 },
             "i8" => quote! { DType::I8 },
+            "u8" => quote! { DType::U8 },
             "bool" => quote! { DType::Bool },
             _ => quote! { DType::F32 },
         };
@@ -670,7 +669,12 @@ mod bench_impl {
     use proc_macro2::TokenStream;
     use quote::quote;
     use syn::{
-        Expr, Ident, LitFloat, LitInt, LitStr, Token,
+        Expr,
+        Ident,
+        LitFloat,
+        LitInt,
+        LitStr,
+        Token,
         parse::{Parse, ParseStream},
     };
 
@@ -1168,7 +1172,7 @@ mod bench_impl {
                     tpg: crate::spec::SELECT_TPG,
                     grid: crate::spec::DispatchGrid::DivCeilN,
                     tensor_bufs: &[
-                        crate::spec::TensorBufSpec { count: crate::spec::Dim::N, init: crate::spec::BufInit::AltZeroOne, dtype_override: None },
+                        crate::spec::TensorBufSpec { count: crate::spec::Dim::N, init: crate::spec::BufInit::AltZeroOne, dtype_override: Some(metaltile_core::DType::U8) },
                         crate::spec::TensorBufSpec { count: crate::spec::Dim::N, init: crate::spec::BufInit::Half, dtype_override: None },
                         crate::spec::TensorBufSpec { count: crate::spec::Dim::N, init: crate::spec::BufInit::Half, dtype_override: None },
                         crate::spec::TensorBufSpec { count: crate::spec::Dim::N, init: crate::spec::BufInit::Zeros, dtype_override: None },
@@ -1177,7 +1181,7 @@ mod bench_impl {
                     cexprs: &[],
                     out_elems: crate::spec::Dim::N,
                     reads: 3usize,
-                    bytes_fn: crate::spec::bytes_elementwise,
+                    bytes_fn: crate::spec::bytes_select,
                     mlx_args: Some(&[
                         crate::spec::MlxArg::BoolAltN,
                         crate::spec::MlxArg::TensorBuf(1),
@@ -1259,7 +1263,7 @@ mod bench_impl {
                 let sh = quote! { &[crate::spec::ShapeSpec {
                     label: #label,
                     n: #n_val as usize, b: #b_val as usize,
-                    check_n: crate::spec::ROW_REDUCE_CHECK_N, check_b: 4usize,
+                    check_n: #n_val as usize, check_b: 4usize,
                     mode: metaltile_core::ir::KernelMode::Reduction,
                     tpg: #tpg_val as usize,
                     grid: crate::spec::DispatchGrid::RowsB,
@@ -1357,77 +1361,59 @@ mod bench_impl {
                 let b_val = a.b.as_ref().expect("Sort requires b");
                 let n_val = a.n.as_ref().expect("Sort requires n");
                 let tpg_val = a.tpg.as_ref().expect("Sort requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::Sort {
-                            b: #b_val as usize, n: #n_val as usize, tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::Sort {
+                        b: #b_val as usize, n: #n_val as usize, tpg: #tpg_val as usize,
+                    }
+                })
             },
             // ── Complex: Scan ────────────────────────────────────────────────
             ClassKind::Scan => {
                 let sh = a.shapes.as_ref().expect("Scan requires shapes");
                 let tpg_val = a.tpg.as_ref().expect("Scan requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::Scan { shapes: #sh, tpg: #tpg_val as usize }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::Scan { shapes: #sh, tpg: #tpg_val as usize }
+                })
             },
             // ── Complex: ArgReduce ───────────────────────────────────────────
             ClassKind::ArgReduce => {
                 let n_val = a.n.as_ref().expect("ArgReduce requires n");
                 let cn_val = a.check_n.as_ref().expect("ArgReduce requires check_n");
                 let tpg_val = a.tpg.as_ref().expect("ArgReduce requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::ArgReduce {
-                            n: #n_val as usize, check_n: #cn_val as usize, tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::ArgReduce {
+                        n: #n_val as usize, check_n: #cn_val as usize, tpg: #tpg_val as usize,
+                    }
+                })
             },
             // ── Complex: Random ──────────────────────────────────────────────
             ClassKind::Random => {
                 let n_val = a.n.as_ref().expect("Random requires n");
                 let tpg_val = a.tpg.as_ref().expect("Random requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::Random { n: #n_val as usize, tpg: #tpg_val as usize }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::Random { n: #n_val as usize, tpg: #tpg_val as usize }
+                })
             },
             // ── Complex: FpQuantized ─────────────────────────────────────────
             ClassKind::FpQuantized => {
                 let n_val = a.n.as_ref().expect("FpQuantized requires n");
                 let tpg_val = a.tpg.as_ref().expect("FpQuantized requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::FpQuantized {
-                            n: #n_val as usize, tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::FpQuantized {
+                        n: #n_val as usize, tpg: #tpg_val as usize,
+                    }
+                })
             },
             // ── Complex: QuantizedMatVec ─────────────────────────────────────
             ClassKind::QuantizedMatVec => {
                 let sh = a.shapes.as_ref().expect("QuantizedMatVec requires shapes");
                 let gs = a.group_size.as_ref().expect("QuantizedMatVec requires group_size");
                 let tpg_val = a.tpg.as_ref().expect("QuantizedMatVec requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::QuantizedMatVec {
-                            shapes: #sh, group_size: #gs as usize, tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::QuantizedMatVec {
+                        shapes: #sh, group_size: #gs as usize, tpg: #tpg_val as usize,
+                    }
+                })
             },
             // ── Complex: Rope ────────────────────────────────────────────────
             ClassKind::Rope => {
@@ -1436,41 +1422,32 @@ mod bench_impl {
                 let l_val = a.l.as_ref().expect("Rope requires l");
                 let d_val = a.d.as_ref().expect("Rope requires d");
                 let npg = a.n_per_group.as_ref().expect("Rope requires n_per_group");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::Rope {
-                            b: #b_val as usize, h: #h_val as usize,
-                            l: #l_val as usize, d: #d_val as usize,
-                            n_per_group: #npg as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::Rope {
+                        b: #b_val as usize, h: #h_val as usize,
+                        l: #l_val as usize, d: #d_val as usize,
+                        n_per_group: #npg as usize,
+                    }
+                })
             },
             // ── Complex: Attention ───────────────────────────────────────────
             ClassKind::Attention => {
                 let sh = a.shapes.as_ref().expect("Attention requires shapes");
                 let tpg_val = a.tpg.as_ref().expect("Attention requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::Attention { shapes: #sh, tpg: #tpg_val as usize }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::Attention { shapes: #sh, tpg: #tpg_val as usize }
+                })
             },
             // ── Complex: StridedCopy ─────────────────────────────────────────
             ClassKind::StridedCopy => {
                 let m_val = a.m.as_ref().expect("StridedCopy requires m");
                 let n_val = a.n.as_ref().expect("StridedCopy requires n");
                 let pad_val = a.pad.as_ref().expect("StridedCopy requires pad");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::StridedCopy {
-                            m: #m_val as usize, n: #n_val as usize, pad: #pad_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::StridedCopy {
+                        m: #m_val as usize, n: #n_val as usize, pad: #pad_val as usize,
+                    }
+                })
             },
             // ── Complex: AffineDequantize ────────────────────────────────────
             ClassKind::AffineDequantize => {
@@ -1479,18 +1456,15 @@ mod bench_impl {
                 let ng = a.n_groups.as_ref().expect("AffineDequantize requires n_groups");
                 let batch = a.batch.as_ref().expect("AffineDequantize requires batch");
                 let tpg_val = a.tpg.as_ref().expect("AffineDequantize requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::AffineDequantize {
-                            bits: #bits_val as usize,
-                            group_size: #gs as usize,
-                            n_groups: #ng as usize,
-                            batch: #batch as usize,
-                            tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::AffineDequantize {
+                        bits: #bits_val as usize,
+                        group_size: #gs as usize,
+                        n_groups: #ng as usize,
+                        batch: #batch as usize,
+                        tpg: #tpg_val as usize,
+                    }
+                })
             },
             // ── Complex: AffineQuantize ──────────────────────────────────────
             ClassKind::AffineQuantize => {
@@ -1499,18 +1473,15 @@ mod bench_impl {
                 let ng = a.n_groups.as_ref().expect("AffineQuantize requires n_groups");
                 let batch = a.batch.as_ref().expect("AffineQuantize requires batch");
                 let tpg_val = a.tpg.as_ref().expect("AffineQuantize requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::AffineQuantize {
-                            bits: #bits_val as usize,
-                            group_size: #gs as usize,
-                            n_groups: #ng as usize,
-                            batch: #batch as usize,
-                            tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::AffineQuantize {
+                        bits: #bits_val as usize,
+                        group_size: #gs as usize,
+                        n_groups: #ng as usize,
+                        batch: #batch as usize,
+                        tpg: #tpg_val as usize,
+                    }
+                })
             },
             // ── Complex: SdpaVector (decode-form SDPA) ───────────────────────
             ClassKind::SdpaVector => {
@@ -1520,19 +1491,16 @@ mod bench_impl {
                 let gqa = a.gqa_factor.as_ref().expect("SdpaVector requires gqa_factor (Q-per-KV)");
                 let batch = a.batch.as_ref().expect("SdpaVector requires batch");
                 let tpg_val = a.tpg.as_ref().expect("SdpaVector requires tpg");
-                (
-                    quote! { &[] },
-                    quote! {
-                        crate::spec::BenchDispatch::SdpaVector {
-                            head_dim: #hd as usize,
-                            n_kv: #nkv as usize,
-                            n_q_heads: #nh as usize,
-                            gqa_factor: #gqa as usize,
-                            batch: #batch as usize,
-                            tpg: #tpg_val as usize,
-                        }
-                    },
-                )
+                (quote! { &[] }, quote! {
+                    crate::spec::BenchDispatch::SdpaVector {
+                        head_dim: #hd as usize,
+                        n_kv: #nkv as usize,
+                        n_q_heads: #nh as usize,
+                        gqa_factor: #gqa as usize,
+                        batch: #batch as usize,
+                        tpg: #tpg_val as usize,
+                    }
+                })
             },
         };
 

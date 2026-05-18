@@ -24,6 +24,24 @@ pub fn mt_all_reduce<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 
 #[bench_kernel(
     op="all_reduce",
+    subop="prod",
+    class=AllReduce,
+    // tol=1024.0 — product grows exponentially; 64M bf16 values compound
+    // ~1% relative error per multiply, leading to large absolute divergence.
+    tol=1024.0,
+    mlx="all_reduce_prod{tn}",
+    metal_file="reduce.metal",
+)]
+#[kernel]
+pub fn mt_all_reduce_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let off = 0;
+    let acc = strided_reduce(inp, off, n, product);
+    let result = reduce_product(acc);
+    store(out[0], result);
+}
+
+#[bench_kernel(
+    op="all_reduce",
     subop="max",
     class=AllReduce,
     tol=0.0,
@@ -69,6 +87,24 @@ pub fn mt_row_reduce<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let re = rs + n;
     let acc = strided_reduce(inp, rs, re, sum);
     let result = reduce_sum(acc);
+    store(out[row], result);
+}
+
+#[bench_kernel(
+    op="row_reduce",
+    subop="prod",
+    class=RowReduce,
+    tol=32.0,
+    mlx="row_reduce_simple_prod{tn}",
+    metal_file="reduce.metal",
+)]
+#[kernel]
+pub fn mt_row_reduce_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<0>();
+    let rs = row * n;
+    let re = rs + n;
+    let acc = strided_reduce(inp, rs, re, product);
+    let result = reduce_product(acc);
     store(out[row], result);
 }
 

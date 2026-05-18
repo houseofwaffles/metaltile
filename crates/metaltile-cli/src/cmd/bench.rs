@@ -76,6 +76,7 @@ pub fn run(args: &[String]) {
 
     // Run all ops, optionally narrowed to a single substring filter.
     let mut all: Vec<OpResult> = Vec::new();
+    let mut matched_filter = false;
     let mut printer = SuitePrinter::new(true);
     {
         let mut report = |result: &OpResult| {
@@ -91,6 +92,7 @@ pub fn run(args: &[String]) {
             specs.sort_unstable_by_key(|s| (s.op, s.subop));
             for spec in specs {
                 if matches_filter(filter.as_deref(), spec.op) {
+                    matched_filter = true;
                     for &dt in spec.dtypes {
                         runner.flush_slc();
                         all.extend(run_spec(spec, &runner, dt));
@@ -102,14 +104,27 @@ pub fn run(args: &[String]) {
 
     if all.is_empty() {
         if let Some(pattern) = &filter {
-            eprintln!(
-                "{} {}",
-                paint_stderr("[warn]", Style::new().fg(Color::Yellow).bold()),
-                paint_stderr(
-                    format!("No benchmarks matched --filter {pattern:?}"),
-                    Style::new().fg(Color::BrightWhite),
-                ),
-            );
+            if matched_filter {
+                eprintln!(
+                    "{} {}",
+                    paint_stderr("[error]", Style::new().fg(Color::Red).bold()),
+                    paint_stderr(
+                        format!(
+                            "Kernel matched --filter {pattern:?} but all shapes failed to compile or run"
+                        ),
+                        Style::new().fg(Color::BrightWhite),
+                    ),
+                );
+            } else {
+                eprintln!(
+                    "{} {}",
+                    paint_stderr("[warn]", Style::new().fg(Color::Yellow).bold()),
+                    paint_stderr(
+                        format!("No benchmarks matched --filter {pattern:?}"),
+                        Style::new().fg(Color::BrightWhite),
+                    ),
+                );
+            }
         } else {
             eprintln!(
                 "{} {}",

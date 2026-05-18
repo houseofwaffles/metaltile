@@ -173,9 +173,17 @@ pub fn remap_value_ids(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
         },
 
         // ── SIMD / threadgroup ────────────────────────────────────────────
-        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } => {
+        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } | Op::SimdScan { value, .. } => {
             s(value);
         },
+        Op::SimdgroupElemLoad { value, .. } => {
+            s(value);
+        },
+        Op::SimdgroupElemStore { value, data, .. } => {
+            s(value);
+            s(data);
+        },
+        Op::SimdgroupAlloc { .. } | Op::SimdgroupMatMul { .. } => {},
         Op::ThreadgroupLoad { index, .. } => {
             s(index);
         },
@@ -206,7 +214,9 @@ pub fn remap_value_ids(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
         | Op::Splat { .. }
         | Op::Barrier
         | Op::ThreadgroupAlloc { .. }
-        | Op::Dequantize { .. } => {},
+        | Op::Dequantize { .. }
+        | Op::SimdLaneId
+        | Op::SimdGroupId => {},
     }
 }
 
@@ -354,9 +364,17 @@ pub fn op_value_refs(op: &Op) -> Vec<ValueId> {
         },
 
         // ── SIMD / threadgroup ────────────────────────────────────────────
-        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } => {
+        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } | Op::SimdScan { value, .. } => {
             refs.push(*value);
         },
+        Op::SimdgroupElemLoad { value, .. } => {
+            refs.push(*value);
+        },
+        Op::SimdgroupElemStore { value, data, .. } => {
+            refs.push(*value);
+            refs.push(*data);
+        },
+        Op::SimdgroupAlloc { .. } | Op::SimdgroupMatMul { .. } => {},
         Op::ThreadgroupLoad { index, .. } => {
             refs.push(*index);
         },
@@ -386,7 +404,9 @@ pub fn op_value_refs(op: &Op) -> Vec<ValueId> {
         | Op::Splat { .. }
         | Op::Barrier
         | Op::ThreadgroupAlloc { .. }
-        | Op::Dequantize { .. } => {},
+        | Op::Dequantize { .. }
+        | Op::SimdLaneId
+        | Op::SimdGroupId => {},
     }
 
     refs
@@ -559,9 +579,17 @@ pub fn max_vid_in_op(op: &Op) -> u32 {
         },
 
         // ── SIMD / threadgroup ────────────────────────────────────────────
-        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } => {
+        Op::SimdReduce { value, .. } | Op::ArgReduce { value, .. } | Op::SimdScan { value, .. } => {
             push(value);
         },
+        Op::SimdgroupElemLoad { value, .. } => {
+            push(value);
+        },
+        Op::SimdgroupElemStore { value, data, .. } => {
+            push(value);
+            push(data);
+        },
+        Op::SimdgroupAlloc { .. } | Op::SimdgroupMatMul { .. } => {},
         Op::ThreadgroupLoad { index, .. } => {
             push(index);
         },
@@ -592,7 +620,9 @@ pub fn max_vid_in_op(op: &Op) -> u32 {
         | Op::Splat { .. }
         | Op::Barrier
         | Op::ThreadgroupAlloc { .. }
-        | Op::Dequantize { .. } => {},
+        | Op::Dequantize { .. }
+        | Op::SimdLaneId
+        | Op::SimdGroupId => {},
     }
 
     m
@@ -791,11 +821,7 @@ mod tests {
 
         // Single-op test: a fused chain that contains a sub-op ref.
         let op = Op::FusedElementwise {
-            ops: vec![Op::BinOp {
-                op: BinOpKind::Add,
-                lhs: sub_op_ref_0,
-                rhs: real_vid,
-            }],
+            ops: vec![Op::BinOp { op: BinOpKind::Add, lhs: sub_op_ref_0, rhs: real_vid }],
         };
         assert_eq!(max_vid_in_op(&op), 42, "sub-op refs must not bump max_vid");
 
@@ -807,10 +833,7 @@ mod tests {
             Op::FusedElementwise {
                 ops: vec![
                     Op::Cast { value: ValueId::new(100), dtype: metaltile_core::dtype::DType::F32 },
-                    Op::UnaryOp {
-                        op: metaltile_core::ir::UnaryOpKind::Neg,
-                        value: sub_op_ref_0,
-                    },
+                    Op::UnaryOp { op: metaltile_core::ir::UnaryOpKind::Neg, value: sub_op_ref_0 },
                 ],
             },
             ValueId::new(101),

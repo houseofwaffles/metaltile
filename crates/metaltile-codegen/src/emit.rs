@@ -325,6 +325,7 @@ fn kernel_mode_str(m: KernelMode) -> &'static str {
         KernelMode::Reduction => "Reduction",
         KernelMode::Grid3D => "Grid3D",
         KernelMode::Tile2D => "Tile2D",
+        KernelMode::SimdGroup2D => "SimdGroup2D",
     }
 }
 

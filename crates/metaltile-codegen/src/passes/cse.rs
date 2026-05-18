@@ -72,11 +72,25 @@ impl super::Pass for CsePass {
             .map(|p| p.name.clone())
             .collect();
 
-        // CSE on the body block.
-        cse_block(&mut kernel.body, &read_only);
+        // CSE on the body block; capture the elimination map so we can propagate
+        // it to child blocks — a value eliminated in the body may still be
+        // referenced by an inner-loop block that the body-local pass didn't touch.
+        let body_remap = cse_block(&mut kernel.body, &read_only);
+
+        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+
+        // Propagate body-level CSE eliminations into every child block.
+        if !body_remap.is_empty() {
+            for bid in &block_ids {
+                if let Some(block) = kernel.blocks.get_mut(bid) {
+                    for op in block.ops.iter_mut() {
+                        replace_values(op, &body_remap);
+                    }
+                }
+            }
+        }
 
         // CSE on all nested blocks.
-        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
         for bid in &block_ids {
             if let Some(block) = kernel.blocks.get_mut(bid) {
                 cse_block(block, &read_only);
@@ -87,7 +101,12 @@ impl super::Pass for CsePass {
     }
 }
 
-fn cse_block(block: &mut Block, read_only: &std::collections::BTreeSet<String>) {
+/// Run CSE on `block` and return the `old → new` ValueId remap that was applied,
+/// so callers can propagate eliminations to sibling / child blocks.
+fn cse_block(
+    block: &mut Block,
+    read_only: &std::collections::BTreeSet<String>,
+) -> HashMap<ValueId, ValueId> {
     let n = block.ops.len();
 
     // Phase 1: find duplicates and build old_vid -> replacement_vid map.
@@ -113,7 +132,7 @@ fn cse_block(block: &mut Block, read_only: &std::collections::BTreeSet<String>) 
     }
 
     if old_to_new.is_empty() {
-        return;
+        return old_to_new;
     }
 
     // Phase 2: remap ValueId references in all surviving ops.
@@ -136,6 +155,7 @@ fn cse_block(block: &mut Block, read_only: &std::collections::BTreeSet<String>) 
 
     block.ops = new_ops;
     block.results = new_results;
+    old_to_new
 }
 
 /// Build an OpKey for an op if it's CSE-eligible.
@@ -312,7 +332,14 @@ fn replace_values(op: &mut Op, map: &HashMap<ValueId, ValueId>) {
             s(index);
             s(value);
         },
-        Op::ThreadgroupAlloc { .. } | Op::Barrier => {},
+        Op::ThreadgroupAlloc { .. } | Op::Barrier | Op::SimdLaneId | Op::SimdGroupId => {},
+        Op::SimdgroupAlloc { .. } | Op::SimdgroupMatMul { .. } => {},
+        Op::SimdgroupElemLoad { value, .. } => s(value),
+        Op::SimdgroupElemStore { value, data, .. } => {
+            s(value);
+            s(data);
+        },
+        Op::SimdScan { value, .. } => s(value),
         Op::DeclareLocal { value, .. } | Op::SetLocal { value, .. } => s(value),
         Op::ArgReduce { value, .. } => s(value),
     }

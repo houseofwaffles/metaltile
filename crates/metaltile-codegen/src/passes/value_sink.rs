@@ -52,12 +52,20 @@ impl super::Pass for ValueSinkPass {
     fn name(&self) -> &str { "value_sink" }
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
-        sink_in_block(&mut kernel.body);
+        // Pass the full blocks map so sink_in_block can count uses in child
+        // blocks (inner loop bodies) — preventing values from being sunk past
+        // the loops that reference them.
+        {
+            let (body, blocks) = (&mut kernel.body, &kernel.blocks);
+            sink_in_block(body, blocks);
+        }
 
         let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
         for bid in block_ids {
             let mut block = kernel.blocks.remove(&bid).unwrap();
-            sink_in_block(&mut block);
+            // For inner blocks, child-of-child nesting is rare; pass the
+            // remaining (non-removed) blocks for best-effort cross-block counting.
+            sink_in_block(&mut block, &kernel.blocks);
             kernel.blocks.insert(bid, block);
         }
 
@@ -89,17 +97,41 @@ struct SinkPlan {
 // main logic
 // ---------------------------------------------------------------------------
 
-fn sink_in_block(block: &mut Block) {
+fn sink_in_block(block: &mut Block, all_blocks: &BTreeMap<BlockId, Block>) {
     let n = block.ops.len();
     if n == 0 {
         return;
     }
 
     // Phase 1: compute use-count for each ValueId.
+    // Also count uses inside directly-nested child blocks (inner loop / if
+    // bodies) so that values used inside a nested block are not sunk past
+    // the loop/if op that encloses them.
     let mut use_count: BTreeMap<ValueId, usize> = BTreeMap::new();
     for op in &block.ops {
         for vid in remap::op_value_refs(op) {
             *use_count.entry(vid).or_default() += 1;
+        }
+        // Count uses inside child blocks referenced by this op.
+        let mut child_bids: Vec<BlockId> = Vec::new();
+        match op {
+            Op::Loop { body, .. } => child_bids.push(*body),
+            Op::If { then_block, else_block, .. } => {
+                child_bids.push(*then_block);
+                if let Some(eb) = else_block {
+                    child_bids.push(*eb);
+                }
+            },
+            _ => {},
+        }
+        for bid in child_bids {
+            if let Some(child) = all_blocks.get(&bid) {
+                for child_op in &child.ops {
+                    for vid in remap::op_value_refs(child_op) {
+                        *use_count.entry(vid).or_default() += 1;
+                    }
+                }
+            }
         }
     }
 

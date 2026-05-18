@@ -88,5 +88,66 @@ impl super::MslGenerator {
             wl!(out, "template<typename T>");
             wl!(out, "inline T mt_erf_impl(T x) {{ return T(mt_erf_impl(float(x))); }}");
         }
+        if feat.needs_erfinv {
+            wl!(out);
+            // Inverse error function, ported from MLX erf.h (max error < 2.4 ulp)
+            wl!(out, "inline float mt_erfinv_impl(float a) {{");
+            wl!(out, "    auto t = metal::fma(a, -a, 1.0f);");
+            wl!(out, "    t = metal::log(t);");
+            wl!(out, "    float p;");
+            wl!(out, "    if (metal::abs(t) > 6.125f) {{");
+            wl!(out, "        p =  3.03697567e-10f;"); // 0x1.4deb44p-32
+            wl!(out, "        p = metal::fma(p, t,  2.93243101e-8f);");
+            wl!(out, "        p = metal::fma(p, t,  1.22150334e-6f);");
+            wl!(out, "        p = metal::fma(p, t,  2.84108955e-5f);");
+            wl!(out, "        p = metal::fma(p, t,  3.93552968e-4f);");
+            wl!(out, "        p = metal::fma(p, t,  3.02698812e-3f);");
+            wl!(out, "        p = metal::fma(p, t,  4.83185798e-3f);");
+            wl!(out, "        p = metal::fma(p, t, -2.64646143e-1f);");
+            wl!(out, "        p = metal::fma(p, t,  8.40016484e-1f);");
+            wl!(out, "    }} else {{");
+            wl!(out, "        p =  5.43877832e-9f;"); // 0x1.75c000p-28
+            wl!(out, "        p = metal::fma(p, t,  1.43285448e-7f);");
+            wl!(out, "        p = metal::fma(p, t,  1.22774793e-6f);");
+            wl!(out, "        p = metal::fma(p, t,  1.12963626e-7f);");
+            wl!(out, "        p = metal::fma(p, t, -5.61530760e-5f);");
+            wl!(out, "        p = metal::fma(p, t, -1.47697632e-4f);");
+            wl!(out, "        p = metal::fma(p, t,  2.31468678e-3f);");
+            wl!(out, "        p = metal::fma(p, t,  1.15392581e-2f);");
+            wl!(out, "        p = metal::fma(p, t, -2.32015476e-1f);");
+            wl!(out, "        p = metal::fma(p, t,  8.86226892e-1f);");
+            wl!(out, "    }}");
+            wl!(out, "    return a * p;");
+            wl!(out, "}}");
+            wl!(out, "template<typename T>");
+            wl!(out, "inline T mt_erfinv_impl(T x) {{ return T(mt_erfinv_impl(float(x))); }}");
+        }
+        if feat.needs_expm1 {
+            wl!(out);
+            // Metal stdlib lacks expm1(); implement via Taylor for |x| < 1e-4
+            // (avoids catastrophic cancellation) and exp(x)-1 elsewhere.
+            wl!(out, "// Metal lacks expm1(); accurate for small x via Taylor series.");
+            wl!(out, "inline float mt_expm1_impl(float x) {{");
+            wl!(out, "    if (fabs(x) < 1.0e-4f) return x + 0.5f * x * x;");
+            wl!(out, "    return exp(x) - 1.0f;");
+            wl!(out, "}}");
+            wl!(out, "template<typename T>");
+            wl!(out, "inline T mt_expm1_impl(T x) {{ return T(mt_expm1_impl(float(x))); }}");
+        }
+        if feat.needs_simd_product {
+            wl!(out);
+            // simd_size is only accessible as a kernel attribute, not in free functions.
+            // Apple Silicon always has SIMD width 32, so unroll the butterfly statically.
+            wl!(out, "// Manual SIMD-group product reduction (Metal has no simd_product builtin).");
+            wl!(out, "// Unrolled butterfly for Apple Silicon's fixed SIMD width of 32.");
+            wl!(out, "inline float __mt_simd_product(float v) {{");
+            wl!(out, "    v *= simd_shuffle_down(v, 16u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 8u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 4u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 2u);");
+            wl!(out, "    v *= simd_shuffle_down(v, 1u);");
+            wl!(out, "    return v;");
+            wl!(out, "}}");
+        }
     }
 }

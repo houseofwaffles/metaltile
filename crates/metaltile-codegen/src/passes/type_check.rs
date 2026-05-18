@@ -299,6 +299,13 @@ fn op_name(op: &Op) -> &'static str {
         Op::ThreadgroupLoad { .. } => "ThreadgroupLoad",
         Op::ThreadgroupStore { .. } => "ThreadgroupStore",
         Op::Barrier => "Barrier",
+        Op::SimdgroupAlloc { .. } => "SimdgroupAlloc",
+        Op::SimdgroupElemLoad { .. } => "SimdgroupElemLoad",
+        Op::SimdgroupElemStore { .. } => "SimdgroupElemStore",
+        Op::SimdgroupMatMul { .. } => "SimdgroupMatMul",
+        Op::SimdScan { .. } => "SimdScan",
+        Op::SimdLaneId => "SimdLaneId",
+        Op::SimdGroupId => "SimdGroupId",
         Op::DeclareLocal { .. } => "DeclareLocal",
         Op::SetLocal { .. } => "SetLocal",
         Op::ArgReduce { .. } => "ArgReduce",
@@ -604,8 +611,16 @@ fn infer_block(
             | Op::ThreadgroupStore { .. }
             | Op::Barrier
             | Op::DeclareLocal { .. }
-            | Op::SetLocal { .. } => {
+            | Op::SetLocal { .. }
+            | Op::SimdgroupMatMul { .. }
+            | Op::SimdgroupElemStore { .. } => {
                 // No output value to type (or side-effect-only op).
+            },
+            Op::SimdgroupAlloc { .. } | Op::SimdgroupElemLoad { .. } | Op::SimdScan { .. } => {
+                env.insert(vid, TypedValue { dtype: DType::F32, shape: Shape::scalar() });
+            },
+            Op::SimdLaneId | Op::SimdGroupId => {
+                env.insert(vid, TypedValue { dtype: DType::U32, shape: Shape::scalar() });
             },
 
             Op::FusedElementwise { ops } => {

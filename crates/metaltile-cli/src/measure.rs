@@ -129,7 +129,8 @@ pub fn to_gflops(st: &BenchStats, flops: f64) -> Option<f64> {
 }
 
 pub fn to_gbps(st: &BenchStats, bytes: f64) -> Option<f64> {
-    st.is_valid().then(|| bytes / (st.mean_us * 1e-6) / 1e9)
+    // Use median to reject outlier iterations (JIT stalls, OS scheduler spikes).
+    st.is_valid().then(|| bytes / (st.median_us * 1e-6) / 1e9)
 }
 
 pub fn bench_gbps(
@@ -141,7 +142,10 @@ pub fn bench_gbps(
     bytes: f64,
 ) -> Option<f64> {
     runner.flush_slc();
-    to_gbps(&runner.bench(kernel, buffers, grid, tpg, 3, 10), bytes)
+    // 5 warmup iterations ensure the working set is fully resident in SLC
+    // before any measurements are taken; 20 measurement iterations give a
+    // stable distribution from which the median is drawn.
+    to_gbps(&runner.bench(kernel, buffers, grid, tpg, 5, 20), bytes)
 }
 
 pub fn bench_all_dtypes<F>(runner: &GpuRunner, f: F) -> Vec<OpResult>

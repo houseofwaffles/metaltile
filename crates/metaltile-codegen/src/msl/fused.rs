@@ -52,8 +52,11 @@ impl MslGenerator {
                     resolved_vid,
                 );
                 match kind {
-                    BinOpKind::Max | BinOpKind::Min | BinOpKind::Pow =>
-                        format!("{}({l}, {r})", kind.msl_symbol()),
+                    BinOpKind::Max
+                    | BinOpKind::Min
+                    | BinOpKind::Pow
+                    | BinOpKind::ATan2
+                    | BinOpKind::Rem => format!("{}({l}, {r})", kind.msl_symbol()),
                     BinOpKind::And => format!("({l} && {r})"),
                     BinOpKind::Or => format!("({l} || {r})"),
                     BinOpKind::Xor => format!("((bool){l} != (bool){r})"),
