@@ -35,6 +35,11 @@ macro_rules! wl {
 
 /// Return `true` if any op in the kernel (body + all child blocks) is
 /// `Op::ProgramId { axis }` for the given axis value.
+///
+/// Also catches the direct-identifier form (`tgid_y` written verbatim in DSL
+/// source) which the macro lowers to `Op::Load { src: "tgid_y", ... }` rather
+/// than `Op::ProgramId`. Both forms reach the same `tgid_y` reference in the
+/// emitted MSL, so the preamble must declare the alias in either case.
 fn kernel_uses_program_id_axis(kernel: &Kernel, axis: u32) -> bool {
     // Match either Op::ProgramId { axis } or a direct Op::Load { src: "tgid_y" }
     // (DSL kernels that use `tgid_y` directly instead of `program_id::<1>()`).
@@ -599,5 +604,30 @@ mod tests {
         k.body.push_op(Op::ProgramId { axis: 1 }, ValueId::new(1));
         let msl = MslGenerator::default().generate(&k).unwrap();
         assert!(msl.contains("tgid_y"), "tgid_y must be emitted when program_id axis 1 is used");
+    }
+
+    /// Regression: `ssm_step` and similar kernels reference `tgid_y` via the
+    /// direct-identifier form, which the body parser lowers to
+    /// `Op::Load { src: "tgid_y", .. }` rather than `Op::ProgramId`. The
+    /// preamble must still declare the alias.
+    #[test]
+    fn reduction_preamble_emits_tgid_y_when_used_as_identifier() {
+        let mut k = Kernel::new("reduction_with_y_load");
+        k.mode = KernelMode::Reduction;
+        k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+        k.body.push_op(
+            Op::Load {
+                src: "tgid_y".to_string(),
+                indices: Vec::new(),
+                mask: None,
+                other: None,
+            },
+            ValueId::new(1),
+        );
+        let msl = MslGenerator::default().generate(&k).unwrap();
+        assert!(
+            msl.contains("uint tgid_y = _tgid3.y;"),
+            "preamble must declare tgid_y when used via direct identifier: {msl}"
+        );
     }
 }

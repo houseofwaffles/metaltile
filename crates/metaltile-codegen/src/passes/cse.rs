@@ -71,28 +71,35 @@ impl super::Pass for CsePass {
             .map(|p| p.name.clone())
             .collect();
 
-        // CSE on the body block; capture the elimination map so we can propagate
-        // it to child blocks — a value eliminated in the body may still be
-        // referenced by an inner-loop block that the body-local pass didn't touch.
+        // CSE the body, then propagate its remap to every nested block so that
+        // ops inside loops / if-branches keep pointing at the surviving SSA
+        // value rather than the eliminated duplicate.
         let body_remap = cse_block(&mut kernel.body, &read_only);
-
-        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
-
-        // Propagate body-level CSE eliminations into every child block.
         if !body_remap.is_empty() {
-            for bid in &block_ids {
-                if let Some(block) = kernel.blocks.get_mut(bid) {
-                    for op in block.ops.iter_mut() {
-                        replace_values(op, &body_remap);
-                    }
+            for block in kernel.blocks.values_mut() {
+                for op in block.ops.iter_mut() {
+                    replace_values(op, &body_remap);
                 }
             }
         }
 
-        // CSE on all nested blocks.
+        // CSE each nested block. After each one, propagate its remap to the
+        // kernel body and to every other block — a value defined in one
+        // nested block may be referenced from a sibling or from the body.
+        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
         for bid in &block_ids {
-            if let Some(block) = kernel.blocks.get_mut(bid) {
-                cse_block(block, &read_only);
+            let Some(mut block) = kernel.blocks.remove(bid) else { continue };
+            let remap = cse_block(&mut block, &read_only);
+            kernel.blocks.insert(*bid, block);
+            if !remap.is_empty() {
+                for op in kernel.body.ops.iter_mut() {
+                    replace_values(op, &remap);
+                }
+                for other in kernel.blocks.values_mut() {
+                    for op in other.ops.iter_mut() {
+                        replace_values(op, &remap);
+                    }
+                }
             }
         }
 
@@ -100,8 +107,9 @@ impl super::Pass for CsePass {
     }
 }
 
-/// Run CSE on `block` and return the `old → new` ValueId remap that was applied,
-/// so callers can propagate eliminations to sibling / child blocks.
+/// CSE the given block. Returns the SSA-value remap (`old → new`) that the
+/// caller must also apply to any other block that may reference values
+/// defined here (loop bodies / if branches / the kernel body).
 fn cse_block(
     block: &mut Block,
     read_only: &std::collections::BTreeSet<String>,
@@ -518,5 +526,84 @@ mod tests {
         let binops: Vec<_> =
             k.body.ops.iter().filter(|op| matches!(op, Op::BinOp { .. })).collect();
         assert_eq!(binops.len(), 2, "different binops should not be CSE'd");
+    }
+
+    /// Regression: when CSE eliminates a duplicate in the kernel body, any
+    /// reference to the dropped SSA value from inside a nested block must
+    /// also be remapped. Triggered by `sdpa_decode`'s `q_off = q_head * head_dim`
+    /// duplicating an inline `q_head * head_dim` later consumed inside an
+    /// inner loop — pre-fix, the inner-block reference became dangling.
+    #[test]
+    fn cse_remaps_references_inside_nested_blocks() {
+        use metaltile_core::ir::{Block, BlockId, VarId};
+
+        let mut k = Kernel::new("cse_cross_block");
+        // Outer body:
+        //   v0 = const 1
+        //   v1 = const 2
+        //   v2 = add(v0, v1)            ← will survive
+        //   v3 = add(v0, v1)            ← duplicate; CSE drops this, remaps v3 → v2
+        //   v4 = const 5
+        //   loop body=inner_block       ← inner block references v3
+        //   v6 = mul(v2, v4)            ← post-loop use of survivor
+        k.body.push_op(Op::Const { value: 1 }, ValueId::new(0));
+        k.body.push_op(Op::Const { value: 2 }, ValueId::new(1));
+        k.body.push_op(
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(0), rhs: ValueId::new(1) },
+            ValueId::new(2),
+        );
+        k.body.push_op(
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(0), rhs: ValueId::new(1) },
+            ValueId::new(3),
+        );
+        k.body.push_op(Op::Const { value: 5 }, ValueId::new(4));
+
+        let inner_id = BlockId::new(1);
+        let mut inner = Block::new(inner_id);
+        inner.push_op(Op::Const { value: 0 }, ValueId::new(100));
+        // Inner block consumes the duplicate (v3) — must be remapped to v2.
+        inner.push_op(
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(3), rhs: ValueId::new(100) },
+            ValueId::new(101),
+        );
+        k.blocks.insert(inner_id, inner);
+
+        k.body.push_op_no_result(Op::Loop {
+            var: VarId::new(0),
+            start: ValueId::new(0),
+            end: ValueId::new(4),
+            step: ValueId::new(0),
+            body: inner_id,
+        });
+        k.body.push_op(
+            Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(4) },
+            ValueId::new(6),
+        );
+
+        CsePass.run(&mut k).unwrap();
+
+        // The duplicate v3 must be gone from the body.
+        let body_add_count =
+            k.body.ops.iter().filter(|op| matches!(op, Op::BinOp { op: BinOpKind::Add, .. })).count();
+        assert_eq!(body_add_count, 1, "duplicate add in body must be CSE'd away");
+
+        // The inner block must no longer reference v3 — its add must now use v2.
+        let inner = k.blocks.get(&inner_id).expect("inner block survived");
+        let inner_add = inner
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::BinOp { op: BinOpKind::Add, lhs, rhs } => Some((*lhs, *rhs)),
+                _ => None,
+            })
+            .expect("inner block must still contain its Add op");
+        assert!(
+            inner_add.0 != ValueId::new(3) && inner_add.1 != ValueId::new(3),
+            "inner-block reference to dropped duplicate v3 must be remapped (got {inner_add:?})"
+        );
+        assert!(
+            inner_add.0 == ValueId::new(2) || inner_add.1 == ValueId::new(2),
+            "inner-block ref must now point at the survivor v2 (got {inner_add:?})"
+        );
     }
 }

@@ -52,25 +52,42 @@ impl super::Pass for ValueSinkPass {
     fn name(&self) -> &str { "value_sink" }
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
-        // Pass the full blocks map so sink_in_block can count uses in child
-        // blocks (inner loop bodies) — preventing values from being sunk past
-        // the loops that reference them.
-        {
-            let (body, blocks) = (&mut kernel.body, &kernel.blocks);
-            sink_in_block(body, blocks);
-        }
+        // Block-local sinking, with use-counts computed across ALL blocks
+        // (body + every nested loop / if body) so that a value defined in
+        // the outer block but consumed inside an inner block is not treated
+        // as single-use and sunk past the op that owns the nested block.
+        let global_use_count = compute_global_use_count(kernel);
+
+        sink_in_block(&mut kernel.body, &global_use_count);
 
         let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
         for bid in block_ids {
             let mut block = kernel.blocks.remove(&bid).unwrap();
-            // For inner blocks, child-of-child nesting is rare; pass the
-            // remaining (non-removed) blocks for best-effort cross-block counting.
-            sink_in_block(&mut block, &kernel.blocks);
+            sink_in_block(&mut block, &global_use_count);
             kernel.blocks.insert(bid, block);
         }
 
         Ok(())
     }
+}
+
+/// Count every use of every `ValueId` across the kernel's entry body and all
+/// stored blocks. Sinking is intra-block (it only reorders ops within one
+/// block) so this count never goes stale as sinking proceeds.
+fn compute_global_use_count(kernel: &Kernel) -> BTreeMap<ValueId, usize> {
+    let mut use_count: BTreeMap<ValueId, usize> = BTreeMap::new();
+    let mut tally = |ops: &[Op]| {
+        for op in ops {
+            for vid in remap::op_value_refs(op) {
+                *use_count.entry(vid).or_default() += 1;
+            }
+        }
+    };
+    tally(&kernel.body.ops);
+    for block in kernel.blocks.values() {
+        tally(&block.ops);
+    }
+    use_count
 }
 
 // ---------------------------------------------------------------------------
@@ -97,42 +114,10 @@ struct SinkPlan {
 // main logic
 // ---------------------------------------------------------------------------
 
-fn sink_in_block(block: &mut Block, all_blocks: &BTreeMap<BlockId, Block>) {
+fn sink_in_block(block: &mut Block, global_use_count: &BTreeMap<ValueId, usize>) {
     let n = block.ops.len();
     if n == 0 {
         return;
-    }
-
-    // Phase 1: compute use-count for each ValueId.
-    // Also count uses inside directly-nested child blocks (inner loop / if
-    // bodies) so that values used inside a nested block are not sunk past
-    // the loop/if op that encloses them.
-    let mut use_count: BTreeMap<ValueId, usize> = BTreeMap::new();
-    for op in &block.ops {
-        for vid in remap::op_value_refs(op) {
-            *use_count.entry(vid).or_default() += 1;
-        }
-        // Count uses inside child blocks referenced by this op.
-        let mut child_bids: Vec<BlockId> = Vec::new();
-        match op {
-            Op::Loop { body, .. } => child_bids.push(*body),
-            Op::If { then_block, else_block, .. } => {
-                child_bids.push(*then_block);
-                if let Some(eb) = else_block {
-                    child_bids.push(*eb);
-                }
-            },
-            _ => {},
-        }
-        for bid in child_bids {
-            if let Some(child) = all_blocks.get(&bid) {
-                for child_op in &child.ops {
-                    for vid in remap::op_value_refs(child_op) {
-                        *use_count.entry(vid).or_default() += 1;
-                    }
-                }
-            }
-        }
     }
 
     // Phase 2: find sink opportunities.
@@ -147,8 +132,11 @@ fn sink_in_block(block: &mut Block, all_blocks: &BTreeMap<BlockId, Block>) {
             continue;
         }
 
-        // Must have exactly one use.
-        if use_count.get(result_vid) != Some(&1) {
+        // Must have exactly one use *across the whole kernel*. A value
+        // referenced inside a nested loop / if body must not be sunk past
+        // the op that contains the nested block, even if its only
+        // straight-line use sits below that op.
+        if global_use_count.get(result_vid) != Some(&1) {
             continue;
         }
 
@@ -356,5 +344,84 @@ mod tests {
 
         // Should not have moved (barrier in between).
         assert_eq!(add_pos_before, add_pos_after);
+    }
+
+    /// Regression: a value defined in the outer block and used inside a nested
+    /// loop body must not be sunk past the loop op, even if its only
+    /// straight-line use in the outer block sits below the loop.
+    /// `sdpa_decode` triggered this — `k_base` lives in the outer kv-walk
+    /// loop and is consumed both inside the inner dot-product loop and
+    /// after it.
+    #[test]
+    fn does_not_sink_value_used_in_nested_block() {
+        use metaltile_core::ir::{Block, BlockId};
+
+        let mut k = Kernel::new("sink_cross_block");
+
+        // Outer block (body):
+        //   v0 = const 1
+        //   v1 = const 2
+        //   v2 = add(v0, v1)        ← defined here
+        //   v3 = const 10           ← filler
+        //   loop body=inner_block (uses v2)
+        //   v4 = mul(v2, v3)        ← straight-line use below loop
+        k.body.push_op(Op::Const { value: 1 }, ValueId::new(0));
+        k.body.push_op(Op::Const { value: 2 }, ValueId::new(1));
+        k.body.push_op(
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(0), rhs: ValueId::new(1) },
+            ValueId::new(2),
+        );
+        k.body.push_op(Op::Const { value: 10 }, ValueId::new(3));
+
+        // Inner block uses v2 (so v2 has 2 uses total: inside loop + after loop).
+        let inner_id = BlockId::new(1);
+        let mut inner = Block::new(inner_id);
+        inner.push_op(Op::Const { value: 0 }, ValueId::new(100));
+        inner.push_op(
+            Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(2), rhs: ValueId::new(100) },
+            ValueId::new(101),
+        );
+        k.blocks.insert(inner_id, inner);
+
+        k.body.push_op_no_result(Op::Loop {
+            var: metaltile_core::ir::VarId::new(0),
+            start: ValueId::new(0),
+            end: ValueId::new(3),
+            step: ValueId::new(0),
+            body: inner_id,
+        });
+        k.body.push_op(
+            Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(3) },
+            ValueId::new(4),
+        );
+
+        // Snapshot the position of the Add op relative to the Loop op.
+        let add_pos_before = k
+            .body
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::BinOp { op: BinOpKind::Add, .. }))
+            .unwrap();
+        let loop_pos_before =
+            k.body.ops.iter().position(|op| matches!(op, Op::Loop { .. })).unwrap();
+        assert!(add_pos_before < loop_pos_before, "test setup: add must precede loop");
+
+        ValueSinkPass.run(&mut k).unwrap();
+
+        // The Add must STILL sit above the Loop — sinking past the loop
+        // would leave the inner-block reference dangling.
+        let add_pos_after = k
+            .body
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::BinOp { op: BinOpKind::Add, .. }))
+            .unwrap();
+        let loop_pos_after =
+            k.body.ops.iter().position(|op| matches!(op, Op::Loop { .. })).unwrap();
+        assert!(
+            add_pos_after < loop_pos_after,
+            "value defined in outer block and used inside a nested loop must not be \
+             sunk past the loop op (got add at {add_pos_after}, loop at {loop_pos_after})"
+        );
     }
 }
