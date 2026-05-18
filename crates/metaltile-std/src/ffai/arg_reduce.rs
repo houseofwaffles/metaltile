@@ -21,30 +21,16 @@ use crate::{
     spec::{BenchDispatch, BenchSpec},
 };
 
-// ── threadgroup argmax tree-reduction helper ─────────────────────────────
+// Tree-reduction strides: 128 → 64 → 32 → 16 → 8 → 4 → 2.
+// Each iteration: threads with `lid < stride` merge the upper half into
+// the lower half (take higher value; on ties take smaller index — NumPy
+// argmax semantics).  Final stride-1 merge writes the result directly
+// to `out[0]` and is kept inline below.
 //
-// Each step of the binary tree merges two halves of the threadgroup
-// arrays `tg_vals` / `tg_idxs`.  The combine rule: take the higher
-// value; on ties take the smaller index (matches NumPy argmax semantics).
-//
-// Used for strides 128 → 2 (7 invocations).  The final stride-1 step
-// writes directly to `out[0]` and is kept inline below.
-
-#[allow(unused_macros)]
-macro_rules! argmax_step {
-    ($lid:expr, $stride:expr) => {
-        if $lid < $stride {
-            let ov = threadgroup_load("tg_vals", $lid + $stride);
-            let oi = threadgroup_load("tg_idxs", $lid + $stride);
-            let tv = threadgroup_load("tg_vals", $lid);
-            let ti = threadgroup_load("tg_idxs", $lid);
-            let bet = (ov > tv) | ((ov == tv) & (oi < ti));
-            threadgroup_store("tg_vals", $lid, select(bet, ov, tv));
-            threadgroup_store("tg_idxs", $lid, select(bet, oi, ti));
-        }
-        threadgroup_barrier();
-    };
-}
+// Originally hand-unrolled via a `macro_rules! argmax_step!` invoked
+// 7×; the proc-macro does not expand inner declarative macros, so the
+// expansion silently produced no IR.  A DSL `for` loop over the seven
+// stages yields identical MSL and survives the proc-macro intact.
 
 #[kernel]
 pub fn ffai_argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
@@ -69,15 +55,22 @@ pub fn ffai_argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
     threadgroup_store("tg_idxs", lid, best_idx);
     threadgroup_barrier();
 
-    argmax_step!(lid, 128u32);
-    argmax_step!(lid, 64u32);
-    argmax_step!(lid, 32u32);
-    argmax_step!(lid, 16u32);
-    argmax_step!(lid, 8u32);
-    argmax_step!(lid, 4u32);
-    argmax_step!(lid, 2u32);
+    // 7-stage power-of-two halving reduction over the 256-thread group.
+    for _stage in range(0u32, 7u32, 1u32) {
+        let stride = 128u32 >> _stage;
+        if lid < stride {
+            let ov = threadgroup_load("tg_vals", lid + stride);
+            let oi = threadgroup_load("tg_idxs", lid + stride);
+            let tv = threadgroup_load("tg_vals", lid);
+            let ti = threadgroup_load("tg_idxs", lid);
+            let bet = (ov > tv) | ((ov == tv) & (oi < ti));
+            threadgroup_store("tg_vals", lid, select(bet, ov, tv));
+            threadgroup_store("tg_idxs", lid, select(bet, oi, ti));
+        }
+        threadgroup_barrier();
+    }
 
-    // Final step writes result directly to output.
+    // Final stride-1 merge writes result directly to output.
     if lid == 0u32 {
         let ov = threadgroup_load("tg_vals", 1u32);
         let oi = threadgroup_load("tg_idxs", 1u32);

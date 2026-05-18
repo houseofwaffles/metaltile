@@ -13,39 +13,12 @@ use crate::{
     spec::{BenchDispatch, BenchSpec},
 };
 
-// ── threadgroup tree-reduction helpers ───────────────────────────────────
-//
-// Both the max-pass and sum-pass reduce 256 threadgroup slots to 1 value.
-// The 8-stage binary tree (strides 128 → 1) is identical except for the
-// combine operation.  Extract one macro per operation so the kernel body
-// reads as two terse calls instead of 48 lines of boilerplate.
-//
-// Each macro includes the trailing `threadgroup_barrier()`, matching the
-// original line-for-line.
-
-#[allow(unused_macros)]
-macro_rules! tg_max_step {
-    ($tg:expr, $lid:expr, $stride:expr) => {
-        if $lid < $stride {
-            let ov = threadgroup_load($tg, $lid + $stride);
-            let tv = threadgroup_load($tg, $lid);
-            threadgroup_store($tg, $lid, select(ov > tv, ov, tv));
-        }
-        threadgroup_barrier();
-    };
-}
-
-#[allow(unused_macros)]
-macro_rules! tg_sum_step {
-    ($tg:expr, $lid:expr, $stride:expr) => {
-        if $lid < $stride {
-            let ov = threadgroup_load($tg, $lid + $stride);
-            let tv = threadgroup_load($tg, $lid);
-            threadgroup_store($tg, $lid, ov + tv);
-        }
-        threadgroup_barrier();
-    };
-}
+// Tree reductions for the max-pass and sum-pass each fold 256 threadgroup
+// slots → 1 value across 8 power-of-two halving stages.  Originally
+// hand-unrolled via `tg_max_step!` / `tg_sum_step!` declarative macros;
+// the proc-macro does not expand inner `macro_rules!` so the unrolled
+// expansions silently produced no IR.  Replaced with DSL `for` loops
+// that yield the same Metal output and survive the proc-macro intact.
 
 // Softmax + categorical sample over a 1D logits tensor. Cooperative
 // reduction (256 threads) for max + sum-exp; single-thread inverse
@@ -88,14 +61,16 @@ pub fn softmax_categorical_sample<T>(
     threadgroup_store("tg_max", lid, local_max);
     threadgroup_barrier();
 
-    tg_max_step!("tg_max", lid, 128u32);
-    tg_max_step!("tg_max", lid, 64u32);
-    tg_max_step!("tg_max", lid, 32u32);
-    tg_max_step!("tg_max", lid, 16u32);
-    tg_max_step!("tg_max", lid, 8u32);
-    tg_max_step!("tg_max", lid, 4u32);
-    tg_max_step!("tg_max", lid, 2u32);
-    tg_max_step!("tg_max", lid, 1u32);
+    // 8-stage power-of-two halving max-reduction (stride 128 → 1).
+    for _stage in range(0u32, 8u32, 1u32) {
+        let stride = 128u32 >> _stage;
+        if lid < stride {
+            let ov = threadgroup_load("tg_max", lid + stride);
+            let tv = threadgroup_load("tg_max", lid);
+            threadgroup_store("tg_max", lid, select(ov > tv, ov, tv));
+        }
+        threadgroup_barrier();
+    }
 
     let max_val = threadgroup_load("tg_max", 0u32);
 
@@ -112,14 +87,16 @@ pub fn softmax_categorical_sample<T>(
     threadgroup_store("tg_sum", lid, local_sum);
     threadgroup_barrier();
 
-    tg_sum_step!("tg_sum", lid, 128u32);
-    tg_sum_step!("tg_sum", lid, 64u32);
-    tg_sum_step!("tg_sum", lid, 32u32);
-    tg_sum_step!("tg_sum", lid, 16u32);
-    tg_sum_step!("tg_sum", lid, 8u32);
-    tg_sum_step!("tg_sum", lid, 4u32);
-    tg_sum_step!("tg_sum", lid, 2u32);
-    tg_sum_step!("tg_sum", lid, 1u32);
+    // 8-stage power-of-two halving sum-reduction (stride 128 → 1).
+    for _stage in range(0u32, 8u32, 1u32) {
+        let stride = 128u32 >> _stage;
+        if lid < stride {
+            let ov = threadgroup_load("tg_sum", lid + stride);
+            let tv = threadgroup_load("tg_sum", lid);
+            threadgroup_store("tg_sum", lid, ov + tv);
+        }
+        threadgroup_barrier();
+    }
 
     let total = threadgroup_load("tg_sum", 0u32);
 
