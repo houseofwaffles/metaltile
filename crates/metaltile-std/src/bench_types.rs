@@ -317,6 +317,10 @@ pub struct OpResult {
 impl OpResult {
     pub fn op(&self) -> &'static str { self.op }
 
+    /// Raw sub-operation label, if set. Consumers that need the combined
+    /// "op (subop)" display string should call [`op_display`] instead.
+    pub fn subop(&self) -> Option<&str> { self.subop.as_deref() }
+
     /// Rendered op name: "op (subop)" if subop is set, else "op".
     pub fn op_display(&self) -> String {
         match &self.subop {
