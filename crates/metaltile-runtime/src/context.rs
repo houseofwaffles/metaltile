@@ -243,15 +243,21 @@ fn resolve_strided_metadata<'a>(
         })
         .transpose()?;
 
-    let shape_key = format!("{}_shape", param.name);
-    let strides_key = format!("{}_strides", param.name);
+    // Single key buffer, reused across the two lookups: allocate once
+    // (capacity = name + "_strides" — the longer suffix) and rewrite the
+    // suffix in place. Replaces two `format!` allocations per strided
+    // param per dispatch.
+    let mut key = String::with_capacity(param.name.len() + 8);
+    key.push_str(&param.name);
+    let prefix_len = key.len();
+    key.push_str("_shape");
 
-    let shape_data = match buffers.get(&shape_key) {
+    let shape_data = match buffers.get(&key) {
         Some(bytes) => {
             if expected_len > 0 && bytes.len() < expected_len {
                 return Err(MetalTileError::Buffer(format!(
                     "buffer '{}' has {} bytes, expected at least {}",
-                    shape_key,
+                    key,
                     bytes.len(),
                     expected_len
                 )));
@@ -262,19 +268,22 @@ fn resolve_strided_metadata<'a>(
             let Some((shape_bytes, _)) = defaults.as_ref() else {
                 return Err(MetalTileError::Buffer(format!(
                     "missing required strided metadata buffer '{}'",
-                    shape_key
+                    key
                 )));
             };
             Cow::Owned(shape_bytes.clone())
         },
     };
 
-    let strides_data = match buffers.get(&strides_key) {
+    key.truncate(prefix_len);
+    key.push_str("_strides");
+
+    let strides_data = match buffers.get(&key) {
         Some(bytes) => {
             if expected_len > 0 && bytes.len() < expected_len {
                 return Err(MetalTileError::Buffer(format!(
                     "buffer '{}' has {} bytes, expected at least {}",
-                    strides_key,
+                    key,
                     bytes.len(),
                     expected_len
                 )));
@@ -285,7 +294,7 @@ fn resolve_strided_metadata<'a>(
             let Some((_, strides_bytes)) = defaults.as_ref() else {
                 return Err(MetalTileError::Buffer(format!(
                     "missing required strided metadata buffer '{}'",
-                    strides_key
+                    key
                 )));
             };
             Cow::Owned(strides_bytes.clone())
@@ -1094,6 +1103,42 @@ mod tests {
 
         assert_eq!(shape_data.as_ref(), encode_u32s(&[2, 3, 4]).as_slice());
         assert_eq!(stride_data.as_ref(), encode_u32s(&[12, 4, 1]).as_slice());
+    }
+
+    // Perf microbench — run with:
+    //   cargo test --release -p metaltile-runtime perf_resolve_strided_metadata \
+    //     -- --ignored --nocapture
+    //
+    // Times `resolve_strided_metadata` in a hot loop over a realistic param
+    // name. Pre-change (`format!("{}_shape", …)` + `format!("{}_strides", …)`)
+    // allocates two Strings per call; post-change reuses a single pre-sized
+    // String via in-place suffix rewrite.
+    #[test]
+    #[ignore = "perf microbench"]
+    fn perf_resolve_strided_metadata() {
+        let param = tensor_param(
+            "long_strided_kv_cache",
+            DType::F32,
+            &[8, 4096, 128],
+            false,
+            ParamKind::Strided,
+        );
+        let buffers = BTreeMap::new();
+        const ITERS: usize = 5_000_000;
+        for _ in 0..50_000 {
+            std::hint::black_box(
+                resolve_strided_metadata(&param, std::hint::black_box(&buffers)).unwrap(),
+            );
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(
+                resolve_strided_metadata(&param, std::hint::black_box(&buffers)).unwrap(),
+            );
+        }
+        let elapsed = start.elapsed();
+        let ns_per_call = elapsed.as_nanos() as f64 / ITERS as f64;
+        println!("resolve_strided_metadata × {ITERS}: {elapsed:?} ({ns_per_call:.1} ns/call)");
     }
 
     #[test]
