@@ -5,8 +5,13 @@ use std::{
 };
 
 /// Pinned MLX commit. Update this to pull newer MLX kernels.
-const MLX_COMMIT: &str = "80a1c206f963f713b8f1f2ce71bac039a3d3baa7";
-const MLX_URL: &str = "https://github.com/ml-explore/mlx.git";
+///
+/// Points at ekryski/mlx's `alpha` branch — a superset of upstream MLX that
+/// carries the custom Metal kernels FFAI ports from (turbo / aura, gated-delta,
+/// ssm, ssm_replay, etc.). Stock upstream is missing those, so `tile bench`
+/// would have no side-by-side reference for them.
+const MLX_COMMIT: &str = "4919270e03f0bc5116db67c99c5d8907dce589a8";
+const MLX_URL: &str = "https://github.com/ekryski/mlx.git";
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
