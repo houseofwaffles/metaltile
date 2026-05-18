@@ -38,6 +38,11 @@ pub struct DispatchResult {
 pub struct Context {
     tuner: Autotuner,
     has_metal: bool,
+    /// Apple GPU family level of the default device, when probeable
+    /// (7 = M1, 8 = M2, 9 = M3/M4, 10 = M5). `None` off macOS or when
+    /// no Metal device is available. Apple GPU families are cumulative,
+    /// so this is the highest level that returned true.
+    chip_family: Option<u32>,
 }
 
 /// One pass in a fused dispatch chain. See [`Context::dispatch_chain`].
@@ -307,11 +312,16 @@ fn resolve_strided_metadata<'a>(
 impl Context {
     pub fn new() -> Result<Self, MetalTileError> {
         let has_metal = cfg!(target_os = "macos");
+        let chip_family = detect_apple_family();
         let tuner = Autotuner::new(Autotuner::default_cache_dir(), has_metal);
-        Ok(Context { tuner, has_metal })
+        Ok(Context { tuner, has_metal, chip_family })
     }
 
     pub fn has_gpu(&self) -> bool { self.has_metal }
+
+    /// Apple GPU family level detected at construction time, or `None`
+    /// off macOS. See the field doc for the level → chip mapping.
+    pub fn chip_family(&self) -> Option<u32> { self.chip_family }
 
     pub fn dispatch(&self, kernel: &Kernel) -> Result<DispatchResult, MetalTileError> {
         self.dispatch_with_buffers(kernel, &BTreeMap::new())
@@ -1035,6 +1045,31 @@ impl Drop for Context {
     }
 }
 
+/// Probe the default Metal device for the highest supported Apple GPU
+/// family. Apple families are cumulative, so a chip that returns true
+/// for `Apple10` also returns true for `Apple9`/`8`/`7` — we report
+/// the newest. Returns `None` off macOS or when no Metal device is
+/// available.
+#[cfg(target_os = "macos")]
+fn detect_apple_family() -> Option<u32> {
+    use objc2_metal::{MTLDevice, MTLGPUFamily};
+    let dev = objc2_metal::MTLCreateSystemDefaultDevice()?;
+    for (family, level) in [
+        (MTLGPUFamily::Apple10, 10u32),
+        (MTLGPUFamily::Apple9, 9),
+        (MTLGPUFamily::Apple8, 8),
+        (MTLGPUFamily::Apple7, 7),
+    ] {
+        if dev.supportsFamily(family) {
+            return Some(level);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_apple_family() -> Option<u32> { None }
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1146,8 +1181,11 @@ mod tests {
         let bad_cache_root = unique_path("flush-error");
         fs::write(&bad_cache_root, b"not a directory").expect("create sentinel file");
 
-        let mut ctx =
-            Context { tuner: Autotuner::new(bad_cache_root.clone(), false), has_metal: false };
+        let mut ctx = Context {
+            tuner: Autotuner::new(bad_cache_root.clone(), false),
+            has_metal: false,
+            chip_family: None,
+        };
         let err = ctx.shutdown().expect_err("shutdown should surface flush errors");
         assert!(matches!(
             err.kind(),
@@ -1162,5 +1200,37 @@ mod tests {
         fs::remove_file(&bad_cache_root).expect("remove sentinel file");
         let _ = fs::remove_file(ok_cache_root.join("tuning_cache.json"));
         let _ = fs::remove_dir_all(ok_cache_root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn context_detects_apple_gpu_family() {
+        // Every Mac that compiles + runs this test is at least Apple7
+        // (M1). The exact level depends on which Mac runs CI, so just
+        // assert the lower bound + the cumulative ordering.
+        let ctx = Context::new().expect("Context::new should succeed on macOS");
+        let level = ctx.chip_family().expect("macOS Context must report a family");
+        assert!(level >= 7, "Apple GPU family level should be >=7 on M-series, got {level}");
+        assert!(level <= 20, "level looks unreasonably high; bound is sanity-only ({level})");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn context_chip_family_is_none_off_macos() {
+        let ctx = Context::new().expect("Context::new should succeed off macOS too");
+        assert!(ctx.chip_family().is_none());
+    }
+
+    #[test]
+    fn detect_apple_family_helper_runs() {
+        // Sanity: the helper compiles + runs on every target. On macOS
+        // it returns Some(>=7); elsewhere it returns None. The specific
+        // arm is asserted by the cfg-gated tests above.
+        let level = detect_apple_family();
+        if cfg!(target_os = "macos") {
+            assert!(matches!(level, Some(l) if (7..=20).contains(&l)));
+        } else {
+            assert!(level.is_none());
+        }
     }
 }
