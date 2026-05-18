@@ -177,6 +177,25 @@ impl DslBodyParser {
         match stmt {
             Stmt::Local(local) => self.parse_let(local),
             Stmt::Expr(expr, _semi) => self.parse_expr_stmt(expr),
+            Stmt::Macro(mac) => {
+                // The proc-macro does NOT expand declarative macros inside the
+                // kernel body — they're seen as opaque tokens and would
+                // silently produce no IR. Fail loudly so future contributors
+                // can't ship a kernel with a dropped body (PR #19 shipped 25+
+                // such kernels before this guard existed).
+                //
+                // Workarounds: (1) wrap the entire `#[kernel] fn …` declaration
+                // in a `macro_rules!` so declarative expansion happens before
+                // the proc-macro runs; (2) inline the macro body; (3) replace
+                // an unrolled tree with a DSL `for` loop.
+                self.push_error(syn::Error::new_spanned(
+                    &mac.mac.path,
+                    "macro_rules! invocations inside #[kernel] bodies are not \
+                     expanded by the metaltile proc-macro and would silently \
+                     drop their body. Wrap the entire `#[kernel] fn` in the \
+                     macro instead, or inline / replace with a DSL loop.",
+                ));
+            },
             _ => {},
         }
     }
@@ -423,6 +442,18 @@ impl DslBodyParser {
             Expr::Paren(paren) => self.parse_expr(&paren.expr),
             Expr::If(if_expr) => self.parse_if(if_expr),
             Expr::ForLoop(_) => self.alloc_vid(),
+            Expr::Macro(mac) => {
+                // Same hazard as Stmt::Macro — fail loudly so silent-drop
+                // regressions cannot recur.
+                self.push_error(syn::Error::new_spanned(
+                    &mac.mac.path,
+                    "macro_rules! invocations inside #[kernel] bodies are not \
+                     expanded by the metaltile proc-macro and would silently \
+                     drop their body. Wrap the entire `#[kernel] fn` in the \
+                     macro instead, or inline / replace with a DSL loop.",
+                ));
+                self.alloc_vid()
+            },
             _ => self.alloc_vid(),
         }
     }
