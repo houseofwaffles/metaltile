@@ -633,6 +633,21 @@ pub enum Op {
     /// Maps to `simd_scan_inclusive_<op>(v)` (Metal 3.0+).
     SimdScan { value: ValueId, op: ReduceKind, exclusive: bool },
 
+    /// SIMD-group butterfly shuffle: each lane receives the value held by
+    /// the lane `(lane_id ^ mask)`. Maps to `simd_shuffle_xor(v, mask)`
+    /// (Metal 2.1+). Used for power-of-two butterfly reductions and the
+    /// FWHT (Fast Walsh-Hadamard Transform) inner loop in AURA encode.
+    /// `mask` is a runtime u32 value (typically a power-of-two constant
+    /// from a butterfly stride loop).
+    SimdShuffleXor { value: ValueId, mask: ValueId },
+
+    /// SIMD-group broadcast: every lane receives the value held by the
+    /// specified `lane` (a u32 index 0..simd_size). Maps to
+    /// `simd_broadcast(v, lane)` (Metal 2.1+). Cooperative codebook hoist
+    /// in AURA score/value kernels uses this to share one lane's loaded
+    /// codebook word across the group.
+    SimdBroadcast { value: ValueId, lane: ValueId },
+
     /// Allocate a named threadgroup (shared) memory array.
     /// Emits `threadgroup T name[size]` in the kernel body.
     ThreadgroupAlloc {
@@ -1126,6 +1141,12 @@ impl Op {
                 write!(f, "Dequantize({weights}, gs={group_size}, bits={bits})")
             },
             Op::SimdReduce { value, op } => write!(f, "SimdReduce(v{}, {op:?})", value.as_u32()),
+            Op::SimdShuffleXor { value, mask } => {
+                write!(f, "SimdShuffleXor(v{}, mask=v{})", value.as_u32(), mask.as_u32())
+            },
+            Op::SimdBroadcast { value, lane } => {
+                write!(f, "SimdBroadcast(v{}, lane=v{})", value.as_u32(), lane.as_u32())
+            },
             Op::ThreadgroupAlloc { dtype, size, name } => {
                 write!(f, "ThreadgroupAlloc({dtype:?}, {size}, {name})")
             },

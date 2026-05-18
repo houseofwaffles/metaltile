@@ -630,4 +630,42 @@ mod tests {
             "preamble must declare tgid_y when used via direct identifier: {msl}"
         );
     }
+
+    /// `Op::SimdShuffleXor { value, mask }` must emit `simd_shuffle_xor(v, mask)`
+    /// — the Metal 2.1+ butterfly shuffle used by AURA's FWHT inner loop.
+    #[test]
+    fn simd_shuffle_xor_emits_metal_builtin() {
+        let mut k = Kernel::new("simd_xor_smoke");
+        k.mode = KernelMode::Reduction;
+        k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+        k.body.push_op(Op::Const { value: 4 }, ValueId::new(1));
+        k.body.push_op(
+            Op::SimdShuffleXor { value: ValueId::new(0), mask: ValueId::new(1) },
+            ValueId::new(2),
+        );
+        let msl = MslGenerator::default().generate(&k).unwrap();
+        assert!(
+            msl.contains("simd_shuffle_xor("),
+            "kernel must emit a simd_shuffle_xor call: {msl}"
+        );
+    }
+
+    /// `Op::SimdBroadcast { value, lane }` must emit `simd_broadcast(v, lane)`
+    /// — the Metal 2.1+ cross-lane broadcast used by AURA's codebook hoist.
+    #[test]
+    fn simd_broadcast_emits_metal_builtin() {
+        let mut k = Kernel::new("simd_bcast_smoke");
+        k.mode = KernelMode::Reduction;
+        k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+        k.body.push_op(Op::Const { value: 0 }, ValueId::new(1));
+        k.body.push_op(
+            Op::SimdBroadcast { value: ValueId::new(0), lane: ValueId::new(1) },
+            ValueId::new(2),
+        );
+        let msl = MslGenerator::default().generate(&k).unwrap();
+        assert!(
+            msl.contains("simd_broadcast("),
+            "kernel must emit a simd_broadcast call: {msl}"
+        );
+    }
 }

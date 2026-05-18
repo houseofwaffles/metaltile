@@ -555,6 +555,14 @@ impl DslBodyParser {
             "simd_sum" => self.parse_simd_reduce(call, "Sum"),
             "simd_max" => self.parse_simd_reduce(call, "Max"),
             "simd_min" => self.parse_simd_reduce(call, "Min"),
+            "simd_shuffle_xor" => self.parse_simd_shuffle_xor(call),
+            "simd_broadcast" => self.parse_simd_broadcast(call),
+            "atomic_add" => self.parse_atomic(call, "Add"),
+            "atomic_max" => self.parse_atomic(call, "Max"),
+            "atomic_min" => self.parse_atomic(call, "Min"),
+            "atomic_and" => self.parse_atomic(call, "And"),
+            "atomic_or" => self.parse_atomic(call, "Or"),
+            "atomic_xor" => self.parse_atomic(call, "Xor"),
             "threadgroup_barrier" => self.parse_barrier(call),
             "threadgroup_alloc" => self.parse_threadgroup_alloc(call),
             "threadgroup_load" => self.parse_threadgroup_load(call),
@@ -1279,6 +1287,86 @@ impl DslBodyParser {
             result,
         );
         result
+    }
+
+    /// `simd_shuffle_xor(value, mask)` → Op::SimdShuffleXor.
+    /// Each lane receives the value held by lane `lane_id ^ mask`. Used by
+    /// AURA's FWHT butterfly (`mask = 1, 2, 4, 8, …` per stage).
+    fn parse_simd_shuffle_xor(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let val = args.first().map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let mask = args.get(1).map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let result = self.alloc_vid();
+        self.push_op(
+            quote! {
+                Op::SimdShuffleXor {
+                    value: ValueId::new(#val),
+                    mask: ValueId::new(#mask),
+                }
+            },
+            result,
+        );
+        result
+    }
+
+    /// `simd_broadcast(value, lane)` → Op::SimdBroadcast.
+    /// Broadcasts `lane`'s value to every lane in the simdgroup. Used by
+    /// AURA's cooperative codebook hoist.
+    fn parse_simd_broadcast(&mut self, call: &ExprCall) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let val = args.first().map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let lane = args.get(1).map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let result = self.alloc_vid();
+        self.push_op(
+            quote! {
+                Op::SimdBroadcast {
+                    value: ValueId::new(#val),
+                    lane: ValueId::new(#lane),
+                }
+            },
+            result,
+        );
+        result
+    }
+
+    /// `atomic_<op>(dst, index, value)` → Op::Atomic. `dst` must be a string
+    /// literal (kernel param name); `index` and `value` are SSA expressions.
+    /// No result — the atomic is a side-effecting store.
+    fn parse_atomic(&mut self, call: &ExprCall, op_str: &str) -> u32 {
+        let args: Vec<_> = call.args.iter().collect();
+        let dst = if let Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })) =
+            args.first().map(|a| match a {
+                syn::Expr::Group(g) => &*g.expr,
+                other => other,
+            }) {
+            s.value()
+        } else {
+            self.push_error(syn::Error::new_spanned(
+                &call.func,
+                format!("atomic_{} expects a string literal as first argument (the destination param name)", op_str.to_lowercase()),
+            ));
+            String::new()
+        };
+        let index = args.get(1).map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let value = args.get(2).map(|a| self.parse_expr(a)).unwrap_or_else(|| self.alloc_vid());
+        let op_tokens = match op_str {
+            "Add" => quote! { AtomicKind::Add },
+            "Max" => quote! { AtomicKind::Max },
+            "Min" => quote! { AtomicKind::Min },
+            "And" => quote! { AtomicKind::And },
+            "Or" => quote! { AtomicKind::Or },
+            "Xor" => quote! { AtomicKind::Xor },
+            _ => quote! { AtomicKind::Add },
+        };
+        self.push_op_no_result(quote! {
+            Op::Atomic {
+                op: #op_tokens,
+                dst: #dst.to_string(),
+                index: ValueId::new(#index),
+                value: ValueId::new(#value),
+            }
+        });
+        0
     }
 
     /// `threadgroup_barrier()` → Op::Barrier (no result — DCE keeps no-result ops)

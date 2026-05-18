@@ -592,6 +592,14 @@ fn remap_values_in_op(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
         },
         Op::Dequantize { .. } => {},
         Op::SimdReduce { value, .. } => s(value),
+        Op::SimdShuffleXor { value, mask } => {
+            s(value);
+            s(mask);
+        },
+        Op::SimdBroadcast { value, lane } => {
+            s(value);
+            s(lane);
+        },
         Op::ThreadgroupLoad { index, .. } => s(index),
         Op::ThreadgroupStore { index, value, .. } => {
             s(index);
