@@ -155,3 +155,164 @@ impl Autotuner {
 }
 
 fn dirs_next() -> Option<PathBuf> { std::env::var("HOME").ok().map(PathBuf::from) }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use metaltile_core::constexpr::ConstExprValues;
+
+    use super::*;
+
+    /// Unique scratch dir per test, rooted in `std::env::temp_dir()` so we
+    /// don't trample the real `~/.cache/metaltile/` cache when running
+    /// tests in parallel.
+    fn scratch_dir() -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "metaltile-autotune-test-{}-{}",
+            std::process::id(),
+            n,
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample_config() -> TuneConfig {
+        TuneConfig {
+            tile_dims: vec![32, 32, 32],
+            threads: (256, 1, 1),
+            unroll_factor: 4,
+            use_simd_matrix: true,
+            use_async_copy: false,
+        }
+    }
+
+    fn sample_entry() -> TuneEntry {
+        TuneEntry {
+            bucket: vec![ShapeBucket { dim_name: "N".into(), lo: 0, hi: 256 }],
+            best_config: sample_config(),
+            perf: 12.34,
+            timestamp: 0,
+        }
+    }
+
+    // ── TuneCache ────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_load_nonexistent_returns_default() {
+        let c = TuneCache::load(&PathBuf::from("/definitely/nonexistent/path.json"));
+        assert!(c.entries.is_empty());
+    }
+
+    #[test]
+    fn cache_insert_save_load_roundtrip() {
+        let dir = scratch_dir();
+        let path = dir.join("tuning_cache.json");
+        let mut c = TuneCache::default();
+        c.insert("kernel_a@N=0..256", sample_entry());
+        c.save(&path).unwrap();
+        assert!(path.exists());
+
+        let loaded = TuneCache::load(&path);
+        assert_eq!(loaded.entries.len(), 1);
+        let e = loaded.entries.get("kernel_a@N=0..256").expect("entry survived round-trip");
+        assert_eq!(e.bucket[0].dim_name, "N");
+        assert_eq!(e.best_config.tile_dims, vec![32, 32, 32]);
+        assert_eq!(e.perf, 12.34);
+    }
+
+    #[test]
+    fn cache_lookup_always_none_today() {
+        // lookup() is a placeholder — see the comment in autotune.rs.
+        // Pinning the behaviour so a future implementation that flips it
+        // gets noticed.
+        let c = TuneCache::default();
+        let ce = ConstExprValues::new();
+        assert!(c.lookup(&ce).is_none());
+    }
+
+    #[test]
+    fn cache_save_creates_parent_dirs() {
+        let dir = scratch_dir();
+        let nested = dir.join("a").join("b").join("c").join("cache.json");
+        let c = TuneCache::default();
+        c.save(&nested).expect("save should mkdir -p the parents");
+        assert!(nested.exists());
+    }
+
+    // ── Autotuner ────────────────────────────────────────────────────
+
+    #[test]
+    fn autotuner_get_or_tune_disabled_returns_default_config() {
+        let dir = scratch_dir();
+        let tuner = Autotuner::new(dir, false);
+        let ce = ConstExprValues::new();
+        // `get_or_tune` borrows mutably, so reassign through a binding.
+        let mut t = tuner;
+        let cfg = t.get_or_tune("any_kernel", &ce).expect("disabled tuner returns default");
+        assert_eq!(cfg.tile_dims, vec![32, 32, 32]);
+        assert_eq!(cfg.threads, (256, 1, 1));
+        assert!(cfg.use_simd_matrix);
+    }
+
+    #[test]
+    fn autotuner_get_or_tune_enabled_with_empty_cache_returns_none() {
+        let dir = scratch_dir();
+        let mut t = Autotuner::new(dir, true);
+        let ce = ConstExprValues::new();
+        // Cache empty + lookup always returns None today → get_or_tune
+        // falls through the placeholder TODO branch.
+        assert!(t.get_or_tune("any_kernel", &ce).is_none());
+    }
+
+    #[test]
+    fn autotuner_set_enabled_flips_state() {
+        let dir = scratch_dir();
+        let mut t = Autotuner::new(dir, false);
+        let ce = ConstExprValues::new();
+        assert!(t.get_or_tune("k", &ce).is_some()); // disabled → default
+        t.set_enabled(true);
+        assert!(t.get_or_tune("k", &ce).is_none()); // enabled, empty cache → None
+    }
+
+    #[test]
+    fn autotuner_flush_writes_cache_file() {
+        let dir = scratch_dir();
+        let t = Autotuner::new(dir.clone(), false);
+        t.flush().expect("flush succeeds even on empty cache");
+        assert!(dir.join("tuning_cache.json").exists());
+    }
+
+    #[test]
+    fn default_cache_dir_uses_home_or_falls_back() {
+        // We can't reliably test the HOME-set path without polluting the
+        // environment; just assert the result is non-empty and ends in
+        // "metaltile".
+        let p = Autotuner::default_cache_dir();
+        assert!(p.ends_with("metaltile"));
+    }
+
+    // ── ShapeBucket / TuneConfig / TuneEntry serde ───────────────────
+
+    #[test]
+    fn shape_bucket_serde_roundtrip() {
+        let b = ShapeBucket { dim_name: "M".into(), lo: 0, hi: 128 };
+        let s = serde_json::to_string(&b).unwrap();
+        let b2: ShapeBucket = serde_json::from_str(&s).unwrap();
+        assert_eq!(b, b2);
+    }
+
+    #[test]
+    fn tune_config_serde_roundtrip() {
+        let c = sample_config();
+        let s = serde_json::to_string(&c).unwrap();
+        let c2: TuneConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(c2.tile_dims, c.tile_dims);
+        assert_eq!(c2.threads, c.threads);
+        assert_eq!(c2.unroll_factor, c.unroll_factor);
+        assert_eq!(c2.use_simd_matrix, c.use_simd_matrix);
+        assert_eq!(c2.use_async_copy, c.use_async_copy);
+    }
+}
