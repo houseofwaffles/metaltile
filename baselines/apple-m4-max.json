@@ -1,0 +1,1960 @@
+{
+  "device": "Apple M4 Max",
+  "gpu_family": "Apple9",
+  "git_sha": "2c45f5d",
+  "timestamp": "2026-05-18T19:09:25Z",
+  "results": [
+    {
+      "metric": "GB/s",
+      "mt": 52.147,
+      "op": "affine",
+      "ref": 51.049,
+      "shape": "bits=3 gs=32 n_groups=4096 f32",
+      "subop": "dequantize_int3"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 30.132,
+      "op": "affine",
+      "ref": 28.807,
+      "shape": "bits=3 gs=32 n_groups=4096 f16",
+      "subop": "dequantize_int3"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 29.677,
+      "op": "affine",
+      "ref": 29.344,
+      "shape": "bits=3 gs=32 n_groups=4096 bf16",
+      "subop": "dequantize_int3"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 50.871,
+      "op": "affine",
+      "ref": 38.643,
+      "shape": "bits=4 gs=64 n_groups=4096 f32",
+      "subop": "dequantize_int4"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 14.643,
+      "op": "affine",
+      "ref": 21.964,
+      "shape": "bits=4 gs=64 n_groups=4096 f16",
+      "subop": "dequantize_int4"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 43.809,
+      "op": "affine",
+      "ref": 22.206,
+      "shape": "bits=4 gs=64 n_groups=4096 bf16",
+      "subop": "dequantize_int4"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 48.225,
+      "op": "affine",
+      "ref": 53.064,
+      "shape": "bits=5 gs=32 n_groups=4096 f32",
+      "subop": "dequantize_int5"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 32.768,
+      "op": "affine",
+      "ref": 31.457,
+      "shape": "bits=5 gs=32 n_groups=4096 f16",
+      "subop": "dequantize_int5"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 32.4,
+      "op": "affine",
+      "ref": 31.688,
+      "shape": "bits=5 gs=32 n_groups=4096 bf16",
+      "subop": "dequantize_int5"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 46.811,
+      "op": "affine",
+      "ref": 45.197,
+      "shape": "bits=6 gs=32 n_groups=4096 f32",
+      "subop": "dequantize_int6"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 28.087,
+      "op": "affine",
+      "ref": 26.917,
+      "shape": "bits=6 gs=32 n_groups=4096 f16",
+      "subop": "dequantize_int6"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 27.742,
+      "op": "affine",
+      "ref": 27.406,
+      "shape": "bits=6 gs=32 n_groups=4096 bf16",
+      "subop": "dequantize_int6"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 66.619,
+      "op": "affine",
+      "ref": 36.977,
+      "shape": "bits=8 gs=64 n_groups=4096 f32",
+      "subop": "dequantize_int8"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 41.347,
+      "op": "affine",
+      "ref": 22.938,
+      "shape": "bits=8 gs=64 n_groups=4096 f16",
+      "subop": "dequantize_int8"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 36.77,
+      "op": "affine",
+      "ref": 22.965,
+      "shape": "bits=8 gs=64 n_groups=4096 bf16",
+      "subop": "dequantize_int8"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 16.987,
+      "op": "affine",
+      "ref": 15.461,
+      "shape": "bits=4 gs=64 n_groups=4096 f32",
+      "subop": "quantize_int4"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 8.878,
+      "op": "affine",
+      "ref": 8.432,
+      "shape": "bits=4 gs=64 n_groups=4096 f16",
+      "subop": "quantize_int4"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 21.669,
+      "op": "affine",
+      "ref": 20.992,
+      "shape": "bits=4 gs=64 n_groups=4096 bf16",
+      "subop": "quantize_int4"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 44.597,
+      "op": "affine",
+      "ref": 17.401,
+      "shape": "bits=8 gs=64 n_groups=4096 f32",
+      "subop": "quantize_int8"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 64.012,
+      "op": "affine",
+      "ref": 68.325,
+      "shape": "bits=8 gs=64 n_groups=4096 f16",
+      "subop": "quantize_int8"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 63.59,
+      "op": "affine",
+      "ref": 60.4,
+      "shape": "bits=8 gs=64 n_groups=4096 bf16",
+      "subop": "quantize_int8"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 13.146,
+      "op": "all_reduce",
+      "ref": 12.579,
+      "shape": "N=64M f32",
+      "subop": "max"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.71,
+      "op": "all_reduce",
+      "ref": 6.511,
+      "shape": "N=64M f16",
+      "subop": "max"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.816,
+      "op": "all_reduce",
+      "ref": 6.163,
+      "shape": "N=64M bf16",
+      "subop": "max"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 13.364,
+      "op": "all_reduce",
+      "ref": 12.689,
+      "shape": "N=64M f32",
+      "subop": "min"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.806,
+      "op": "all_reduce",
+      "ref": 6.579,
+      "shape": "N=64M f16",
+      "subop": "min"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.805,
+      "op": "all_reduce",
+      "ref": 6.182,
+      "shape": "N=64M bf16",
+      "subop": "min"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 13.432,
+      "op": "all_reduce",
+      "ref": 13.549,
+      "shape": "N=64M f32",
+      "subop": "prod"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.928,
+      "op": "all_reduce",
+      "ref": 7.009,
+      "shape": "N=64M f16",
+      "subop": "prod"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.916,
+      "op": "all_reduce",
+      "ref": 6.937,
+      "shape": "N=64M bf16",
+      "subop": "prod"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 13.34,
+      "op": "all_reduce",
+      "ref": 13.418,
+      "shape": "N=64M f32",
+      "subop": "sum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.845,
+      "op": "all_reduce",
+      "ref": 6.997,
+      "shape": "N=64M f16",
+      "subop": "sum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 6.846,
+      "op": "all_reduce",
+      "ref": 6.894,
+      "shape": "N=64M bf16",
+      "subop": "sum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 438.024,
+      "op": "arange",
+      "ref": 399.037,
+      "shape": "N=64M f32",
+      "subop": "arange"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 331.197,
+      "op": "arange",
+      "ref": 333.219,
+      "shape": "N=64M f16",
+      "subop": "arange"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 327.96,
+      "op": "arange",
+      "ref": 328.294,
+      "shape": "N=64M bf16",
+      "subop": "arange"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 17.877,
+      "op": "arg_reduce",
+      "ref": 5.107,
+      "shape": "N=1048576 f32",
+      "subop": "argmax"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 463.03,
+      "op": "binary",
+      "ref": 461.538,
+      "shape": "N=64M f32",
+      "subop": "add"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 479.92,
+      "op": "binary",
+      "ref": 389.932,
+      "shape": "N=64M f16",
+      "subop": "add"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 408.871,
+      "op": "binary",
+      "ref": 374.445,
+      "shape": "N=64M bf16",
+      "subop": "add"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 472.044,
+      "op": "binary",
+      "ref": 457.268,
+      "shape": "N=64M f32",
+      "subop": "atan2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 480.828,
+      "op": "binary",
+      "ref": 374.314,
+      "shape": "N=64M f16",
+      "subop": "atan2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 479.801,
+      "op": "binary",
+      "ref": 371.038,
+      "shape": "N=64M bf16",
+      "subop": "atan2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 468.849,
+      "op": "binary",
+      "ref": 465.865,
+      "shape": "N=64M f32",
+      "subop": "div"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 479.373,
+      "op": "binary",
+      "ref": 389.759,
+      "shape": "N=64M f16",
+      "subop": "div"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 479.587,
+      "op": "binary",
+      "ref": 366.048,
+      "shape": "N=64M bf16",
+      "subop": "div"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 470.103,
+      "op": "binary",
+      "ref": 469.259,
+      "shape": "N=64M f32",
+      "subop": "logaddexp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 482.34,
+      "op": "binary",
+      "ref": 385.545,
+      "shape": "N=64M f16",
+      "subop": "logaddexp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 479.206,
+      "op": "binary",
+      "ref": 388.193,
+      "shape": "N=64M bf16",
+      "subop": "logaddexp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 468.269,
+      "op": "binary",
+      "ref": 468.781,
+      "shape": "N=64M f32",
+      "subop": "maximum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 483.885,
+      "op": "binary",
+      "ref": 389.979,
+      "shape": "N=64M f16",
+      "subop": "maximum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 475.2,
+      "op": "binary",
+      "ref": 385.545,
+      "shape": "N=64M bf16",
+      "subop": "maximum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 471.445,
+      "op": "binary",
+      "ref": 469.875,
+      "shape": "N=64M f32",
+      "subop": "minimum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 478.258,
+      "op": "binary",
+      "ref": 385.729,
+      "shape": "N=64M f16",
+      "subop": "minimum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 474.291,
+      "op": "binary",
+      "ref": 388.411,
+      "shape": "N=64M bf16",
+      "subop": "minimum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 470.527,
+      "op": "binary",
+      "ref": 468.428,
+      "shape": "N=64M f32",
+      "subop": "mul"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 482.099,
+      "op": "binary",
+      "ref": 389.806,
+      "shape": "N=64M f16",
+      "subop": "mul"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 479.992,
+      "op": "binary",
+      "ref": 367.594,
+      "shape": "N=64M bf16",
+      "subop": "mul"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 467.793,
+      "op": "binary",
+      "ref": 467.465,
+      "shape": "N=64M f32",
+      "subop": "pow"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 480.565,
+      "op": "binary",
+      "ref": 388.458,
+      "shape": "N=64M f16",
+      "subop": "pow"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 480.589,
+      "op": "binary",
+      "ref": 390.862,
+      "shape": "N=64M bf16",
+      "subop": "pow"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 469.43,
+      "op": "binary",
+      "ref": 470.355,
+      "shape": "N=64M f32",
+      "subop": "remainder"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 478.993,
+      "op": "binary",
+      "ref": 388.708,
+      "shape": "N=64M f16",
+      "subop": "remainder"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 478.092,
+      "op": "binary",
+      "ref": 392.02,
+      "shape": "N=64M bf16",
+      "subop": "remainder"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 472.124,
+      "op": "binary",
+      "ref": 467.364,
+      "shape": "N=64M f32",
+      "subop": "sub"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 480.636,
+      "op": "binary",
+      "ref": 386.64,
+      "shape": "N=64M f16",
+      "subop": "sub"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 476.395,
+      "op": "binary",
+      "ref": 389.602,
+      "shape": "N=64M bf16",
+      "subop": "sub"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 462.147,
+      "op": "binary_two",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "add_mul"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 466.591,
+      "op": "binary_two",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "add_mul"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 469.088,
+      "op": "binary_two",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "add_mul"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.942,
+      "op": "copy",
+      "ref": 265.909,
+      "shape": "N=64M f32",
+      "subop": "copy"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.261,
+      "op": "copy",
+      "ref": 140.227,
+      "shape": "N=64M f16",
+      "subop": "copy"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.233,
+      "op": "copy",
+      "ref": 140.261,
+      "shape": "N=64M bf16",
+      "subop": "copy"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 185.897,
+      "op": "fp_quantized",
+      "ref": 152.984,
+      "shape": "N=1M f32 gs32",
+      "subop": "fp4_quant_dequant"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 510.098,
+      "op": "gemv",
+      "ref": null,
+      "shape": "B=4096 N=4096 f32",
+      "subop": "gemv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 484.777,
+      "op": "gemv",
+      "ref": null,
+      "shape": "B=4096 N=4096 f16",
+      "subop": "gemv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 495.51,
+      "op": "gemv",
+      "ref": null,
+      "shape": "B=4096 N=4096 bf16",
+      "subop": "gemv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 493.809,
+      "op": "gemv_masked",
+      "ref": null,
+      "shape": "B=4096 N=4096 f32",
+      "subop": "gemv_masked"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 457.636,
+      "op": "gemv_masked",
+      "ref": null,
+      "shape": "B=4096 N=4096 f16",
+      "subop": "gemv_masked"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 457.895,
+      "op": "gemv_masked",
+      "ref": null,
+      "shape": "B=4096 N=4096 bf16",
+      "subop": "gemv_masked"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1062.41,
+      "op": "layer_norm",
+      "ref": 936.404,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "layer_norm"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 922.107,
+      "op": "layer_norm",
+      "ref": 750.286,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "layer_norm"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 920.701,
+      "op": "layer_norm",
+      "ref": 754.032,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "layer_norm"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 818.601,
+      "op": "logsumexp",
+      "ref": 736.291,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "logsumexp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 495.998,
+      "op": "logsumexp",
+      "ref": 368.82,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "logsumexp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 505.97,
+      "op": "logsumexp",
+      "ref": 368.82,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "logsumexp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 522.66,
+      "op": "quantized",
+      "ref": 625.028,
+      "shape": "M=4096 K=4096 f32 gs64 b4",
+      "subop": "qmv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 428.356,
+      "op": "random",
+      "ref": 335.545,
+      "shape": "1M u32",
+      "subop": "random_hash"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1483.98,
+      "op": "rms_norm",
+      "ref": 1383.687,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "rms_norm"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1227.599,
+      "op": "rms_norm",
+      "ref": 1207.959,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "rms_norm"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1230.103,
+      "op": "rms_norm",
+      "ref": 1198.373,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "rms_norm"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 512.282,
+      "op": "rope",
+      "ref": 488.657,
+      "shape": "B1H32L512D128 f16",
+      "subop": "rope"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 513.589,
+      "op": "rope",
+      "ref": 482.796,
+      "shape": "B1H32L512D128 f16",
+      "subop": "rope"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 518.883,
+      "op": "rope",
+      "ref": 489.846,
+      "shape": "B1H32L512D128 f16",
+      "subop": "rope"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 846.117,
+      "op": "row_reduce",
+      "ref": 450.504,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "max"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 532.74,
+      "op": "row_reduce",
+      "ref": 300.113,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "max"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 525.785,
+      "op": "row_reduce",
+      "ref": 241.748,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "max"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 842.578,
+      "op": "row_reduce",
+      "ref": 450.505,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "min"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 532.74,
+      "op": "row_reduce",
+      "ref": 291.427,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "min"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 524.416,
+      "op": "row_reduce",
+      "ref": 240.592,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "min"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 840.819,
+      "op": "row_reduce",
+      "ref": 459.762,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "prod"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 532.74,
+      "op": "row_reduce",
+      "ref": 360.244,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "prod"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 532.74,
+      "op": "row_reduce",
+      "ref": 353.292,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "prod"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 839.064,
+      "op": "row_reduce",
+      "ref": 457.673,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "sum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 527.162,
+      "op": "row_reduce",
+      "ref": 343.059,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "sum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 532.74,
+      "op": "row_reduce",
+      "ref": 349.611,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "sum"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1066.631,
+      "op": "scan",
+      "ref": 994.205,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "scan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1047.212,
+      "op": "scan",
+      "ref": 994.206,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "scan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1033.769,
+      "op": "scan",
+      "ref": 996.666,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "scan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 388.102,
+      "op": "sdpa",
+      "ref": 396.896,
+      "shape": "H=8 N=2048 D=128 f32",
+      "subop": "sdpa"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 497.993,
+      "op": "sdpa",
+      "ref": 514.041,
+      "shape": "H=32 N=4096 D=128 f32",
+      "subop": "sdpa"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 334.038,
+      "op": "sdpa",
+      "ref": 346.687,
+      "shape": "H=8 N=2048 D=128 f16",
+      "subop": "sdpa"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 476.066,
+      "op": "sdpa",
+      "ref": 509.812,
+      "shape": "H=32 N=4096 D=128 f16",
+      "subop": "sdpa"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 335.708,
+      "op": "sdpa",
+      "ref": null,
+      "shape": "H=8 N=2048 D=128 bf16",
+      "subop": "sdpa"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 502.34,
+      "op": "sdpa",
+      "ref": null,
+      "shape": "H=32 N=4096 D=128 bf16",
+      "subop": "sdpa"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 488.541,
+      "op": "sdpa",
+      "ref": 367.073,
+      "shape": "H=32 N=4096 D=128 gqa=4 blocks=32 f32",
+      "subop": "sdpa_decode_2pass"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 412.535,
+      "op": "sdpa",
+      "ref": 399.451,
+      "shape": "H=32 N=4096 D=128 gqa=4 blocks=32 f16",
+      "subop": "sdpa_decode_2pass"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 412.535,
+      "op": "sdpa",
+      "ref": 395.144,
+      "shape": "H=32 N=4096 D=128 gqa=4 blocks=32 bf16",
+      "subop": "sdpa_decode_2pass"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 316.487,
+      "op": "sdpa",
+      "ref": 371.3,
+      "shape": "H=32 N=4096 D=128 gqa=4 f32",
+      "subop": "sdpa_vector"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 306.266,
+      "op": "sdpa",
+      "ref": 395.143,
+      "shape": "H=32 N=4096 D=128 gqa=4 f16",
+      "subop": "sdpa_vector"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 306.034,
+      "op": "sdpa",
+      "ref": 395.92,
+      "shape": "H=32 N=4096 D=128 gqa=4 bf16",
+      "subop": "sdpa_vector"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 432.263,
+      "op": "select",
+      "ref": 433.041,
+      "shape": "N=64M f32",
+      "subop": "select"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 234.984,
+      "op": "select",
+      "ref": 234.94,
+      "shape": "N=64M f16",
+      "subop": "select"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 234.69,
+      "op": "select",
+      "ref": 234.427,
+      "shape": "N=64M bf16",
+      "subop": "select"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1519.446,
+      "op": "softmax",
+      "ref": 1412.818,
+      "shape": "B=1024 N=4096 f32",
+      "subop": "softmax"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1150.44,
+      "op": "softmax",
+      "ref": 871.545,
+      "shape": "B=1024 N=4096 f16",
+      "subop": "softmax"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 1157.05,
+      "op": "softmax",
+      "ref": 771.367,
+      "shape": "B=1024 N=4096 bf16",
+      "subop": "softmax"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 58.679,
+      "op": "sort",
+      "ref": 90.241,
+      "shape": "B=1024 N=1024 f32",
+      "subop": "sort"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 28.205,
+      "op": "sort",
+      "ref": 48.842,
+      "shape": "B=1024 N=1024 f16",
+      "subop": "sort"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 27.184,
+      "op": "sort",
+      "ref": 47.438,
+      "shape": "B=1024 N=1024 bf16",
+      "subop": "sort"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 4.956,
+      "op": "steel_gemm_fused",
+      "ref": 5.266,
+      "shape": "M=4096 N=4096 K=4096 BM=64 BN=64 f32",
+      "subop": "bm64_bn64_bk16_wm2_wn2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 2.521,
+      "op": "steel_gemm_fused",
+      "ref": 2.706,
+      "shape": "M=4096 N=4096 K=4096 BM=64 BN=64 f16",
+      "subop": "bm64_bn64_bk16_wm2_wn2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 2.542,
+      "op": "steel_gemm_fused",
+      "ref": 2.657,
+      "shape": "M=4096 N=4096 K=4096 BM=64 BN=64 bf16",
+      "subop": "bm64_bn64_bk16_wm2_wn2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 197.282,
+      "op": "strided_copy",
+      "ref": null,
+      "shape": "M=1024 N=4096+128 f32",
+      "subop": "strided_copy"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 99.642,
+      "op": "strided_copy",
+      "ref": null,
+      "shape": "M=1024 N=4096+128 f16",
+      "subop": "strided_copy"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 99.642,
+      "op": "strided_copy",
+      "ref": null,
+      "shape": "M=1024 N=4096+128 bf16",
+      "subop": "strided_copy"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.734,
+      "op": "unary",
+      "ref": 265.816,
+      "shape": "N=64M f32",
+      "subop": "abs"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.837,
+      "op": "unary",
+      "ref": 140.005,
+      "shape": "N=64M f16",
+      "subop": "abs"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.099,
+      "op": "unary",
+      "ref": 140.072,
+      "shape": "N=64M bf16",
+      "subop": "abs"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.394,
+      "op": "unary",
+      "ref": 134.504,
+      "shape": "N=64M f32",
+      "subop": "acos"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.886,
+      "op": "unary",
+      "ref": 72.675,
+      "shape": "N=64M f16",
+      "subop": "acos"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 73.605,
+      "op": "unary",
+      "ref": 75.604,
+      "shape": "N=64M bf16",
+      "subop": "acos"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.679,
+      "op": "unary",
+      "ref": 134.44,
+      "shape": "N=64M f32",
+      "subop": "acosh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.092,
+      "op": "unary",
+      "ref": 73.597,
+      "shape": "N=64M f16",
+      "subop": "acosh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.756,
+      "op": "unary",
+      "ref": 75.515,
+      "shape": "N=64M bf16",
+      "subop": "acosh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.63,
+      "op": "unary",
+      "ref": 133.126,
+      "shape": "N=64M f32",
+      "subop": "asin"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.813,
+      "op": "unary",
+      "ref": 74.517,
+      "shape": "N=64M f16",
+      "subop": "asin"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.74,
+      "op": "unary",
+      "ref": 74.42,
+      "shape": "N=64M bf16",
+      "subop": "asin"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.745,
+      "op": "unary",
+      "ref": 133.41,
+      "shape": "N=64M f32",
+      "subop": "asinh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.683,
+      "op": "unary",
+      "ref": 74.2,
+      "shape": "N=64M f16",
+      "subop": "asinh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.522,
+      "op": "unary",
+      "ref": 73.243,
+      "shape": "N=64M bf16",
+      "subop": "asinh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.586,
+      "op": "unary",
+      "ref": 134.339,
+      "shape": "N=64M f32",
+      "subop": "atan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.347,
+      "op": "unary",
+      "ref": 73.303,
+      "shape": "N=64M f16",
+      "subop": "atan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 138.47,
+      "op": "unary",
+      "ref": 72.944,
+      "shape": "N=64M bf16",
+      "subop": "atan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 261.172,
+      "op": "unary",
+      "ref": 131.501,
+      "shape": "N=64M f32",
+      "subop": "atanh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.926,
+      "op": "unary",
+      "ref": 75.633,
+      "shape": "N=64M f16",
+      "subop": "atanh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.203,
+      "op": "unary",
+      "ref": 74.815,
+      "shape": "N=64M bf16",
+      "subop": "atanh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.685,
+      "op": "unary",
+      "ref": 265.92,
+      "shape": "N=64M f32",
+      "subop": "ceil"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.05,
+      "op": "unary",
+      "ref": 139.956,
+      "shape": "N=64M f16",
+      "subop": "ceil"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.056,
+      "op": "unary",
+      "ref": 140.087,
+      "shape": "N=64M bf16",
+      "subop": "ceil"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.712,
+      "op": "unary",
+      "ref": 133.804,
+      "shape": "N=64M f32",
+      "subop": "cos"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.84,
+      "op": "unary",
+      "ref": 74.599,
+      "shape": "N=64M f16",
+      "subop": "cos"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.71,
+      "op": "unary",
+      "ref": 74.89,
+      "shape": "N=64M bf16",
+      "subop": "cos"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.695,
+      "op": "unary",
+      "ref": 133.103,
+      "shape": "N=64M f32",
+      "subop": "cosh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.749,
+      "op": "unary",
+      "ref": 72.962,
+      "shape": "N=64M f16",
+      "subop": "cosh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.619,
+      "op": "unary",
+      "ref": 72.702,
+      "shape": "N=64M bf16",
+      "subop": "cosh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.225,
+      "op": "unary",
+      "ref": 132.837,
+      "shape": "N=64M f32",
+      "subop": "erf"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.574,
+      "op": "unary",
+      "ref": 75.019,
+      "shape": "N=64M f16",
+      "subop": "erf"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.668,
+      "op": "unary",
+      "ref": 74.898,
+      "shape": "N=64M bf16",
+      "subop": "erf"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.58,
+      "op": "unary",
+      "ref": 265.318,
+      "shape": "N=64M f32",
+      "subop": "erfinv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.014,
+      "op": "unary",
+      "ref": 139.701,
+      "shape": "N=64M f16",
+      "subop": "erfinv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.544,
+      "op": "unary",
+      "ref": 139.547,
+      "shape": "N=64M bf16",
+      "subop": "erfinv"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.63,
+      "op": "unary",
+      "ref": 265.597,
+      "shape": "N=64M f32",
+      "subop": "exp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.065,
+      "op": "unary",
+      "ref": 139.895,
+      "shape": "N=64M f16",
+      "subop": "exp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.992,
+      "op": "unary",
+      "ref": 139.634,
+      "shape": "N=64M bf16",
+      "subop": "exp"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.236,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "exp2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.224,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "exp2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.692,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "exp2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 264.382,
+      "op": "unary",
+      "ref": 131.266,
+      "shape": "N=64M f32",
+      "subop": "expm1"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.765,
+      "op": "unary",
+      "ref": 74.493,
+      "shape": "N=64M f16",
+      "subop": "expm1"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.698,
+      "op": "unary",
+      "ref": 74.074,
+      "shape": "N=64M bf16",
+      "subop": "expm1"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.843,
+      "op": "unary",
+      "ref": 265.679,
+      "shape": "N=64M f32",
+      "subop": "floor"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.157,
+      "op": "unary",
+      "ref": 140.008,
+      "shape": "N=64M f16",
+      "subop": "floor"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.029,
+      "op": "unary",
+      "ref": 140.111,
+      "shape": "N=64M bf16",
+      "subop": "floor"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.455,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "gelu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.819,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "gelu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.701,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "gelu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.827,
+      "op": "unary",
+      "ref": 265.904,
+      "shape": "N=64M f32",
+      "subop": "log"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.819,
+      "op": "unary",
+      "ref": 139.883,
+      "shape": "N=64M f16",
+      "subop": "log"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.065,
+      "op": "unary",
+      "ref": 139.898,
+      "shape": "N=64M bf16",
+      "subop": "log"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.384,
+      "op": "unary",
+      "ref": 265.351,
+      "shape": "N=64M f32",
+      "subop": "log10"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.646,
+      "op": "unary",
+      "ref": 139.447,
+      "shape": "N=64M f16",
+      "subop": "log10"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.677,
+      "op": "unary",
+      "ref": 138.978,
+      "shape": "N=64M bf16",
+      "subop": "log10"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.975,
+      "op": "unary",
+      "ref": 265.663,
+      "shape": "N=64M f32",
+      "subop": "log1p"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.847,
+      "op": "unary",
+      "ref": 139.865,
+      "shape": "N=64M f16",
+      "subop": "log1p"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.919,
+      "op": "unary",
+      "ref": 139.859,
+      "shape": "N=64M bf16",
+      "subop": "log1p"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.679,
+      "op": "unary",
+      "ref": 265.679,
+      "shape": "N=64M f32",
+      "subop": "log2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.91,
+      "op": "unary",
+      "ref": 140.05,
+      "shape": "N=64M f16",
+      "subop": "log2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.813,
+      "op": "unary",
+      "ref": 139.956,
+      "shape": "N=64M bf16",
+      "subop": "log2"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.959,
+      "op": "unary",
+      "ref": 265.57,
+      "shape": "N=64M f32",
+      "subop": "neg"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.09,
+      "op": "unary",
+      "ref": 140.093,
+      "shape": "N=64M f16",
+      "subop": "neg"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.938,
+      "op": "unary",
+      "ref": 139.84,
+      "shape": "N=64M bf16",
+      "subop": "neg"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.597,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "recip"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.792,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "recip"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.822,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "recip"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.597,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "relu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.008,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "relu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.008,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "relu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.537,
+      "op": "unary",
+      "ref": 266.014,
+      "shape": "N=64M f32",
+      "subop": "round"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.837,
+      "op": "unary",
+      "ref": 139.837,
+      "shape": "N=64M f16",
+      "subop": "round"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.938,
+      "op": "unary",
+      "ref": 140.139,
+      "shape": "N=64M bf16",
+      "subop": "round"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 266.008,
+      "op": "unary",
+      "ref": 265.646,
+      "shape": "N=64M f32",
+      "subop": "rsqrt"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.956,
+      "op": "unary",
+      "ref": 139.853,
+      "shape": "N=64M f16",
+      "subop": "rsqrt"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.674,
+      "op": "unary",
+      "ref": 139.929,
+      "shape": "N=64M bf16",
+      "subop": "rsqrt"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.745,
+      "op": "unary",
+      "ref": 265.466,
+      "shape": "N=64M f32",
+      "subop": "sigmoid"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.956,
+      "op": "unary",
+      "ref": 139.722,
+      "shape": "N=64M f16",
+      "subop": "sigmoid"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.968,
+      "op": "unary",
+      "ref": 139.892,
+      "shape": "N=64M bf16",
+      "subop": "sigmoid"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.28,
+      "op": "unary",
+      "ref": 265.4,
+      "shape": "N=64M f32",
+      "subop": "sign"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.114,
+      "op": "unary",
+      "ref": 139.862,
+      "shape": "N=64M f16",
+      "subop": "sign"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.014,
+      "op": "unary",
+      "ref": 139.218,
+      "shape": "N=64M bf16",
+      "subop": "sign"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.591,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "silu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.792,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "silu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.622,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "silu"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.4,
+      "op": "unary",
+      "ref": 133.871,
+      "shape": "N=64M f32",
+      "subop": "sin"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.338,
+      "op": "unary",
+      "ref": 74.816,
+      "shape": "N=64M f16",
+      "subop": "sin"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.85,
+      "op": "unary",
+      "ref": 75.001,
+      "shape": "N=64M bf16",
+      "subop": "sin"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.619,
+      "op": "unary",
+      "ref": 133.394,
+      "shape": "N=64M f32",
+      "subop": "sinh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.944,
+      "op": "unary",
+      "ref": 74.61,
+      "shape": "N=64M f16",
+      "subop": "sinh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.965,
+      "op": "unary",
+      "ref": 74.559,
+      "shape": "N=64M bf16",
+      "subop": "sinh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.964,
+      "op": "unary",
+      "ref": 265.367,
+      "shape": "N=64M f32",
+      "subop": "sqrt"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.038,
+      "op": "unary",
+      "ref": 140.154,
+      "shape": "N=64M f16",
+      "subop": "sqrt"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.983,
+      "op": "unary",
+      "ref": 139.974,
+      "shape": "N=64M bf16",
+      "subop": "sqrt"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.745,
+      "op": "unary",
+      "ref": 265.953,
+      "shape": "N=64M f32",
+      "subop": "square"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.23,
+      "op": "unary",
+      "ref": 140.248,
+      "shape": "N=64M f16",
+      "subop": "square"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.096,
+      "op": "unary",
+      "ref": 140.129,
+      "shape": "N=64M bf16",
+      "subop": "square"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.712,
+      "op": "unary",
+      "ref": 133.169,
+      "shape": "N=64M f32",
+      "subop": "tan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.737,
+      "op": "unary",
+      "ref": 74.778,
+      "shape": "N=64M f16",
+      "subop": "tan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.32,
+      "op": "unary",
+      "ref": 74.697,
+      "shape": "N=64M bf16",
+      "subop": "tan"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.69,
+      "op": "unary",
+      "ref": 133.484,
+      "shape": "N=64M f32",
+      "subop": "tanh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.619,
+      "op": "unary",
+      "ref": 74.356,
+      "shape": "N=64M f16",
+      "subop": "tanh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 139.929,
+      "op": "unary",
+      "ref": 74.747,
+      "shape": "N=64M bf16",
+      "subop": "tanh"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 265.827,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f32",
+      "subop": "trunc"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.029,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M f16",
+      "subop": "trunc"
+    },
+    {
+      "metric": "GB/s",
+      "mt": 140.193,
+      "op": "unary",
+      "ref": null,
+      "shape": "N=64M bf16",
+      "subop": "trunc"
+    }
+  ]
+}
