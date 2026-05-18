@@ -965,7 +965,7 @@ mod bench_impl {
         };
         let dtypes = match &a.dtypes {
             Some(e) => quote! {#e},
-            None => quote! {crate::ops::FLOAT_DTYPES},
+            None => quote! {crate::bench_types::FLOAT_DTYPES},
         };
 
         // Non-generic kernels have `kernel_ir_for() -> Kernel` (no args).

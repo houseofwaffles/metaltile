@@ -1,7 +1,7 @@
 //! Llama-style RoPE with optional Llama-3 frequency-band scaling.
 //! Per-token decode form (single position constexpr), generic over T.
 //!
-//! Different from `mt_rope` (in `ops/mlx/rope.rs`):
+//! Different from `mt_rope` (in `mlx/rope.rs`):
 //!   - decode-only (no batch / seq grid)
 //!   - generic dtype (mt_rope is f16-only)
 //!   - supports Llama-3 wavelength banding (low / high / smoothed)

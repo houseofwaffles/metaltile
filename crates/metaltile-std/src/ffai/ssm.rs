@@ -6,7 +6,7 @@
 //! but mainline MLX (pinned by `metaltile-std/build.rs`) doesn't ship
 //! the `ssm.metal` source yet, so there's no side-by-side comparison
 //! today. When the pin moves to a commit that ships `ssm.metal`, this
-//! file (or just `mt_ssm_step` alone) graduates to `ops/mlx/ssm.rs` and
+//! file (or just `mt_ssm_step` alone) graduates to `mlx/ssm.rs` and
 //! picks up an MLX bench comparison via the standard `mlx=` /
 //! `metal_file=` annotations.
 //!

@@ -12,7 +12,7 @@
 //! verified there, the shape spec / bench dispatch can be added back
 //! here so `tile bench` can track it for regressions — and if its MLX
 //! counterpart lands in mainline at a future pin, the file moves to
-//! `ops/mlx/`.
+//! `mlx/`.
 
 pub mod arg_reduce;
 pub mod dequant_gather;

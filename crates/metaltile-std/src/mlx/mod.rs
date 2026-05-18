@@ -9,7 +9,7 @@
 //! When a kernel can't be directly compared today (MLX template not
 //! shipped at the pinned commit, or the comparison isn't wired yet)
 //! but the implementation faithfully mirrors MLX semantics and is
-//! expected to wire up eventually, it lives in `ops/ffai/` until the
+//! expected to wire up eventually, it lives in `ffai/` until the
 //! comparison lands.
 
 pub mod arange;

@@ -13,7 +13,7 @@
 //!
 //! GQA: `kv_head = q_head / heads_per_group`.
 //!
-//! Different from `mt_sdpa` (in `ops/mlx/scaled_dot_product_attention.rs`):
+//! Different from `mt_sdpa` (in `mlx/scaled_dot_product_attention.rs`):
 //!   - generic `head_dim` (mt_sdpa is hardcoded to 128)
 //!   - GQA via `heads_per_group` constexpr (mt_sdpa assumes Q heads = KV heads)
 //!   - single-token decode form, one thread per (q_head, d)

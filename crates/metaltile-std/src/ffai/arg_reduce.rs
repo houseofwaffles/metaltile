@@ -1,7 +1,7 @@
 //! Generic `argmax<T>` with u32 index output — FFAI's decode-form
 //! greedy-sampler workhorse.
 //!
-//! Adapted from `mt_argmax_f32` (in `ops/mlx/arg_reduce.rs`) but generic
+//! Adapted from `mt_argmax_f32` (in `mlx/arg_reduce.rs`) but generic
 //! over input dtype and emitting a `u32` index rather than a float-cast
 //! version. Decode-form samplers (greedy token pick) need an integer
 //! token id; the f32-output upstream variant doesn't fit that contract.
@@ -130,7 +130,7 @@ inventory::submit! {
     BenchSpec {
         op: "arg_reduce",
         // Distinct subop so it sorts alongside `mt_argmax_f32` (subop
-        // "argmax" in ops/mlx/arg_reduce.rs) but doesn't collide with it
+        // "argmax" in mlx/arg_reduce.rs) but doesn't collide with it
         // in the bench table.
         subop: "argmax_u32",
         kernel_name: "argmax",

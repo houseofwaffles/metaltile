@@ -35,7 +35,7 @@ pub fn first_mode(spec: &BenchSpec) -> KernelMode {
 /// explicit `kernel_mode` override, otherwise fall back to
 /// [`first_mode`].
 ///
-/// Codegen-only kernels (e.g. the FFAI ports in `ops/ffai/`) set
+/// Codegen-only kernels (e.g. the FFAI ports in `ffai/`) set
 /// `kernel_mode: Some(Reduction|Grid3D)` so the MSL header declares
 /// the `tid`/`lsize`/`tgid_*` aliases their bodies depend on even
 /// though dispatch is `Generic` with empty `shapes`. Subcommands that

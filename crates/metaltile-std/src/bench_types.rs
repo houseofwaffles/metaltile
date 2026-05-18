@@ -736,7 +736,7 @@ macro_rules! bench_tests {
 
             #[test]
             fn msl_generates_for_all_dtypes() {
-                for &dt in $crate::ops::FLOAT_DTYPES {
+                for &dt in $crate::bench_types::FLOAT_DTYPES {
                     let msl = $msl_fn(dt);
                     assert!(!msl.trim().is_empty(), "MSL empty for {dt:?}");
                 }
