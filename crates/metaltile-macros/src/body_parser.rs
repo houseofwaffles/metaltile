@@ -440,6 +440,13 @@ impl DslBodyParser {
             Expr::MethodCall(method) => self.parse_method_call(method),
             Expr::Unary(unary) => self.parse_unary(unary),
             Expr::Paren(paren) => self.parse_expr(&paren.expr),
+            // `macro_rules!` captures (e.g. `$bits:literal`) are substituted
+            // wrapped in `Delimiter::None` invisible groups, which syn parses
+            // as `Expr::Group`. Unwrap so the inner literal / expression
+            // reaches its real arm — otherwise the catch-all below allocates
+            // a VID without pushing an Op and downstream consumers reference
+            // an undeclared SSA value.
+            Expr::Group(group) => self.parse_expr(&group.expr),
             Expr::If(if_expr) => self.parse_if(if_expr),
             Expr::ForLoop(_) => self.alloc_vid(),
             Expr::Macro(mac) => {
