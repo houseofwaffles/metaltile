@@ -54,13 +54,13 @@ Early development — APIs are not yet stable. Core DSL works; autotuner and typ
 
 | Crate | Description |
 |---|---|
-| `metaltile-core` | IR types, DType, Shape |
-| `metaltile-macros` | `#[kernel]` proc macro |
-| `metaltile-codegen` | MSL lowering + 6 opt passes |
-| `metaltile-runtime` | Metal dispatch, PSO cache |
-| `metaltile` | Facade re-exporting all crates |
-| `metaltile-std` | Kernel stdlib, op files, bench types |
-| `metaltile-cli` | `tile` CLI binary |
+| [`metaltile-core`](crates/metaltile-core/README.md) | IR types, DType, Shape |
+| [`metaltile-macros`](crates/metaltile-macros/README.md) | `#[kernel]` proc macro |
+| [`metaltile-codegen`](crates/metaltile-codegen/README.md) | MSL lowering + 14 opt passes |
+| [`metaltile-runtime`](crates/metaltile-runtime/README.md) | Metal dispatch, PSO cache |
+| [`metaltile`](crates/metaltile/README.md) | Facade re-exporting all crates |
+| [`metaltile-std`](crates/metaltile-std/README.md) | Kernel stdlib, op files, bench types |
+| [`metaltile-cli`](crates/metaltile-cli/README.md) | `tile` CLI binary |
 
 ## Quick Start
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 To inspect the generated MSL directly:
 
 ```rust
-use metaltile::codegen::MslGenerator;
+use metaltile::codegen::msl::MslGenerator;
 
 let msl = MslGenerator::default().generate(&vector_add::kernel_ir())?;
 println!("{msl}");
@@ -111,13 +111,13 @@ println!("{msl}");
 
 ## Supported Operations
 
-27 operation categories benchmarked against MLX:
+22 operation categories benchmarked against MLX:
 
-**Elementwise**: unary (exp, log, sqrt, sin, cos, erf, sigmoid, silu, gelu, relu, …), binary (add, mul, sub, div, max, min, pow, logaddexp), ternary (select), copy, arange
+**Elementwise**: unary (exp, log, sqrt, sin, cos, erf, sigmoid, silu, gelu, relu, …), binary (add, mul, sub, div, max, min, pow, logaddexp), binary_two (fused add+mul), ternary (select), copy, arange
 
 **Reductions**: all-reduce sum/max/min, row-reduce sum/max/min, logsumexp, softmax, rms-norm, layer-norm
 
-**Matrix**: GEMV, masked GEMV, matmul (fp16 steel/gemm), SDPA vector decode
+**Matrix**: GEMV, masked GEMV, SDPA vector decode
 
 **Misc**: RoPE, scan (parallel prefix sum), arg-reduce (argmax), sort (bitonic), random (xorshift32), quantized GeMV (int4), fp4 quantize/dequantize, strided copy (non-contiguous tensors)
 
@@ -167,13 +167,13 @@ Selected results (M4 Max, higher = better vs MLX):
                           │
                     MetalTile IR  (metaltile-core)
                           │
-               metaltile-codegen (6 opt passes → MSL)
+               metaltile-codegen (14 opt passes → MSL)
                  │
          metaltile-runtime
          (Metal GPU dispatch)
 ```
 
-Optimization passes: TypeCheck → ConstFold → TileLowering → Fusion → Schedule → Vectorize.
+Optimization passes: TypeCheck → ConstFold → AlgebraicSimplify → CopyProp → CSE → LICM → IfConversion → ValueSink → TileLowering → Fusion → Unroll → Schedule → Vectorize → DeadStoreElim.
 
 ## License
 
