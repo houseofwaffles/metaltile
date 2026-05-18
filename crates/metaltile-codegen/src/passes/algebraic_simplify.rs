@@ -558,6 +558,7 @@ fn remap_values_in_op(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
                 remap_values_in_op(sub_op, map);
             },
         Op::VectorLoad { byte_offset, .. } => s(byte_offset),
+        Op::VectorExtract { .. } => {},
         Op::VectorStore { byte_offset, value, .. } => {
             s(byte_offset);
             s(value);

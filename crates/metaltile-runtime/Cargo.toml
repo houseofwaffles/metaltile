@@ -11,7 +11,7 @@ categories = ["compilers", "hardware-support"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLLibrary", "MTLComputePipeline", "MTLComputeCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLFunctionConstantValues"] }
+objc2-metal = { version = "0.3", features = ["MTLDevice", "MTLCommandQueue", "MTLLibrary", "MTLComputePipeline", "MTLComputeCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLFunctionConstantValues", "MTLCaptureManager"] }
 objc2-foundation = "0.3"
 
 [dependencies]
@@ -21,3 +21,5 @@ thiserror.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true

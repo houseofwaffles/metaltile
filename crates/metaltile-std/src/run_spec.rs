@@ -2,7 +2,10 @@
 //! BenchSpec::run() and all dispatch arms, transformed into free functions.
 
 use metaltile_codegen::msl::MslGenerator;
-use metaltile_core::{dtype::DType, ir::KernelMode};
+use metaltile_core::{
+    dtype::DType,
+    ir::{Kernel, KernelMode},
+};
 
 use crate::{
     bench_types::{
@@ -83,6 +86,29 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
                 *batch,
                 *tpg,
             ),
+        BenchDispatch::SdpaVector2Pass {
+            head_dim,
+            n_kv,
+            n_q_heads,
+            gqa_factor,
+            batch,
+            blocks,
+            pass2_kernel_name,
+            pass2_kernel_ir,
+        } => run_sdpa_vector_2pass(
+            spec,
+            runner,
+            dt,
+            &bench,
+            *head_dim,
+            *n_kv,
+            *n_q_heads,
+            *gqa_factor,
+            *batch,
+            *blocks,
+            pass2_kernel_name,
+            *pass2_kernel_ir,
+        ),
         BenchDispatch::SteelGemm { m, n, k, check_m, check_n, check_k, bm, bn, tpg } =>
             run_steel_gemm(
                 spec, runner, dt, &bench, *m, *n, *k, *check_m, *check_n, *check_k, *bm, *bn, *tpg,
@@ -1714,6 +1740,189 @@ fn run_sdpa_vector(
         .unwrap_or(None);
 
     let label = format!("H={n_q_heads} N={n_kv} D={head_dim} gqa={gqa_factor} {}", ctx.label);
+    vec![bench.result_sub(Some(spec.subop), label, ref_perf, mt_perf, equiv)]
+}
+
+// ── SdpaVector2Pass — chained pass1 + pass2, MLX single-pass as ref ─────
+//
+// The 2-pass pair targets the long-N regime where single-pass `sdpa_vector`
+// can't keep all KV slots in-flight per simdgroup. Pass 1 splits the n_kv
+// walk across `blocks` threadgroups (each owning n_kv/blocks K positions);
+// pass 2 reduces the per-block (max, sum, partial-O) tuples into one final
+// O via TG=1024 (32 simdgroups × 32 lanes, where the reducer drops the
+// remainder when `blocks % 32 != 0`).
+//
+// Both passes are measured separately and the rows are summed — this
+// approximates chained-dispatch wall time. Real chained dispatch via
+// `Context::dispatch_chain` is slightly faster (one CB commit + one wait
+// for the whole chain) and is what production callers use; the test-bench
+// in `tests/sdpa_decode_2pass_gpu.rs` measures that path end-to-end.
+#[allow(clippy::too_many_arguments)]
+fn run_sdpa_vector_2pass(
+    spec: &BenchSpec,
+    runner: &GpuRunner,
+    dt: DType,
+    bench: &OpBench,
+    head_dim: usize,
+    n_kv: usize,
+    n_q_heads: usize,
+    gqa_factor: usize,
+    _batch: usize,
+    blocks: usize,
+    pass2_kernel_name: &str,
+    pass2_kernel_ir: fn(DType) -> Kernel,
+) -> Vec<OpResult> {
+    assert_eq!(head_dim, 128, "sdpa_decode_2pass hardcodes head_dim=128");
+    assert!(n_q_heads.is_multiple_of(gqa_factor), "n_q_heads must be divisible by gqa_factor");
+    assert!(blocks.is_multiple_of(32), "blocks must be a multiple of 32 (pass-2 reducer)");
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let gqa_factor_u = gqa_factor;
+    let ctx = DtypeCtx::elementwise(dt);
+
+    let p1_msl = match msl_reduction(spec, dt) {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let p1_mk = match compile_mt(runner, &p1_msl, spec.kernel_name) {
+        Some(k) => k,
+        None => return vec![],
+    };
+    let mut p2_kernel = pass2_kernel_ir(dt);
+    p2_kernel.mode = KernelMode::Reduction;
+    let p2_msl = match MslGenerator::default().generate(&p2_kernel) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let p2_mk = match compile_mt(runner, &p2_msl, pass2_kernel_name) {
+        Some(k) => k,
+        None => return vec![],
+    };
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let max_n = (n_kv_heads * n_kv * head_dim).max(n_q_heads * head_dim);
+    let vals: Vec<f32> = (0..max_n).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+
+    let q_buf = buffer_typed(runner, &vals[..n_q_heads * head_dim], dt);
+    let k_buf = buffer_typed(runner, &vals[..n_kv_heads * n_kv * head_dim], dt);
+    let v_buf = buffer_typed(runner, &vals[..n_kv_heads * n_kv * head_dim], dt);
+
+    // Pass 1 partials: `partial_o` is Tensor<T> (matches MLX sdpa_vector_2pass —
+    // post-softmax-weighted values are bounded so storage in T loses no useful
+    // bits and halves bandwidth at f16/bf16). `partial_max` / `partial_sum`
+    // stay f32 — the online-softmax running sum of `exp()` can blow past f16's
+    // ~6.5e4 ceiling on long n_kv.
+    let partial_o = runner.buffer_zeros(n_q_heads * blocks * head_dim * ctx.eb);
+    let partial_max = runner.buffer_zeros(n_q_heads * blocks * 4);
+    let partial_sum = runner.buffer_zeros(n_q_heads * blocks * 4);
+    let mt_out_buf = zeros_typed(runner, n_q_heads * head_dim, dt);
+
+    let hd_buf = runner.buffer_u32(head_dim as u32);
+    let n_buf = runner.buffer_u32(n_kv as u32);
+    let kvs_buf = runner.buffer_u32(n_kv as u32); // kv_stride == n_kv (contiguous KV cache)
+    let gqa_buf = runner.buffer_u32(gqa_factor as u32);
+    let blocks_buf = runner.buffer_u32(blocks as u32);
+    let sc_buf = runner.buffer_f32_scalar(scale);
+
+    // Pass 1: grid (n_kv_heads, blocks, 1), TG (32, gqa_factor, 1).
+    // Buffer order matches `sdpa_decode_2pass_pass1` signature:
+    //   q, k, v, partial_o, partial_m, partial_l,
+    //   head_dim, n_kv, kv_stride, gqa_factor, blocks, scale.
+    let p1_bufs: Vec<&GpuBuffer> = vec![
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &partial_o,
+        &partial_max,
+        &partial_sum,
+        &hd_buf,
+        &n_buf,
+        &kvs_buf,
+        &gqa_buf,
+        &blocks_buf,
+        &sc_buf,
+    ];
+    let p1_grid = [n_kv_heads, blocks, 1];
+    let p1_tpg = [32, gqa_factor_u, 1];
+    // Pass 2: grid (n_q_heads, 1, 1), TG (1024, 1, 1).
+    let p2_bufs: Vec<&GpuBuffer> =
+        vec![&partial_o, &partial_max, &partial_sum, &mt_out_buf, &hd_buf, &blocks_buf];
+    let p2_grid = [n_q_heads, 1, 1];
+    let p2_tpg = [1024, 1, 1];
+
+    // Run once for correctness.
+    runner.measure(&p1_mk, &p1_bufs, p1_grid, p1_tpg, 0, 1);
+    runner.measure(&p2_mk, &p2_bufs, p2_grid, p2_tpg, 0, 1);
+    let mt_out = crate::runner::read_typed(runner, &mt_out_buf, n_q_heads * head_dim, dt);
+
+    // MLX single-pass `sdpa_vector` reference at the same shape.
+    const REF_FCS: &[(usize, bool)] =
+        &[(20, false), (21, false), (22, false), (23, false), (24, false), (25, false)];
+    let ref_name: Option<String> = match dt {
+        DType::F32 => Some(format!("sdpa_vector_float_{head_dim}_{head_dim}")),
+        DType::F16 => Some(format!("sdpa_vector_float16_t_{head_dim}_{head_dim}")),
+        DType::BF16 => Some(format!("sdpa_vector_bfloat16_t_{head_dim}_{head_dim}")),
+        _ => None,
+    };
+    let rk = ref_name.as_ref().and_then(|name| {
+        spec.mlx_src.and_then(|src| runner.compile_with_bool_constants(src, name, REF_FCS).ok())
+    });
+
+    let equiv = rk.as_ref().map(|rk| {
+        let gqa = runner.buffer_i32(gqa_factor as i32);
+        let n_i32 = runner.buffer_i32(n_kv as i32);
+        let khs = runner.buffer_u64((n_kv * head_dim) as u64);
+        let kss = runner.buffer_u64(head_dim as u64);
+        let mlx_out_buf = zeros_typed(runner, n_q_heads * head_dim, dt);
+        runner.measure(
+            rk,
+            &[&q_buf, &k_buf, &v_buf, &mlx_out_buf, &gqa, &n_i32, &khs, &kss, &khs, &kss, &sc_buf],
+            [n_q_heads, 1, 1],
+            [1024, 1, 1],
+            0,
+            1,
+        );
+        let ref_out = crate::runner::read_typed(runner, &mlx_out_buf, n_q_heads * head_dim, dt);
+        check_equiv_with(&ref_out, &mt_out, EquivTolerance::new(spec.tol, 0.999))
+    });
+
+    // Perf: read q + k + v + write out. K/V sized by n_kv_heads (GQA).
+    let bytes = ((n_q_heads * head_dim + 2 * n_kv_heads * n_kv * head_dim + n_q_heads * head_dim)
+        * ctx.eb) as f64;
+    let p1_perf = bench_gbps_only(runner, &p1_mk, &p1_bufs, p1_grid, p1_tpg, bytes);
+    let p2_perf = bench_gbps_only(runner, &p2_mk, &p2_bufs, p2_grid, p2_tpg, bytes);
+    // Sum the per-pass µs (1/GBps × bytes) then convert back to GB/s.
+    let mt_perf = match (p1_perf, p2_perf) {
+        (Some(p1), Some(p2)) if p1 > 0.0 && p2 > 0.0 => {
+            let gb = bytes / 1.0e9;
+            let p1_s = gb / p1;
+            let p2_s = gb / p2;
+            Some(gb / (p1_s + p2_s))
+        },
+        _ => None,
+    };
+    let ref_perf = rk
+        .as_ref()
+        .map(|rk| {
+            let gqa = runner.buffer_i32(gqa_factor as i32);
+            let n_i32 = runner.buffer_i32(n_kv as i32);
+            let khs = runner.buffer_u64((n_kv * head_dim) as u64);
+            let kss = runner.buffer_u64(head_dim as u64);
+            let out = zeros_typed(runner, n_q_heads * head_dim, dt);
+            bench_gbps_only(
+                runner,
+                rk,
+                &[&q_buf, &k_buf, &v_buf, &out, &gqa, &n_i32, &khs, &kss, &khs, &kss, &sc_buf],
+                [n_q_heads, 1, 1],
+                [1024, 1, 1],
+                bytes,
+            )
+        })
+        .unwrap_or(None);
+
+    let label = format!(
+        "H={n_q_heads} N={n_kv} D={head_dim} gqa={gqa_factor} blocks={blocks} {}",
+        ctx.label
+    );
     vec![bench.result_sub(Some(spec.subop), label, ref_perf, mt_perf, equiv)]
 }
 

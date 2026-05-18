@@ -88,6 +88,7 @@ pub fn remap_value_ids(op: &mut Op, map: &BTreeMap<ValueId, ValueId>) {
         Op::VectorLoad { byte_offset, .. } => {
             s(byte_offset);
         },
+        Op::VectorExtract { .. } => {},
         Op::VectorStore { byte_offset, value, .. } => {
             s(byte_offset);
             s(value);
@@ -280,6 +281,7 @@ pub fn op_value_refs(op: &Op) -> Vec<ValueId> {
         Op::VectorLoad { byte_offset, .. } => {
             refs.push(*byte_offset);
         },
+        Op::VectorExtract { .. } => {},
         Op::VectorStore { byte_offset, value, .. } => {
             refs.push(*byte_offset);
             refs.push(*value);
@@ -494,6 +496,7 @@ pub fn max_vid_in_op(op: &Op) -> u32 {
         Op::VectorLoad { byte_offset, .. } => {
             push(byte_offset);
         },
+        Op::VectorExtract { .. } => {},
         Op::VectorStore { byte_offset, value, .. } => {
             push(byte_offset);
             push(value);

@@ -286,6 +286,7 @@ fn replace_values(op: &mut Op, map: &HashMap<ValueId, ValueId>) {
                 replace_values(op, map);
             },
         Op::VectorLoad { byte_offset, .. } => s(byte_offset),
+        Op::VectorExtract { .. } => {},
         Op::VectorStore { byte_offset, value, .. } => {
             s(byte_offset);
             s(value);

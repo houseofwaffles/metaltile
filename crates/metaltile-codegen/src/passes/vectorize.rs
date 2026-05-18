@@ -46,13 +46,28 @@ impl super::Pass for VectorizePass {
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
         let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
-        let params = &kernel.params;
+        let params = kernel.params.clone();
+        // Allocate fresh ValueIds starting one past the current max.
+        let max_vid = kernel
+            .body
+            .results
+            .iter()
+            .chain(kernel.blocks.values().flat_map(|b| b.results.iter()))
+            .filter_map(|r| r.map(|v| v.as_u32()))
+            .max()
+            .unwrap_or(0);
+        let mut next_vid = max_vid + 1;
+        // Snapshot kernel.body so child blocks (loop bodies) can find
+        // loop-invariant Const ops hoisted there by LICM. Without this,
+        // decompose_index falls back to (vid, 0) for index expressions
+        // whose Const operand was lifted out of the loop.
+        let body_snapshot = kernel.body.clone();
         for bid in &block_ids {
             if let Some(block) = kernel.blocks.get_mut(bid) {
-                vectorize_block(block, params);
+                vectorize_block(block, &params, Some(&body_snapshot), &mut next_vid);
             }
         }
-        vectorize_block(&mut kernel.body, params);
+        vectorize_block(&mut kernel.body, &params, None, &mut next_vid);
         Ok(())
     }
 }
@@ -61,9 +76,21 @@ impl super::Pass for VectorizePass {
 const MAX_VEC_LEN: usize = 8;
 
 #[allow(clippy::needless_range_loop)]
-fn vectorize_block(block: &mut Block, params: &[Param]) {
+fn vectorize_block(
+    block: &mut Block,
+    params: &[Param],
+    parent: Option<&Block>,
+    next_vid: &mut u32,
+) {
     let n = block.ops.len();
     let mut skip: Vec<bool> = vec![false; n];
+
+    // extract_inserts maps slot of a vectorized scalar Load →
+    // (vec_vid, lane, fresh_extract_vid, original_scalar_vid). Phase 3
+    // splices in `Op::VectorExtract` ops + records the old → new VID
+    // remap so downstream consumers reference the right lane.
+    let mut extract_inserts: BTreeMap<usize, (ValueId, u32, ValueId, Option<ValueId>)> =
+        BTreeMap::new();
 
     // Phase 1: find contiguous Load sequences.
     for i in 0..n {
@@ -88,7 +115,7 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
             }
 
             // Use structural analysis: find the (invariant_base, const_offset) for this index.
-            let (inv_base, offset) = decompose_index(block, base_vid);
+            let (inv_base, offset) = decompose_index(block, base_vid, parent);
 
             // Collect a run of loads with same src, same invariant_base, and consecutive offsets.
             let mut run_indices: Vec<usize> = vec![i];
@@ -102,7 +129,7 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
                             IndexExpr::Value(v) | IndexExpr::Range(v, _) => *v,
                             _ => break,
                         };
-                        let (next_inv, next_off) = decompose_index(block, next_base);
+                        let (next_inv, next_off) = decompose_index(block, next_base, parent);
                         if next_inv == inv_base && next_off == offset + (j - i) as i64 {
                             run_indices.push(j);
                         } else {
@@ -115,8 +142,26 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
 
             if run_indices.len() >= 2 {
                 let vlen = run_indices.len() as u32;
+                // Capture original scalar VIDs BEFORE overwriting
+                // block.results[i] so each extract can remap correctly.
+                let orig_vids: Vec<Option<ValueId>> = run_indices
+                    .iter()
+                    .map(|&idx| block.results.get(idx).and_then(|r| *r))
+                    .collect();
                 block.ops[i] =
                     Op::VectorLoad { src: src.clone(), byte_offset: base_vid, len: vlen };
+                let vec_vid = ValueId::new(*next_vid);
+                *next_vid += 1;
+                block.results[i] = Some(vec_vid);
+                for (lane, &idx) in run_indices.iter().enumerate() {
+                    let lane_u32 = lane as u32;
+                    let extract_vid = ValueId::new(*next_vid);
+                    *next_vid += 1;
+                    extract_inserts.insert(idx, (vec_vid, lane_u32, extract_vid, orig_vids[lane]));
+                }
+                // Skip ops 1..vlen (their Loads are subsumed). Slot 0
+                // keeps the VectorLoad; Phase 3 splices in a
+                // VectorExtract for lane 0 right after.
                 for &idx in run_indices[1..].iter().rev() {
                     skip[idx] = true;
                 }
@@ -146,7 +191,7 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
                 continue;
             }
 
-            let (inv_base, offset) = decompose_index(block, base_vid);
+            let (inv_base, offset) = decompose_index(block, base_vid, parent);
 
             let mut run_indices: Vec<usize> = vec![i];
             for j in (i + 1)..n.min(i + MAX_VEC_LEN) {
@@ -159,7 +204,7 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
                             IndexExpr::Value(v) | IndexExpr::Range(v, _) => *v,
                             _ => break,
                         };
-                        let (next_inv, next_off) = decompose_index(block, next_base);
+                        let (next_inv, next_off) = decompose_index(block, next_base, parent);
                         if next_inv == inv_base && next_off == offset + (j - i) as i64 {
                             run_indices.push(j);
                         } else {
@@ -189,11 +234,13 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
         }
     }
 
-    // Phase 3: rebuild the block without skipped ops.
+    // Phase 3: rebuild the block, replacing each skipped scalar Load
+    // with a VectorExtract op that pulls the right lane out of the
+    // preceding VectorLoad. Each old skipped_vid → fresh extract_vid;
+    // remap surviving op references through this map.
     let mut old_ops = std::mem::take(&mut block.ops);
     let old_results = std::mem::take(&mut block.results);
 
-    // result_remap: skipped scalar load ValueId → replacement VectorLoad ValueId.
     let mut result_remap: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     let mut new_ops: Vec<Op> = Vec::new();
     let mut new_results: Vec<Option<ValueId>> = Vec::new();
@@ -201,29 +248,38 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
     let mut i = 0usize;
     while i < n {
         if skip[i] {
+            // Skipped scalar Load (lane 1..vlen of a vectorized run) →
+            // emit only the VectorExtract here. Old scalar VID remaps
+            // to the Extract's VID.
+            if let Some((vec_vid, lane, extract_vid, orig)) = extract_inserts.remove(&i)
+                && let Some(scalar_vid) = orig
+            {
+                result_remap.insert(scalar_vid, extract_vid);
+                new_ops.push(Op::VectorExtract { vec: vec_vid, lane });
+                new_results.push(Some(extract_vid));
+            }
             i += 1;
             continue;
         }
-
-        // If this is a VectorLoad (start of a vectorized run), register the result
-        // so that subsequent code referencing the old scalar results gets the vector.
-        if let Op::VectorLoad { len, .. } = &old_ops[i] {
-            let vlen = *len as usize;
-            let first_vid = old_results[i].unwrap_or(ValueId::new(0));
-            for k in 1..vlen {
-                // The i+k load results are now subsumed by the VectorLoad result.
-                if let Some(Some(skipped_vid)) = old_results.get(i + k) {
-                    result_remap.insert(*skipped_vid, first_vid);
-                }
-            }
-        }
-
+        // Keep the original op at this slot.
         new_ops.push(std::mem::replace(&mut old_ops[i], Op::Const { value: 0 }));
         new_results.push(old_results[i]);
+        // If this slot was the START of a vectorized run, splice in a
+        // VectorExtract for lane 0 right after the VectorLoad. The
+        // VectorLoad's own result VID was reassigned in Phase 1 to
+        // `vec_vid` — old scalar VID for Load 0 lives in `orig`.
+        if let Some((vec_vid, lane, extract_vid, orig)) = extract_inserts.remove(&i)
+            && let Some(scalar_vid) = orig
+        {
+            result_remap.insert(scalar_vid, extract_vid);
+            new_ops.push(Op::VectorExtract { vec: vec_vid, lane });
+            new_results.push(Some(extract_vid));
+        }
         i += 1;
     }
 
-    // Remap value references in surviving ops.
+    // Remap value references in surviving ops (each skipped scalar
+    // Load's VID now points at its dedicated VectorExtract output).
     for op in new_ops.iter_mut() {
         remap_values_in_op(op, &result_remap);
     }
@@ -236,14 +292,18 @@ fn vectorize_block(block: &mut Block, params: &[Param]) {
 ///
 /// If the index is defined by `BinOp(Add, base, Const(k))`, returns `(base, k)`.
 /// Otherwise returns `(vid, 0)` — treating the index itself as the base with offset 0.
-fn decompose_index(block: &Block, vid: ValueId) -> (ValueId, i64) {
+///
+/// `parent` is the kernel body when `block` is a child (loop) block — LICM
+/// hoists loop-invariant `Const` ops up to the parent, so we must consult
+/// it as a fallback when looking up the Const operand of an Add.
+fn decompose_index(block: &Block, vid: ValueId, parent: Option<&Block>) -> (ValueId, i64) {
     for (i, op) in block.ops.iter().enumerate() {
         if block.results.get(i) == Some(&Some(vid)) {
             if let Op::BinOp { op: BinOpKind::Add, lhs, rhs } = op {
-                if let Some(k) = find_const_in_block(block, *rhs) {
+                if let Some(k) = find_const(block, parent, *rhs) {
                     return (*lhs, k);
                 }
-                if let Some(k) = find_const_in_block(block, *lhs) {
+                if let Some(k) = find_const(block, parent, *lhs) {
                     return (*rhs, k);
                 }
             }
@@ -251,6 +311,11 @@ fn decompose_index(block: &Block, vid: ValueId) -> (ValueId, i64) {
         }
     }
     (vid, 0)
+}
+
+/// Find an Op::Const for `vid` — current block first, then `parent`.
+fn find_const(block: &Block, parent: Option<&Block>, vid: ValueId) -> Option<i64> {
+    find_const_in_block(block, vid).or_else(|| parent.and_then(|p| find_const_in_block(p, vid)))
 }
 
 /// Check if a ValueId is defined by an Op::Const in this block.
@@ -313,6 +378,9 @@ fn remap_values_in_op(op: &mut Op, remap: &BTreeMap<ValueId, ValueId>) {
             for sub in ops.iter_mut() {
                 remap_values_in_op(sub, remap);
             },
+        Op::VectorExtract { vec, .. } => {
+            s(vec);
+        },
         _ => {},
     }
 }

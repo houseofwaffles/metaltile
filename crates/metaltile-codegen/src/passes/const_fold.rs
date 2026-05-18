@@ -265,6 +265,7 @@ fn replace_value_in_op(op: &mut Op, old: ValueId, new: ValueId) {
             s(byte_offset);
             s(value);
         },
+        Op::VectorExtract { vec, .. } => s(vec),
         Op::StrideReduce { offset, stride, end, .. } => {
             s(offset);
             s(stride);
@@ -435,6 +436,7 @@ fn collect_uses(op: &Op, used: &mut BTreeSet<ValueId>) {
             add(*byte_offset);
             add(*value);
         },
+        Op::VectorExtract { vec, .. } => add(*vec),
         Op::StrideReduce { offset, stride, end, .. } => {
             add(*offset);
             add(*stride);

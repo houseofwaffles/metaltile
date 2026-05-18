@@ -536,6 +536,14 @@ impl MslGenerator {
                     }
                 },
 
+                Op::VectorExtract { vec, lane } => {
+                    let v = self.vname(vid, block, extra_names);
+                    let src = self.vname(Some(*vec), block, extra_names);
+                    // Use array-index syntax — Metal vec types support
+                    // operator[] returning scalar of the element type.
+                    wl!(out, "{pad}auto {v} = {src}[{lane}];");
+                },
+
                 // ---- vectorised data movement ---------------------------
                 Op::VectorLoad { src, byte_offset, len } => {
                     let v = self.vname(vid, block, extra_names);

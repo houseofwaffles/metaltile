@@ -543,6 +543,10 @@ pub enum Op {
         value: ValueId,
     },
 
+    /// Project one scalar lane (0..len) out of a VectorLoad result.
+    /// Emitted by VectorizePass to feed each original scalar consumer.
+    VectorExtract { vec: ValueId, lane: u32 },
+
     /// Gather: indexed load from a buffer. `out[i] = src[indices[i]]`.
     Gather { src: String, indices: ValueId, axis: u32 },
 
@@ -1069,6 +1073,9 @@ impl Op {
                     byte_offset.as_u32(),
                     value.as_u32()
                 )
+            },
+            Op::VectorExtract { vec, lane } => {
+                write!(f, "VectorExtract(v{}, lane={lane})", vec.as_u32())
             },
             Op::Gather { src, indices, axis } => {
                 write!(f, "Gather({src}, v{}, axis={axis})", indices.as_u32())

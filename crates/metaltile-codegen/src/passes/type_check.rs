@@ -288,6 +288,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::FusedElementwise { .. } => "FusedElementwise",
         Op::VectorLoad { .. } => "VectorLoad",
         Op::VectorStore { .. } => "VectorStore",
+        Op::VectorExtract { .. } => "VectorExtract",
         Op::Gather { .. } => "Gather",
         Op::Scatter { .. } => "Scatter",
         Op::Atomic { .. } => "Atomic",
@@ -600,6 +601,7 @@ fn infer_block(
             | Op::Store { .. }
             | Op::VectorLoad { .. }
             | Op::VectorStore { .. }
+            | Op::VectorExtract { .. }
             | Op::If { .. }
             | Op::ExpandDims { .. }
             | Op::Reshape { .. }

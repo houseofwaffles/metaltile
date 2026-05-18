@@ -37,6 +37,7 @@ proc-macro2 = "1"
 darling = "0.23"
 thiserror = "2"
 smallvec = { version = "1", features = ["serde"] }
+rustc-hash = "2"
 bytemuck = "1"
 half = "2"
 parking_lot = "0.12"
@@ -48,3 +49,12 @@ inventory = "0.3"
 
 # Test-only
 trybuild = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true

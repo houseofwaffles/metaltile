@@ -16,6 +16,9 @@ metaltile-codegen.workspace = true
 metaltile-runtime.workspace = true
 inventory.workspace = true
 
+[dev-dependencies]
+half.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-metal = { version = "0.3", features = [

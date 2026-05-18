@@ -8,8 +8,10 @@
 
 pub mod autotune;
 pub mod buffer;
+pub mod capture;
 pub mod context;
 pub mod error;
 
-pub use context::{Context, DispatchResult};
+pub use capture::{start_gpu_trace, stop_gpu_trace};
+pub use context::{Context, DispatchResult, DispatchSpec, ResidentBuffer};
 pub use error::MetalTileError;

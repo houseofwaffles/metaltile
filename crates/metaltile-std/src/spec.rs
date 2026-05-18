@@ -275,6 +275,21 @@ pub enum BenchDispatch {
         batch: usize,
         tpg: usize,
     },
+    /// Two-pass decode SDPA. Mirrors `sdpa_decode_2pass_pass1` +
+    /// `sdpa_decode_2pass_pass2`. The `BenchSpec` carries pass1; this
+    /// variant carries pass2's name + IR getter so a single
+    /// `inventory::submit!` describes the whole chained dispatch.
+    /// MLX reference is single-pass `sdpa_vector` at the same shape.
+    SdpaVector2Pass {
+        head_dim: usize,
+        n_kv: usize,
+        n_q_heads: usize,
+        gqa_factor: usize,
+        batch: usize,
+        blocks: usize,
+        pass2_kernel_name: &'static str,
+        pass2_kernel_ir: fn(DType) -> Kernel,
+    },
     /// Tiled simdgroup GEMM (steel_gemm_fused).
     SteelGemm {
         m: usize,
@@ -305,7 +320,8 @@ impl BenchDispatch {
             | BenchDispatch::QuantizedMatVec { .. }
             | BenchDispatch::Attention { .. }
             | BenchDispatch::AffineQuantize { .. }
-            | BenchDispatch::SdpaVector { .. } => KernelMode::Reduction,
+            | BenchDispatch::SdpaVector { .. }
+            | BenchDispatch::SdpaVector2Pass { .. } => KernelMode::Reduction,
             BenchDispatch::Random { .. }
             | BenchDispatch::FpQuantized { .. }
             | BenchDispatch::AffineDequantize { .. } => KernelMode::Elementwise,
