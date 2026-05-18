@@ -55,11 +55,13 @@ jobs:
             --ignore-filename-regex '(crates/metaltile/src/(lib|prelude)\.rs|crates/metaltile-std/src/(ffai|mlx)/.*\.rs|tests/|benches/|build\.rs)'
 
       - name: Upload to Codecov
+        # No `token:` — this is a public repo, so `codecov-action@v5`
+        # uploads tokenlessly via GitHub OIDC. `fail_ci_if_error: false`
+        # keeps codecov outages from blocking PRs.
         uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.json
-          fail_ci_if_error: false   # don't block PRs on codecov outages
+          fail_ci_if_error: false
           verbose: true
 
       - name: Coverage summary in job log
