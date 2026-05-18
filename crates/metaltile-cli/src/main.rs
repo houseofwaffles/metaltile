@@ -85,6 +85,11 @@ struct BuildArgs {
     /// xcrun SDK (default: macosx)
     #[arg(long = "sdk", default_value = "macosx")]
     sdk: String,
+    /// Run the standard pass pipeline 25× per kernel and print per-pass
+    /// median wall_us instead of emitting MSL (after 5 warmup iters).
+    /// Inherits `--filter` and `--dtypes`.
+    #[arg(long = "time-passes", short = 't')]
+    time_passes: bool,
 }
 
 // ── Inspect ──────────────────────────────────────────────────────────────

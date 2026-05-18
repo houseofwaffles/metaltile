@@ -26,6 +26,7 @@ use std::{
 use metaltile_codegen::{
     emit::{self, compile_metallib, dtype_suffix, write_manifest, write_msl, write_swift_wrappers},
     generator_for_mode,
+    passes::{PassStats, PipelineBuilder, run_passes_with_stats},
 };
 use metaltile_core::ir::Kernel;
 use metaltile_std::{
@@ -54,6 +55,11 @@ pub fn run(args: &BuildArgs) {
     let emit_arg = &args.emit;
     let out_arg = &args.out;
     let sdk = &args.sdk;
+
+    if args.time_passes {
+        run_time_passes(filter.as_deref(), dtypes_arg.as_deref());
+        return;
+    }
 
     let emit_kinds: BTreeSet<EmitKind> = match emit_arg.as_deref() {
         None => BTreeSet::new(),
@@ -442,4 +448,91 @@ fn check_metal_compile(msl: &str, kernel_name: &str) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn check_metal_compile(_msl: &str, _kernel_name: &str) -> Result<(), String> {
     Ok(()) // Skip Metal compile-check on non-macOS.
+}
+
+// ── --time-passes ────────────────────────────────────────────────────────
+
+const TIME_PASSES_WARMUP: usize = 5;
+const TIME_PASSES_ITERS: usize = 25;
+
+/// Run the standard pass pipeline `TIME_PASSES_ITERS` times over the
+/// filtered `BenchSpec × dtype` corpus and print per-pass median wall_us
+/// (after `TIME_PASSES_WARMUP` discarded warmup iters).
+///
+/// Output schema matches `rustc -Z time-passes`-style tables:
+/// `pass_name  median_total_us  median_per_kernel_us`.
+fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) {
+    let dtypes_filter: Option<Vec<DType>> =
+        dtypes_arg.map(|s| s.split(',').filter_map(|t| t.trim().parse::<DType>().ok()).collect());
+
+    let kernels: Vec<_> = inventory::iter::<BenchSpec>()
+        .filter(|s| matches_filter(filter, s.kernel_name))
+        .flat_map(|s| {
+            s.dtypes
+                .iter()
+                .filter(|dt| dtypes_filter.as_ref().is_none_or(|df| df.contains(dt)))
+                .map(|&dt| (s.kernel_ir)(dt))
+        })
+        .collect();
+
+    if kernels.is_empty() {
+        eprintln!(
+            "  {} no kernels matched filter",
+            paint_stderr("error:", Style::new().fg(Color::Red).bold()),
+        );
+        std::process::exit(1);
+    }
+
+    let pipeline = PipelineBuilder::standard().build();
+    let total_iters = TIME_PASSES_WARMUP + TIME_PASSES_ITERS;
+    let mut pass_names: Vec<String> = Vec::new();
+    let mut samples: Vec<Vec<u64>> = Vec::new();
+
+    for iter in 0..total_iters {
+        let mut pass_totals: Vec<u64> = Vec::new();
+        for k in &kernels {
+            let mut kc = k.clone();
+            let stats: Vec<PassStats> = match run_passes_with_stats(&mut kc, &pipeline) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if pass_totals.is_empty() {
+                pass_totals = vec![0u64; stats.len()];
+                if pass_names.is_empty() {
+                    pass_names = stats.iter().map(|s| s.name.clone()).collect();
+                    samples = vec![Vec::with_capacity(TIME_PASSES_ITERS); pass_names.len()];
+                }
+            }
+            for (i, s) in stats.iter().enumerate() {
+                pass_totals[i] += s.wall_us;
+            }
+        }
+        if iter >= TIME_PASSES_WARMUP {
+            for (i, t) in pass_totals.iter().enumerate() {
+                samples[i].push(*t);
+            }
+        }
+    }
+
+    let n_kernels = kernels.len() as f64;
+    println!(
+        "{} {}",
+        paint_stdout("tile build --time-passes", Style::new().fg(Color::Cyan).bold()),
+        paint_stdout(
+            format!(
+                "· {} kernels × {} iters ({} warmup)",
+                kernels.len(),
+                TIME_PASSES_ITERS,
+                TIME_PASSES_WARMUP,
+            ),
+            Style::new().fg(Color::BrightBlack),
+        ),
+    );
+    println!("  {:<24}  {:>14}  {:>18}", "pass", "median_us", "median_us/kernel");
+    for (i, name) in pass_names.iter().enumerate() {
+        samples[i].sort_unstable();
+        let median = samples[i][samples[i].len() / 2];
+        let per_kernel = median as f64 / n_kernels;
+        println!("  {name:<24}  {median:>14}  {per_kernel:>18.1}");
+    }
 }
