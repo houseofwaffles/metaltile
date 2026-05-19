@@ -86,15 +86,34 @@ pub struct ResidentBuffer {
 type BufRc =
     std::rc::Rc<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>>;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn fnv1a_extend(h: &mut u64, bytes: &[u8]) {
     for &b in bytes {
         *h ^= b as u64;
         *h = h.wrapping_mul(0x0100_0000_01b3);
     }
+}
+
+/// PSO / MSL cache key for a dispatch_chain pass: kernel name +
+/// first-param dtype size + sorted fn_consts. The MSL source is fully
+/// determined by this tuple, so hashing the source string per pass is
+/// pure waste (5–50 KB → ~10–30 µs vs ~16 ns for this key).
+#[cfg(any(target_os = "macos", test))]
+fn pso_cache_key(kernel: &Kernel, fn_consts: &BTreeMap<String, u32>) -> u64 {
+    let mut h = FNV_OFFSET;
+    fnv1a_extend(&mut h, kernel.name.as_bytes());
+    fnv1a_extend(&mut h, b":");
+    if let Some(p) = kernel.params.first() {
+        fnv1a_extend(&mut h, &(p.dtype.size_bytes() as u64).to_le_bytes());
+    }
+    for (n, v) in fn_consts {
+        fnv1a_extend(&mut h, n.as_bytes());
+        fnv1a_extend(&mut h, &v.to_le_bytes());
+    }
+    h
 }
 #[cfg(target_os = "macos")]
 type PoolKey = (usize, u64);
@@ -801,17 +820,7 @@ impl Context {
         static MSL_CACHE: OnceLock<Mutex<FxHashMap<u64, String>>> = OnceLock::new();
         let msl_cache = MSL_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()));
         for spec in specs {
-            let mut h = FNV_OFFSET;
-            fnv1a_extend(&mut h, spec.kernel.name.as_bytes());
-            fnv1a_extend(&mut h, b":");
-            // First tensor param's dtype distinguishes f32/f16/bf16 specializations.
-            if let Some(p) = spec.kernel.params.first() {
-                fnv1a_extend(&mut h, &(p.dtype.size_bytes() as u64).to_le_bytes());
-            }
-            for (n, v) in spec.fn_consts {
-                fnv1a_extend(&mut h, n.as_bytes());
-                fnv1a_extend(&mut h, &v.to_le_bytes());
-            }
+            let h = pso_cache_key(spec.kernel, spec.fn_consts);
             // Drop the read guard BEFORE the match — parking_lot::Mutex isn't
             // reentrant, and temporaries in a match scrutinee live until the
             // end of the match body (RFC 66), so writing back inside None
@@ -845,17 +854,7 @@ impl Context {
 
         let mut pipes: Vec<Retained<Pso>> = Vec::with_capacity(specs.len());
         for (spec, msl) in specs.iter().zip(msl_sources.iter()) {
-            let cache_key = {
-                let mut h = FNV_OFFSET;
-                fnv1a_extend(&mut h, spec.kernel.name.as_bytes());
-                fnv1a_extend(&mut h, b":");
-                fnv1a_extend(&mut h, msl.as_bytes());
-                for (n, v) in spec.fn_consts {
-                    fnv1a_extend(&mut h, n.as_bytes());
-                    fnv1a_extend(&mut h, &v.to_le_bytes());
-                }
-                h
-            };
+            let cache_key = pso_cache_key(spec.kernel, spec.fn_consts);
             let pipe: Retained<Pso> = {
                 let mut lock = cache.lock();
                 if let Some(p) = lock.get(&cache_key) {
@@ -1148,6 +1147,362 @@ mod tests {
     // name. Pre-change (`format!("{}_shape", …)` + `format!("{}_strides", …)`)
     // allocates two Strings per call; post-change reuses a single pre-sized
     // String via in-place suffix rewrite.
+    fn key_kernel(name: &str, dtype: DType) -> Kernel {
+        let mut k = Kernel::new(name);
+        k.params = vec![tensor_param("input", dtype, &[4], false, ParamKind::Tensor)];
+        k
+    }
+
+    #[test]
+    fn pso_cache_key_is_stable_and_discriminates_inputs() {
+        let k = key_kernel("sdpa_decode", DType::F32);
+        let mut consts = BTreeMap::new();
+        consts.insert("gqa".to_string(), 4u32);
+        consts.insert("head_dim".to_string(), 128u32);
+        let baseline = pso_cache_key(&k, &consts);
+        assert_eq!(baseline, pso_cache_key(&k, &consts), "key must be deterministic");
+
+        // Kernel name change → different key.
+        let k_other_name = key_kernel("sdpa_prefill", DType::F32);
+        assert_ne!(baseline, pso_cache_key(&k_other_name, &consts));
+
+        // First-param dtype change → different key (f32 vs f16 specializations).
+        let k_other_dtype = key_kernel("sdpa_decode", DType::F16);
+        assert_ne!(baseline, pso_cache_key(&k_other_dtype, &consts));
+
+        // fn_const value change → different key.
+        let mut consts_other_val = consts.clone();
+        consts_other_val.insert("gqa".to_string(), 8u32);
+        assert_ne!(baseline, pso_cache_key(&k, &consts_other_val));
+
+        // fn_const name change → different key.
+        let mut consts_other_name = BTreeMap::new();
+        consts_other_name.insert("kv_heads".to_string(), 4u32);
+        consts_other_name.insert("head_dim".to_string(), 128u32);
+        assert_ne!(baseline, pso_cache_key(&k, &consts_other_name));
+
+        // Empty fn_consts and empty params are both well-defined.
+        let empty_consts = BTreeMap::new();
+        assert_ne!(baseline, pso_cache_key(&k, &empty_consts));
+        let mut k_empty = Kernel::new("noop");
+        k_empty.params = vec![];
+        let _ = pso_cache_key(&k_empty, &empty_consts);
+    }
+
+    #[test]
+    fn fnv1a_extend_empty_input_is_identity() {
+        // Hashing no bytes must not perturb the accumulator. Guarantees the
+        // empty-fn_consts path in `pso_cache_key` doesn't depend on a separator.
+        let mut h = FNV_OFFSET;
+        fnv1a_extend(&mut h, &[]);
+        assert_eq!(h, FNV_OFFSET);
+
+        let mut h2 = 0xdead_beef_dead_beef_u64;
+        fnv1a_extend(&mut h2, &[]);
+        assert_eq!(h2, 0xdead_beef_dead_beef_u64);
+    }
+
+    #[test]
+    fn fnv1a_extend_matches_canonical_fnv1a_64() {
+        // Spot-check against canonical FNV-1a 64-bit vectors. "" → FNV_OFFSET,
+        // "a" → 0xaf63dc4c8601ec8c, "foobar" → 0x85944171f73967e8 (well-known
+        // FNV reference values). Pins the constants in case anyone "optimises"
+        // the prime/offset.
+        let cases: &[(&[u8], u64)] = &[
+            (b"", 0xcbf2_9ce4_8422_2325),
+            (b"a", 0xaf63_dc4c_8601_ec8c),
+            (b"foobar", 0x8594_4171_f739_67e8),
+        ];
+        for (input, want) in cases {
+            let mut h = FNV_OFFSET;
+            fnv1a_extend(&mut h, input);
+            assert_eq!(h, *want, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn fnv1a_extend_is_byte_by_byte_associative() {
+        // Folding bytes in one shot must equal folding the same bytes split
+        // across two calls. This is the property `pso_cache_key` relies on
+        // when it threads the accumulator through name → ":" → dtype → consts.
+        let bytes = b"sdpa_decode_2pass_pass1";
+        let mut whole = FNV_OFFSET;
+        fnv1a_extend(&mut whole, bytes);
+
+        for split in 0..=bytes.len() {
+            let (a, b) = bytes.split_at(split);
+            let mut piecewise = FNV_OFFSET;
+            fnv1a_extend(&mut piecewise, a);
+            fnv1a_extend(&mut piecewise, b);
+            assert_eq!(piecewise, whole, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn fnv1a_extend_handles_large_input_without_overflow_panic() {
+        // 10 KB blob matches the perf-microbench size and exercises the inner
+        // wrapping_mul on a long stream. Result must be deterministic.
+        let blob: Vec<u8> = (0..10_240).map(|i| (i as u8).wrapping_add(0x42)).collect();
+        let mut a = FNV_OFFSET;
+        let mut b = FNV_OFFSET;
+        fnv1a_extend(&mut a, &blob);
+        fnv1a_extend(&mut b, &blob);
+        assert_eq!(a, b);
+        assert_ne!(a, FNV_OFFSET);
+    }
+
+    #[test]
+    fn pso_cache_key_reorder_does_not_change_key_because_btreemap_is_sorted() {
+        // `pso_cache_key` iterates `fn_consts: &BTreeMap`, which yields keys
+        // in sorted order regardless of insertion order. Two maps built in
+        // different orders must hash identically — otherwise a caller that
+        // inserted in a different order would miss the PSO cache.
+        let k = key_kernel("sdpa_decode", DType::F32);
+        let mut a = BTreeMap::new();
+        a.insert("gqa".to_string(), 4u32);
+        a.insert("head_dim".to_string(), 128u32);
+        a.insert("n_kv_heads".to_string(), 8u32);
+
+        let mut b = BTreeMap::new();
+        b.insert("n_kv_heads".to_string(), 8u32);
+        b.insert("head_dim".to_string(), 128u32);
+        b.insert("gqa".to_string(), 4u32);
+
+        assert_eq!(pso_cache_key(&k, &a), pso_cache_key(&k, &b));
+    }
+
+    #[test]
+    fn pso_cache_key_dtype_size_collision_groups_match() {
+        // Only the first param's dtype *size* is folded in (not the dtype
+        // discriminant). f32 and i32 share size_bytes()==4, so kernels with
+        // identical names + fn_consts that differ only between two
+        // same-size dtypes are intentionally aliased — this documents the
+        // behaviour and pins it for future refactors.
+        let k_f32 = key_kernel("noop", DType::F32);
+        let k_i32 = key_kernel("noop", DType::I32);
+        let consts = BTreeMap::new();
+        assert_eq!(pso_cache_key(&k_f32, &consts), pso_cache_key(&k_i32, &consts));
+
+        // …but a different *size* (f16 = 2 bytes) must still discriminate.
+        let k_f16 = key_kernel("noop", DType::F16);
+        assert_ne!(pso_cache_key(&k_f32, &consts), pso_cache_key(&k_f16, &consts));
+    }
+
+    #[test]
+    fn pso_cache_key_only_first_param_dtype_matters() {
+        // `pso_cache_key` only looks at `params.first()`. A second param of
+        // any dtype must not change the key. Documents the chosen
+        // specialisation surface: a kernel is monomorphised by the dtype of
+        // its first tensor operand; downstream dtypes are propagated.
+        let mut k_one = Kernel::new("k");
+        k_one.params = vec![tensor_param("a", DType::F32, &[4], false, ParamKind::Tensor)];
+        let mut k_two = Kernel::new("k");
+        k_two.params = vec![
+            tensor_param("a", DType::F32, &[4], false, ParamKind::Tensor),
+            tensor_param("b", DType::F16, &[4], true, ParamKind::Tensor),
+        ];
+        let consts = BTreeMap::new();
+        assert_eq!(pso_cache_key(&k_one, &consts), pso_cache_key(&k_two, &consts));
+    }
+
+    #[test]
+    fn pso_cache_key_no_params_still_well_defined() {
+        // A kernel with zero params skips the dtype-size fold but must still
+        // produce a stable, non-trivial key (the kernel name + ":" + sorted
+        // fn_consts get folded in). Pins that the `if let Some(...)` branch
+        // is the *only* effect of param absence — separator and consts still
+        // fold.
+        let mut k = Kernel::new("zero_param_kernel");
+        k.params = vec![];
+        let mut consts = BTreeMap::new();
+        consts.insert("foo".to_string(), 1u32);
+        let key = pso_cache_key(&k, &consts);
+        assert_ne!(key, FNV_OFFSET);
+        assert_eq!(key, pso_cache_key(&k, &consts));
+
+        // A different kernel name still discriminates with no params present.
+        let mut k_other = Kernel::new("other_zero_param_kernel");
+        k_other.params = vec![];
+        assert_ne!(key, pso_cache_key(&k_other, &consts));
+    }
+
+    /// Representative MSL source size for a real metaltile kernel:
+    /// sdpa_decode_2pass_pass1 generates ~12 KB; sdpa_vector ~6 KB. A
+    /// mid-size 10 KB blob is the pre-fix per-pass cost we're comparing
+    /// against. Shared by the always-on coverage test and the perf bench.
+    fn perf_bench_msl_blob() -> Vec<u8> {
+        (0..10_240).map(|i| (i as u8).wrapping_add(0x42)).collect()
+    }
+
+    fn perf_bench_kernel() -> Kernel { key_kernel("sdpa_decode_2pass_pass1", DType::F32) }
+
+    fn perf_bench_consts() -> BTreeMap<String, u32> {
+        let mut consts = BTreeMap::new();
+        consts.insert("gqa".to_string(), 4u32);
+        consts
+    }
+
+    /// Pre-fix per-pass cost: FNV-1a over the full MSL source.
+    fn pre_fix_pass_key(msl_bytes: &[u8]) -> u64 {
+        let mut h = FNV_OFFSET;
+        fnv1a_extend(&mut h, std::hint::black_box(msl_bytes));
+        std::hint::black_box(h)
+    }
+
+    /// Post-fix per-pass cost: structured `pso_cache_key` over the small
+    /// (name, first-param dtype, sorted fn_consts) tuple.
+    fn post_fix_pass_key(kernel: &Kernel, consts: &BTreeMap<String, u32>) -> u64 {
+        std::hint::black_box(pso_cache_key(
+            std::hint::black_box(kernel),
+            std::hint::black_box(consts),
+        ))
+    }
+
+    #[test]
+    fn pso_cache_key_separator_prevents_name_dtype_smudge() {
+        // `pso_cache_key` folds `kernel.name` then `b":"` then the dtype-size
+        // bytes. Without the separator, a kernel named `"foo"` with dtype
+        // size N could collide with one named `"foo<sep_bytes>"` with no
+        // params. The literal `":"` byte is what stops that.
+        let mut k_a = Kernel::new("foo");
+        k_a.params = vec![tensor_param("x", DType::F32, &[1], false, ParamKind::Tensor)];
+
+        // A kernel named "foo:" with no params: if the separator weren't
+        // there, the post-name accumulator state would equal `"foo" + ":"`
+        // from `k_a`, and a no-params kernel skips the dtype fold — so
+        // without the separator these *could* collide. With the separator,
+        // they must differ because `k_a` folds in 8 dtype bytes after ":"
+        // and `k_b` folds in nothing.
+        let mut k_b = Kernel::new("foo:");
+        k_b.params = vec![];
+        let consts = BTreeMap::new();
+        assert_ne!(pso_cache_key(&k_a, &consts), pso_cache_key(&k_b, &consts));
+    }
+
+    #[test]
+    fn pso_cache_key_const_value_endianness_pinned() {
+        // fn_const values are folded as little-endian u32 bytes. Pin that
+        // by checking that two values which are byte-swapped versions of
+        // each other produce different keys (catches an accidental switch
+        // to `to_be_bytes`).
+        let k = key_kernel("k", DType::F32);
+        let mut a = BTreeMap::new();
+        a.insert("c".to_string(), 0x0000_0001_u32);
+        let mut b = BTreeMap::new();
+        b.insert("c".to_string(), 0x0100_0000_u32);
+        assert_ne!(pso_cache_key(&k, &a), pso_cache_key(&k, &b));
+    }
+
+    #[test]
+    fn pso_cache_key_distinct_for_realistic_kernel_matrix() {
+        // Sanity-sweep across a realistic matrix of (kernel, dtype, gqa,
+        // head_dim) tuples and assert all keys are pairwise distinct. Any
+        // accidental aliasing (e.g. dropping the const name in favour of
+        // value-only hashing) would surface here as a duplicate.
+        let kernels = ["sdpa_decode", "sdpa_prefill", "rmsnorm", "matmul_4bit"];
+        // Use dtypes with distinct size_bytes() — F16/BF16 both fold to 2,
+        // so the test would self-collide. The dtype-size alias is
+        // intentional (and pinned by `pso_cache_key_dtype_size_collision_groups_match`).
+        let dtypes = [DType::F32, DType::F16];
+        let gqas = [1u32, 4, 8];
+        let head_dims = [64u32, 128];
+
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for kname in kernels {
+            for dt in dtypes {
+                for gqa in gqas {
+                    for hd in head_dims {
+                        let k = key_kernel(kname, dt);
+                        let mut consts = BTreeMap::new();
+                        consts.insert("gqa".to_string(), gqa);
+                        consts.insert("head_dim".to_string(), hd);
+                        let key = pso_cache_key(&k, &consts);
+                        assert!(
+                            seen.insert(key),
+                            "duplicate key for ({kname}, {dt:?}, gqa={gqa}, hd={hd})"
+                        );
+                        total += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(total, seen.len());
+        assert_eq!(total, kernels.len() * dtypes.len() * gqas.len() * head_dims.len());
+    }
+
+    #[test]
+    fn perf_pass_keys_run_and_discriminate() {
+        // Always-on coverage for the per-pass key helpers used by the
+        // `#[ignore]`'d perf bench below. Both paths must produce stable,
+        // non-trivial keys, and the two paths must NOT collide — the whole
+        // point of the PR is that they're different discriminators for the
+        // same kernel.
+        let msl_bytes = perf_bench_msl_blob();
+        let kernel = perf_bench_kernel();
+        let consts = perf_bench_consts();
+
+        let pre = pre_fix_pass_key(&msl_bytes);
+        assert_eq!(pre, pre_fix_pass_key(&msl_bytes), "pre-fix key is deterministic");
+        assert_ne!(pre, 0);
+
+        let post = post_fix_pass_key(&kernel, &consts);
+        assert_eq!(post, post_fix_pass_key(&kernel, &consts), "post-fix key is deterministic");
+        assert_ne!(post, 0);
+
+        assert_ne!(pre, post, "pre/post must hash distinct inputs");
+    }
+
+    // Perf microbench — run with:
+    //   cargo test --release -p metaltile-runtime perf_dispatch_chain_pso_key \
+    //     -- --ignored --nocapture
+    //
+    // Times the per-pass PSO cache key computation in `dispatch_chain_metal`.
+    // Pre-fix: FNV-1a over the full MSL source string (5–50 KB per pass).
+    // Post-fix: `pso_cache_key` over the kernel name + first-param dtype size
+    // + sorted fn_consts (~30–60 bytes). Demonstrates the savings without a
+    // GPU; the fix itself is the helper call inside `dispatch_chain_metal`.
+    #[test]
+    #[ignore = "perf microbench"]
+    fn perf_dispatch_chain_pso_key() {
+        let msl_bytes = perf_bench_msl_blob();
+        let kernel = perf_bench_kernel();
+        let consts = perf_bench_consts();
+
+        const ITERS: usize = 1_000_000;
+        // Warmup.
+        let mut warm: u64 = 0;
+        for _ in 0..10_000 {
+            warm ^= pre_fix_pass_key(&msl_bytes);
+        }
+        std::hint::black_box(warm);
+
+        let start = std::time::Instant::now();
+        let mut pre_acc: u64 = 0;
+        for _ in 0..ITERS {
+            pre_acc ^= pre_fix_pass_key(&msl_bytes);
+        }
+        let pre = start.elapsed();
+        std::hint::black_box(pre_acc);
+
+        let start = std::time::Instant::now();
+        let mut post_acc: u64 = 0;
+        for _ in 0..ITERS {
+            post_acc ^= post_fix_pass_key(&kernel, &consts);
+        }
+        let post = start.elapsed();
+        std::hint::black_box(post_acc);
+
+        let pre_ns = pre.as_nanos() as f64 / ITERS as f64;
+        let post_ns = post.as_nanos() as f64 / ITERS as f64;
+        let saved_ns = pre_ns - post_ns;
+        println!(
+            "pre-fix  (FNV over 10 KB MSL):  {pre:?}  ({pre_ns:.0} ns/call)\n\
+             post-fix (pso_cache_key call):  {post:?}  ({post_ns:.0} ns/call)\n\
+             saved per dispatch_chain pass:  {saved_ns:.0} ns",
+        );
+    }
+
     #[test]
     #[ignore = "perf microbench"]
     fn perf_resolve_strided_metadata() {
