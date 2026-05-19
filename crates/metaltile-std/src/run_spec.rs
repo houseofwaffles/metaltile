@@ -2064,10 +2064,22 @@ fn run_sdpa_prefill(
     let q_len_buf = runner.buffer_u32(q_len as u32);
     let k_len_buf = runner.buffer_u32(k_len as u32);
     let gqa_buf = runner.buffer_u32(gqa_factor as u32);
+    let n_q_heads_buf = runner.buffer_u32(n_q_heads as u32);
+    let n_kv_heads_buf = runner.buffer_u32(n_kv_heads as u32);
     let sc_buf = runner.buffer_f32_scalar(scale);
 
-    let mt_bufs: Vec<&GpuBuffer> =
-        vec![&q_buf, &k_buf, &v_buf, &mt_out_buf, &q_len_buf, &k_len_buf, &gqa_buf, &sc_buf];
+    let mt_bufs: Vec<&GpuBuffer> = vec![
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &mt_out_buf,
+        &q_len_buf,
+        &k_len_buf,
+        &gqa_buf,
+        &n_q_heads_buf,
+        &n_kv_heads_buf,
+        &sc_buf,
+    ];
     // Grid = (q_tiles, n_q_heads, batch); one TG per Q-tile × head × batch.
     let q_tiles = q_len / bq;
     runner.measure(&mk, &mt_bufs, [q_tiles, n_q_heads, batch], [tpg, 1, 1], 0, 1);

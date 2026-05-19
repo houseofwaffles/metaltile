@@ -70,6 +70,8 @@ pub fn mt_sdpa_prefill_mma_bf16<T>(
     #[constexpr] q_len: u32,
     #[constexpr] k_len: u32,
     #[constexpr] gqa_factor: u32,
+    #[constexpr] n_q_heads: u32,
+    #[constexpr] n_kv_heads: u32,
     #[constexpr] scale: f32,
 ) {
     let q_tile = tgid_x;
@@ -79,7 +81,6 @@ pub fn mt_sdpa_prefill_mma_bf16<T>(
     let lane = simd_lane;
     let sg = simd_group_id();
     let lane_in_tg = sg * 32u32 + lane;
-    let _ = batch;
 
     // ── 8×8 frag lane mapping (Apple steel_gemm layout) ──
     let qid = lane / 4u32;
@@ -94,8 +95,11 @@ pub fn mt_sdpa_prefill_mma_bf16<T>(
     let q_len_off = k_len - q_len;
     let scale_log2 = scale * 1.4426950408889634f32;
 
-    let kv_row_base = kv_head * k_len * head_dim;
-    let q_head_row_off = q_head * q_len * head_dim;
+    // Batched-prefill layout: q/out [batch, n_q_heads, q_len, head_dim],
+    // k/v [batch, n_kv_heads, k_len, head_dim]. Single-batch B=1
+    // collapses to the original `(kv|q_head) * len * head_dim` form.
+    let kv_row_base = batch * n_kv_heads * k_len * head_dim + kv_head * k_len * head_dim;
+    let q_head_row_off = batch * n_q_heads * q_len * head_dim + q_head * q_len * head_dim;
     let q_tile_first = q_tile * bq + sg * bq_sg;
     let q_row_base = q_head_row_off + q_tile_first * head_dim;
 
