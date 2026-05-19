@@ -17,7 +17,7 @@ help: ## show this help
 # ─── Setup ────────────────────────────────────────────────────────────
 .PHONY: setup
 setup: ## one-time dev environment setup (toolchains, deps, first build)
-	./scripts/setup-dev.sh
+	./.github/scripts/setup-dev.sh
 
 # ─── Build ────────────────────────────────────────────────────────────
 .PHONY: build
