@@ -17,6 +17,15 @@
 //! consecutive Q/K/V quartiles, the dot-product across `head_dim`
 //! reduces via `simd_sum`, and the V accumulator stays in 4 thread-
 //! local f32 registers throughout the n_kv walk.
+//!
+//! `ffai/sdpa_decode.rs` is a sibling kernel with the same dispatch +
+//! reduction shape but extra FFAI-specific surface
+//! (`kv_stride`, `heads_per_group`, `sink_end`, `window_start`). The
+//! split is deliberate: this file's charter is a 1:1 MLX port for the
+//! `tile bench` head-to-head, so additions that diverge from MLX's
+//! `sdpa_vector` template live in `ffai/`. Bandwidth fixes that apply
+//! to both should be ported across — see the `tg_out` occupancy fix
+//! in PR #43 for the precedent.
 
 use metaltile::{bench_kernel, kernel};
 
