@@ -345,7 +345,7 @@ fn mt_moe_unpermute_shuffled_inv_perm_f32() {
     let expert_outputs: Vec<f32> =
         (0..total * hidden).map(|i| ((i as f32 * 0.11) % 9.0) - 4.5).collect();
     // Deterministic shuffled permutation.
-    let inv_perm: Vec<u32> = (0..total as u32).map(|i| (total as u32 - 1 - i)).collect();
+    let inv_perm: Vec<u32> = (0..total as u32).map(|i| total as u32 - 1 - i).collect();
     let raw_weights: Vec<f32> = (0..n_rows * k).map(|i| 0.5 + (i as f32 * 0.07)).collect();
     let mut weights = vec![0.0f32; n_rows * k];
     for row in 0..n_rows {
@@ -540,13 +540,13 @@ fn mt_moe_router_topk_nan_inf_clamp_f32() {
     // Row 3: mix of NaN + +Inf
     let mut logits = vec![0.0f32; n_rows * n_experts];
     for j in 0..n_experts {
-        logits[0 * n_experts + j] = j as f32 * 0.1;
-        logits[1 * n_experts + j] = j as f32 * 0.1;
+        logits[j] = j as f32 * 0.1;
+        logits[n_experts + j] = j as f32 * 0.1;
         logits[2 * n_experts + j] = j as f32 * 0.1;
         logits[3 * n_experts + j] = j as f32 * 0.1;
     }
-    logits[0 * n_experts + 5] = f32::NAN;
-    logits[1 * n_experts + 7] = f32::INFINITY;
+    logits[5] = f32::NAN;
+    logits[n_experts + 7] = f32::INFINITY;
     logits[2 * n_experts + 3] = f32::NEG_INFINITY;
     logits[3 * n_experts + 2] = f32::NAN;
     logits[3 * n_experts + 11] = f32::INFINITY;
@@ -566,7 +566,7 @@ fn mt_moe_router_topk_nan_inf_clamp_f32() {
     }
 
     // INVARIANT 2: row 1 picks +Inf at index 7 as the top entry.
-    assert_eq!(gpu_idx[1 * k], 7, "row 1: +Inf should be top-1, got {:?}", &gpu_idx[k..2 * k]);
+    assert_eq!(gpu_idx[k], 7, "row 1: +Inf should be top-1, got {:?}", &gpu_idx[k..2 * k]);
 
     // INVARIANT 3: row 2 does NOT pick -Inf at index 3 (it's worse than 0.0).
     let row2_slice = &gpu_idx[2 * k..3 * k];

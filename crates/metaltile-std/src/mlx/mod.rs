@@ -39,6 +39,7 @@ pub mod softmax;
 pub mod sort;
 pub mod steel;
 pub mod strided;
+pub mod swiglu;
 pub mod ternary;
 pub mod unary;
 
