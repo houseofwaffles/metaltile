@@ -2015,10 +2015,17 @@ fn string_lit_from_expr(expr: &Expr) -> String {
     String::new()
 }
 
-/// Extract a usize literal from an optional expression like `9`.
+/// Extract a usize literal from an optional expression like `9` or `9u32`.
+/// Unwraps `Expr::Group` (the invisible delimiter `macro_rules!` wraps
+/// captured fragments in) so callers like `threadgroup_alloc!(..., $size)`
+/// see the underlying integer literal rather than the Group wrapping.
 fn usize_lit_from_expr(expr: Option<&Expr>) -> usize {
     let Some(expr) = expr else { return 0 };
-    if let Expr::Lit(lit) = expr
+    let unwrapped: &Expr = match expr {
+        Expr::Group(g) => &g.expr,
+        other => other,
+    };
+    if let Expr::Lit(lit) = unwrapped
         && let syn::Lit::Int(n) = &lit.lit
     {
         return n.base10_parse::<usize>().unwrap_or(0);
