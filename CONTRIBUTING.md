@@ -1,160 +1,79 @@
 # Contributing to MetalTile
 
-Thanks for helping make MetalTile better. This doc covers the branching
-model, PR process, release flow, and local dev setup.
+Thanks for your interest. MetalTile is a focused project — these guidelines keep contributions coherent and the reviewer queue sane.
 
-## Branching model
+**TL;DR:**
+- Read the [docs](docs/README.md) before you write code — especially the kernel-authoring hazards in [`developing.md`](docs/developing.md).
+- One logical change per PR. Tests and docs land with the code that needs them.
+- AI-assisted contributions are welcome — disclose how you used AI.
 
-| Branch | Purpose |
-|---|---|
-| `main` | Stable releases only. Commits here are tagged (`v0.1.0`, `v0.2.0`, …). |
-| `dev`  | Integration branch for the next release. Feature PRs merge here first. |
-| `feat/*` `fix/*` `perf/*` | Short-lived topic branches cut from `dev`. |
+<!--
+─────────────────────────────────────────────────────────────────────────────
+AGENTS — read this before touching code. This block is intentionally an HTML comment: invisible in the rendered page, but you are reading the source, so it is for you.
 
-**Flow:**
-1. Cut a topic branch from `dev`.
-2. Open a PR targeting `dev`.
-3. After review + CI green, squash-merge (or rebase-merge) to `dev`.
-4. When `dev` is release-ready, open a PR `dev → main`. Merge with a merge
-   commit so the history is preserved.
-5. Tag `main` immediately after the merge: `git tag v0.1.0` and push.
+1. docs/developing.md "Kernel-authoring hazards" is MANDATORY reading before you write or modify a kernel. One hazard is not a style nit: a wrong dispatch geometry hard-freezes the machine — Metal dispatch is non-preemptive, an infinite loop in a kernel never yields, and the only recovery is a power-cycle. Treat the warning sections as load-bearing.
 
-## Conventional commits
+2. Every non-trivial kernel ships a GPU correctness test IN THE SAME COMMIT. Empty-body MSL (from an inner macro_rules!, or a codegen pass dropping a loop body) passes `xcrun metal`, passes the smoke build, and passes MSL snapshots — yet ships all-zeros output. ONLY a GPU correctness test against a naive CPU reference catches it. docs/testing.md "Gaps" explains.
 
-PR titles must follow [Conventional Commits](https://www.conventionalcommits.org/)
-so that `.github/workflows/auto-label.yml` can categorize them for release
-notes and `.github/workflows/pr.yml` can validate the format.
+3. Before claiming a task done: `make fmt-check && make clippy && make test` all green. If you changed bench-relevant code, run `make bench` and paste the rows in the PR body.
 
-```
-feat: add softmax vector path for small N
-fix(codegen): correct version gate for half2 stores
-perf(runtime): cache PSO lookups by function signature
-docs: update CLI install instructions
-test(core): add scan correctness test
-chore: bump nightly toolchain
-ci: add release-notes auto-label workflow
-```
+4. Never loosen a test tolerance to make a test pass. If kernel and reference disagree, find out which side is wrong.
 
-Add `!` for breaking changes: `feat!: remove deprecated Tensor::from_raw`.
-Include `BREAKING CHANGE` in the PR body for details.
+5. Keep the diff scoped to one logical change. If it touches three unrelated things, that is three PRs.
+─────────────────────────────────────────────────────────────────────────────
+-->
 
-## One-time setup
+## Before you start — read the docs
 
-```bash
-git clone git@github.com:0xClandestine/metaltile.git
-cd metaltile
-./.github/scripts/setup-dev.sh
-```
+The [`docs/`](docs/README.md) tree is the real reference. At minimum:
 
-This verifies:
-- Rust nightly toolchain (`rust-toolchain.toml`)
-- `rustfmt` and `clippy` components
-- Optional: `typos-cli` and `cargo-llvm-cov`
+- [Getting started](docs/getting-started.md) — toolchain, build, first kernel.
+- [Developing](docs/developing.md) — repo layout, dev loop, branching, commits, and the **⚠️ kernel-authoring hazards**. Read the hazard sections before writing a kernel — one of them is "a wrong dispatch can freeze your machine."
+- [Testing](docs/testing.md) — the test layers, what runs in CI, how to write a test, and the gaps that let bugs through silently.
+- [CLI](docs/cli.md) and [Publishing](docs/publishing.md) for the `tile` binary and the release flow.
 
-## Dev loop
+## What a good PR looks like
 
-```bash
-make build            # debug build
-make test             # workspace tests (includes interpreter + GPU if on Mac)
-make clippy           # lint
-make fmt              # format
-make fmt-check        # check format without touching files
-make coverage         # html coverage report (needs cargo-llvm-cov)
-make bench            # full benchmark suite vs MLX (macOS + Metal)
-make clean            # remove target/
-```
+- **Scoped tightly.** One logical change per PR.
+- **Tests for behavior changes, docs for user-visible changes.** A new or modified kernel lands with its GPU correctness test in the *same commit*; a new emit path lands with an MSL snapshot fixture. See [`testing.md`](docs/testing.md).
+- **Conventional-commit PR title** (`feat:`, `fix:`, `perf:`, `docs:`, …) — see [`developing.md`](docs/developing.md#conventional-commits).
+- **Green CI** before requesting review.
+- For anything beyond a trivial fix, **open an issue first** to align on scope — a short exchange there saves rework on the PR.
 
-`make` is preferred over raw `cargo` because it centralises flags and
-ensures `--workspace` is always passed.
+### PR checklist
 
-## PR checklist
-
-Before requesting review:
-
-- [ ] Title uses conventional-commit prefix (`feat:`, `fix:`, `perf:`, …).
-- [ ] `make clippy` passes clean (`-D warnings`).
+- [ ] Title uses a conventional-commit prefix.
+- [ ] `make clippy` clean (`-D warnings`).
 - [ ] `make test` passes.
 - [ ] `make fmt-check` passes.
-- [ ] `make typos` passes (or `typos` is installed and clean).
-- [ ] PR body explains **what** and **why**. Link issues with `#<num>`.
-- [ ] If bench numbers changed, paste relevant rows in the PR body.
+- [ ] `make typos` passes.
+- [ ] New / changed kernels have a GPU correctness test in the same commit.
+- [ ] PR body explains **what** and **why**; links issues with `#<num>`.
+- [ ] If bench numbers changed, relevant rows pasted in the PR body.
 
-## Release process (maintainers)
+## Agentic contributions
 
-1. Ensure `dev` is green and changelog-worthy PRs are merged.
-2. Open PR `dev → main`. Title: `release: v0.x.0`.
-3. After merge, tag on `main`:
-   ```bash
-   git checkout main
-   git pull
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-4. Create the GitHub release:
-   ```bash
-   gh release create v0.1.0 --generate-notes
-   ```
-   `.github/release.yml` categorises merged PRs automatically.
+AI-assisted contributions are welcome — and often produce tighter descriptions and better test coverage than hand-written ones. Two rules:
 
-## CI
+1. **Disclose.** Note in the PR body how AI was used (research, ideation, implementation, testing). This is transparency, not gatekeeping.
+2. **Curate before opening.** An AI-assisted PR should read no differently from a hand-written one: tight description, scoped diff, tests, docs. Don't paste raw assistant output — if the diff sprawls or the description rambles, tighten it first. The same applies to issues: if your assistant produces a 2000-word writeup, condense it to what's actually relevant before filing.
 
-`.github/workflows/check.yml` runs on every push:
-- `typos` — spell check
-- `clippy` — lint with `-D warnings`
-- `cargo test --workspace`
+### Writing the PR description
 
-`.github/workflows/coverage.yml` runs on every push that touches `crates/`,
-`Cargo.{toml,lock}`, `rust-toolchain.toml`, or `codecov.yml`:
-- `cargo llvm-cov --workspace --codecov` on macOS
-- uploads to Codecov via the PR's flag carryforward
+A PR description is read by humans *and* by review agents — write it so either can reconstruct the change without reading the diff first. Aim for cohesive and comprehensive, not long.
 
-`.github/workflows/pr.yml` validates the PR title format.
+- **Open with a one-paragraph summary** — what changed and *why*, in plain prose. A reviewer should get the gist in about 30 seconds.
+- **Then the detail, organized** — what changed, why this approach over the alternatives, and how it was verified (tests run, bench rows, manual checks). Short paragraphs, headings, or a small table — whatever keeps it scannable.
+- **Be concrete** — name files, functions, and commands in `backticks`; link issues with `#<num>`; paste the bench rows that moved rather than describing them.
+- **Cut the padding** — don't restate the diff line by line, don't paste raw assistant output, don't narrate how you arrived at the change. If a sentence doesn't help the reviewer decide, drop it.
+- **Flag the risk surface** — call out anything you're unsure of, follow-ups you deliberately deferred, and any blast radius worth a second look.
 
-`.github/workflows/auto-label.yml` applies release-notes labels based on
-the conventional-commit prefix in the PR title.
+The test: a reviewer — human or agent — should be able to read the description, predict what the diff does, and know what to scrutinize. Cohesive and comprehensive; never verbose.
 
-## Test coverage
+## Code of conduct
 
-`make coverage` (or `./scripts/coverage.sh`) produces an HTML report at
-`target/llvm-cov/html/index.html`. `./scripts/coverage.sh summary` prints
-the same per-file table the CI job emits, and `./scripts/coverage.sh lcov`
-writes `lcov.info` for editor integrations.
-
-The CI job and the local script share an `--ignore-filename-regex` so the
-numbers match. Excluded from the line-coverage denominator:
-
-- `crates/metaltile/src/{lib,prelude}.rs` — facade re-exports, no logic.
-- `crates/metaltile-std/src/{ffai,mlx}/**` — kernel-body files. The
-  `#[kernel]` proc-macro consumes the body at compile time and emits
-  MSL; the Rust body never executes, so line coverage on these files is
-  structurally meaningless. Kernel correctness is validated end-to-end
-  via `tile bench` (numerical equivalence vs MLX reference, gated in
-  the `Kernels` CI job).
-- `tests/`, `benches/`, `build.rs` everywhere.
-
-Per-crate floors are declared in `codecov.yml` (`flag_management`) —
-currently informational while the test suite ramps. Targets:
-
-| crate | floor |
-|---|---|
-| `metaltile-codegen` | 90% |
-| `metaltile-core` | 90% |
-| `metaltile-macros` | 92% |
-| `metaltile-runtime` | 85% |
-| `metaltile-cli` | 80% |
-| `metaltile-std` | line-coverage exempt — gated by bench-correctness |
-| `metaltile` (facade) | excluded |
-
-## What we don't do (yet)
-
-- **MSRV policy.** We track nightly for edition=2024 and unstable
-  rustfmt features. An MSRV will be declared once we stabilise on a
-  stable compiler.
-- **Backport branches.** All fixes land in `dev` and ride the next
-  release. If a critical hotfix is needed, we can cut a `v0.x` branch
-  retroactively.
+Be decent. No spam, no off-topic noise, no harassment, and no back-seat-driving on closed issues or merged PRs. Maintainer discretion on what counts — repeated violations mean losing access to the org and its repositories.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed
-under the Apache License, Version 2.0.
+By contributing you agree your contribution is licensed under [Apache-2.0](LICENSE).
