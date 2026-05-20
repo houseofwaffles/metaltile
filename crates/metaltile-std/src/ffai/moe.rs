@@ -291,3 +291,73 @@ inventory::submit! {
         kernel_mode: Some(KernelMode::Reduction),
     }
 }
+
+// ── mt_moe_permute ───────────────────────────────────────────────────────
+//
+// Gather tokens into per-expert contiguous buffers given a pre-computed
+// sort permutation. The expensive sort step (argsort over top-k expert
+// indices) is done by the caller — typically CPU-side via Rust sort,
+// or via a future sort kernel. This kernel is just the data-movement
+// half: each output position copies the row indicated by sort_token_idx.
+//
+// Inputs:
+//   tokens          — [B*T, hidden]      activations to gather
+//   sort_token_idx  — [k * B*T]          for each permuted position p,
+//                                        which original token row sourced it.
+//                                        Caller computes via argsort over
+//                                        top-k indices flattened to
+//                                        (token * k + slot) → token (this is
+//                                        the "permute" direction; the inverse
+//                                        is `inv_perm` consumed by unpermute).
+//   permuted        — [k * B*T, hidden]  expert-sorted output. Each k*B*T
+//                                        row corresponds to one (expert, token)
+//                                        pair; consecutive rows with the same
+//                                        expert form that expert's input slab.
+//
+// Constexpr:
+//   hidden — model hidden dim
+//
+// Geometry:
+//   tpg=128  (split hidden across 128 lanes, ceil(hidden/128) iters)
+//   grid=[k*B*T, 1, 1]
+//
+// Per-permuted-row cost: hidden / 128 = 16 loads + 16 stores (at
+// hidden=2048). Bandwidth-bound — no FMAs, just a vector copy.
+#[kernel]
+pub fn mt_moe_permute<T>(
+    tokens: Tensor<T>,
+    sort_token_idx: Tensor<u32>,
+    mut permuted: Tensor<T>,
+    #[constexpr] hidden: u32,
+) {
+    let permuted_pos = tgid_x;
+    let lane = tid;
+    let token = load(sort_token_idx[permuted_pos]);
+    let src_base = token * hidden;
+    let dst_base = permuted_pos * hidden;
+
+    let n_per_lane = (hidden + 127u32) / 128u32;
+    for r in range(0u32, n_per_lane, 1u32) {
+        let h = r * 128u32 + lane;
+        if h < hidden {
+            let v = load(tokens[src_base + h]);
+            store(permuted[dst_base + h], v);
+        }
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "moe",
+        subop: "permute",
+        kernel_name: "mt_moe_permute",
+        kernel_ir: mt_moe_permute::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 0.0, // exact copy — no numerical drift
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}

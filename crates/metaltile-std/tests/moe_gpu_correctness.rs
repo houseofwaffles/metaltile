@@ -15,7 +15,7 @@ mod common;
 use common::gpu_lock;
 use metaltile_core::dtype::DType;
 use metaltile_runtime::Context;
-use metaltile_std::ffai::moe::{mt_moe_router_topk, mt_moe_unpermute};
+use metaltile_std::ffai::moe::{mt_moe_permute, mt_moe_router_topk, mt_moe_unpermute};
 
 #[allow(clippy::too_many_arguments)]
 fn run_topk(
@@ -591,4 +591,128 @@ fn mt_moe_router_topk_nan_inf_clamp_f32() {
         !row3_slice.contains(&2u32),
         "row 3: NaN at idx 2 should not be chosen, got {row3_slice:?}"
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_permute(
+    ctx: &Context,
+    dtype: DType,
+    tokens_bytes: &[u8],
+    sort_token_idx: &[u32],
+    n_rows: usize,
+    n_permuted: usize,
+    hidden: usize,
+    elem_bytes: usize,
+) -> Vec<u8> {
+    let mut buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    buffers.insert("tokens".into(), tokens_bytes.to_vec());
+    buffers.insert(
+        "sort_token_idx".into(),
+        sort_token_idx.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    );
+    buffers.insert("permuted".into(), vec![0u8; n_permuted * hidden * elem_bytes]);
+    buffers.insert("hidden".into(), (hidden as u32).to_le_bytes().to_vec());
+    let _ = n_rows; // n_rows not passed to kernel — derived from input shape via sort idx
+
+    let mut kernel = mt_moe_permute::kernel_ir_for(dtype);
+    kernel.mode = metaltile_core::ir::KernelMode::Reduction;
+    let result = ctx
+        .dispatch_with_grid(&kernel, &buffers, &BTreeMap::new(), [n_permuted, 1, 1], [128, 1, 1])
+        .expect("dispatch_with_grid should succeed");
+    result.outputs.get("permuted").expect("permuted").clone()
+}
+
+#[test]
+fn mt_moe_permute_gather_matches_cpu_reference_f32() {
+    // Forward MoE permute: gather tokens by per-position source-token index.
+    // Caller (host) computes sort_token_idx via argsort over flat
+    // (token, slot) pairs by expert; this kernel does just the gather.
+    let n_rows = 4usize;
+    let hidden = 128usize;
+    let k = 4usize;
+    let n_permuted = n_rows * k;
+
+    let tokens: Vec<f32> = (0..n_rows * hidden).map(|i| ((i as f32 * 0.11) % 9.0) - 4.5).collect();
+    // Sort index: each token contributes k times to permuted, but
+    // shuffled. Use a deterministic permutation that doesn't equal
+    // identity so we can't accidentally pass via "kernel copies row i to
+    // row i" bug.
+    let sort_token_idx: Vec<u32> =
+        (0..n_permuted as u32).map(|p| (p * 7 + 3) % n_rows as u32).collect();
+
+    // CPU reference.
+    let mut ref_out = vec![0.0f32; n_permuted * hidden];
+    for p in 0..n_permuted {
+        let src = sort_token_idx[p] as usize;
+        ref_out[p * hidden..(p + 1) * hidden]
+            .copy_from_slice(&tokens[src * hidden..(src + 1) * hidden]);
+    }
+
+    let tokens_bytes: Vec<u8> = tokens.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let _g = gpu_lock();
+    let ctx = Context::new().unwrap();
+    let out_bytes = run_permute(
+        &ctx,
+        DType::F32,
+        &tokens_bytes,
+        &sort_token_idx,
+        n_rows,
+        n_permuted,
+        hidden,
+        4,
+    );
+    let gpu_out: Vec<f32> =
+        out_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    // Permute is an exact copy — should match byte-for-byte at f32.
+    for (i, (g, r)) in gpu_out.iter().zip(ref_out.iter()).enumerate() {
+        assert_eq!(g, r, "permute[{i}]: {g} != {r}");
+    }
+}
+
+#[test]
+fn mt_moe_permute_qwen3_moe_shape_f16() {
+    // Production-shape pin: Qwen3-MoE hidden=2048, B*T=8 tokens, k=8
+    // active experts per token → 64 permuted positions.
+    let n_rows = 8usize;
+    let hidden = 2048usize;
+    let k = 8usize;
+    let n_permuted = n_rows * k;
+
+    let tokens_f32: Vec<f32> =
+        (0..n_rows * hidden).map(|i| ((i as f32 * 0.013) % 5.0) - 2.5).collect();
+    let sort_token_idx: Vec<u32> =
+        (0..n_permuted as u32).map(|p| (p * 13 + 5) % n_rows as u32).collect();
+
+    let mut ref_out_f32 = vec![0.0f32; n_permuted * hidden];
+    for p in 0..n_permuted {
+        let src = sort_token_idx[p] as usize;
+        for h in 0..hidden {
+            // Round through f16 since the kernel stores f16 values.
+            ref_out_f32[p * hidden + h] =
+                half::f16::from_f32(tokens_f32[src * hidden + h]).to_f32();
+        }
+    }
+
+    let tokens_bytes: Vec<u8> =
+        tokens_f32.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
+    let _g = gpu_lock();
+    let ctx = Context::new().unwrap();
+    let out_bytes = run_permute(
+        &ctx,
+        DType::F16,
+        &tokens_bytes,
+        &sort_token_idx,
+        n_rows,
+        n_permuted,
+        hidden,
+        2,
+    );
+    let gpu_out: Vec<f32> = out_bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect();
+    for (i, (g, r)) in gpu_out.iter().zip(ref_out_f32.iter()).enumerate() {
+        // f16 round-trip — exact match expected (kernel doesn't compute).
+        assert_eq!(g, r, "permute[{i}]: {g} != {r}");
+    }
 }
