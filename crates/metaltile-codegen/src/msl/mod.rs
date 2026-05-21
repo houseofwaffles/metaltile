@@ -113,6 +113,17 @@ impl MslGenerator {
             wl!(out);
             wl!(out, "#include <metal_simdgroup_matrix>");
         }
+        // MetalPerformancePrimitives (NAX / `mpp::tensor_ops::matmul2d`) — only
+        // available on macOS 26+ / Metal 4. Gated on a kernel-level feature flag
+        // detected from `Op::InlineMsl` sources that mention `mpp::`. Emits a
+        // version guard so older targets fall through cleanly at compile time.
+        if feat.needs_mpp {
+            wl!(out);
+            wl!(out, "#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400");
+            wl!(out, "#include <metal_simdgroup>");
+            wl!(out, "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>");
+            wl!(out, "#endif");
+        }
         self.emit_activation_helpers(&feat, &mut out);
         wl!(out);
         self.emit_kernel(k, &feat, &type_env, &mut out)?;
@@ -970,6 +981,53 @@ mod tests {
         assert!(
             !msl.contains("(threadgroup"),
             "device-scope atomic must NOT emit a threadgroup cast: {msl}"
+        );
+    }
+
+    /// `needs_mpp` triggers the MetalPerformancePrimitives include when an
+    /// `Op::InlineMsl` body references `mpp::`. Detection lives in
+    /// `KernelFeatures` (see `msl/features.rs:33`); the preamble emits the
+    /// header gated on Metal 4 so older toolchains still link.
+    #[test]
+    fn mpp_preamble_emits_when_inline_msl_contains_mpp() {
+        let mut k = Kernel::new("mpp_smoke");
+        k.mode = KernelMode::Reduction;
+        k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+        k.body.push_op_no_result(Op::InlineMsl {
+            source: "mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;"
+                .to_string(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        let msl = MslGenerator::default().generate(&k).unwrap();
+        assert!(
+            msl.contains("#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>"),
+            "MPP include must appear when InlineMsl body references `mpp::`: {msl}"
+        );
+        assert!(
+            msl.contains("__METAL_VERSION__ >= 400"),
+            "MPP include must be gated on Metal 4: {msl}"
+        );
+    }
+
+    /// `needs_mpp` stays off when no `Op::InlineMsl` body references `mpp::`.
+    /// Forcing the include unconditionally would break older toolchains that
+    /// don't ship the MPP header.
+    #[test]
+    fn mpp_preamble_omitted_when_no_mpp_marker() {
+        let mut k = Kernel::new("no_mpp");
+        k.mode = KernelMode::Reduction;
+        k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+        // InlineMsl body present but no `mpp::` token anywhere.
+        k.body.push_op_no_result(Op::InlineMsl {
+            source: "float x = 1.0;".to_string(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        let msl = MslGenerator::default().generate(&k).unwrap();
+        assert!(
+            !msl.contains("MetalPerformancePrimitives"),
+            "MPP include must NOT appear when InlineMsl has no `mpp::` marker: {msl}"
         );
     }
 }

@@ -29,6 +29,11 @@ pub(super) struct KernelFeatures {
     pub needs_erfinv: bool,
     pub needs_expm1: bool,
     pub needs_simd_product: bool,
+    /// MetalPerformancePrimitives (`mpp::tensor_ops::matmul2d` / NAX) needed.
+    /// Detected by scanning `Op::InlineMsl::source` for `"mpp::"` — kernels
+    /// using NAX-class MMA must include the framework header. Requires
+    /// macOS 26+ / Metal 4 toolchain.
+    pub needs_mpp: bool,
 }
 
 impl MslGenerator {
@@ -48,6 +53,7 @@ impl MslGenerator {
             needs_erfinv: false,
             needs_expm1: false,
             needs_simd_product: false,
+            needs_mpp: false,
         };
         for p in &kernel.params {
             if p.dtype == DType::BF16 {
@@ -141,6 +147,20 @@ impl MslGenerator {
                 for inner in ops {
                     self.analyze_op(inner, feat);
                 },
+            // Detect MPP tensor-ops usage in raw inline MSL — escape-hatch
+            // for kernels that call `mpp::tensor_ops::matmul2d` / NAX.
+            // Forces the codegen preamble to include the framework header.
+            // TODO: replace the substring scan with a typed `Op::MppMatMul2d`
+            // IR variant once shape/dtype params are parametric across MPP
+            // kernels (tracked as a follow-up). The current scan is fragile
+            // (false-positive on a comment containing `mpp::`).
+            Op::InlineMsl { source, .. } if source.contains("mpp::") => {
+                feat.needs_mpp = true;
+                // MPP MMA is simdgroup-cooperative — pulls in the same
+                // simd built-ins as the simdgroup_matrix path.
+                feat.needs_simd_lane = true;
+                feat.needs_simd_group = true;
+            },
             _ => {},
         }
     }
