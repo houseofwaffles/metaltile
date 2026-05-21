@@ -14,6 +14,7 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// A single autotune configuration: tile sizes, thread layout, etc.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +128,7 @@ impl Autotuner {
     pub fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
 
     /// Get the best known config, or trigger tuning.
+    #[tracing::instrument(skip(self, constexprs), fields(key = %_kernel_name))]
     pub fn get_or_tune(
         &mut self,
         _kernel_name: &str,
@@ -143,6 +145,7 @@ impl Autotuner {
         }
 
         if let Some(entry) = self.cache.lookup(constexprs) {
+            debug!("autotune cache hit");
             return Some(entry.best_config.clone());
         }
 

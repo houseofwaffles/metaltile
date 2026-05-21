@@ -342,6 +342,7 @@ impl Context {
         let has_metal = cfg!(target_os = "macos");
         let chip_family = detect_apple_family();
         let tuner = Autotuner::new(Autotuner::default_cache_dir(), has_metal);
+        tracing::info!(has_metal, chip_family = ?chip_family, "runtime context initialized");
         Ok(Context { tuner, has_metal, chip_family })
     }
 
@@ -366,6 +367,7 @@ impl Context {
     /// Like `dispatch_with_buffers` but also binds Metal function constants (for rope and similar
     /// kernels that use `[[function_constant(N)]]` annotations).
     /// `fn_consts` maps constant name → u32 value.
+    #[tracing::instrument(skip(self, kernel, buffers, fn_consts), fields(kernel = %kernel.name))]
     pub fn dispatch_with_options(
         &self,
         kernel: &Kernel,
@@ -389,6 +391,7 @@ impl Context {
     /// `grid_groups` is the number of threadgroups along each axis;
     /// `threads_per_group` is the size of each threadgroup. Both are
     /// `[x, y, z]`.
+    #[tracing::instrument(skip(self, kernel, buffers, fn_consts), fields(kernel = %kernel.name))]
     pub fn dispatch_with_grid(
         &self,
         kernel: &Kernel,
@@ -484,6 +487,7 @@ impl Context {
             let mut lock =
                 cache.lock().map_err(|_| MetalTileError::LockPoisoned("PSO/MSL cache".into()))?;
             if let Some(cached) = lock.get(&cache_key) {
+                tracing::debug!(kernel = %kernel.name, "pso cache hit");
                 cached.clone()
             } else {
                 let lib = dev
@@ -528,6 +532,7 @@ impl Context {
                         reason: format!("{e:?}"),
                     })?;
                 lock.insert(cache_key, pso.clone());
+                tracing::debug!(kernel = %kernel.name, "pso cache miss — compiled");
                 pso
             }
         };
@@ -645,6 +650,12 @@ impl Context {
                 }),
             },
         };
+        tracing::debug!(
+            kernel = %kernel.name,
+            groups_x = tgs.width, groups_y = tgs.height, groups_z = tgs.depth,
+            tpg_x = tpg.width, tpg_y = tpg.height, tpg_z = tpg.depth,
+            "dispatch"
+        );
         enc.dispatchThreadgroups_threadsPerThreadgroup(tgs, tpg);
         (*enc).endEncoding();
         (*cb).commit();
@@ -688,6 +699,7 @@ impl Context {
     /// alloc + memcpy. The buffer stays GPU-resident as long as any
     /// clone of the [`ResidentBuffer`] exists; on the last drop it
     /// returns to the pool.
+    #[tracing::instrument(skip(self, bytes), fields(bytes = bytes.len()))]
     pub fn upload_resident(&self, bytes: &[u8]) -> Result<ResidentBuffer, MetalTileError> {
         #[cfg(target_os = "macos")]
         {
@@ -737,6 +749,7 @@ impl Context {
     /// For a 2-pass SDPA decode this replaces two separate cmd-buffer
     /// commits + a ~MB-sized host memcpy of `partial_o/m/l` with one
     /// commit and zero host traffic between passes.
+    #[tracing::instrument(skip(self, specs), fields(spec_count = specs.len()))]
     pub fn dispatch_chain(
         &self,
         specs: &[DispatchSpec<'_>],
@@ -855,9 +868,13 @@ impl Context {
                 .get(&h)
                 .cloned();
             let msl = match cached {
-                Some(m) => m,
+                Some(m) => {
+                    tracing::trace!(kernel = %spec.kernel.name, "msl cache hit");
+                    m
+                },
                 None => {
                     let generated = MslGenerator::default().generate(spec.kernel)?;
+                    tracing::trace!(kernel = %spec.kernel.name, bytes = generated.len(), "msl generated");
                     msl_cache
                         .lock()
                         .map_err(|_| MetalTileError::LockPoisoned("PSO/MSL cache".into()))?
@@ -891,6 +908,7 @@ impl Context {
                     .lock()
                     .map_err(|_| MetalTileError::LockPoisoned("PSO/MSL cache".into()))?;
                 if let Some(p) = lock.get(&cache_key) {
+                    tracing::debug!(kernel = %spec.kernel.name, "pso cache hit");
                     p.clone()
                 } else {
                     let src = NSString::from_str(msl);
@@ -936,6 +954,7 @@ impl Context {
                             reason: format!("{e:?}"),
                         })?;
                     lock.insert(cache_key, pso.clone());
+                    tracing::debug!(kernel = %spec.kernel.name, "pso cache miss — compiled");
                     pso
                 }
             };
@@ -1023,6 +1042,13 @@ impl Context {
                 }
             }
             let (g, t) = (spec.grid_groups, spec.threads_per_group);
+            tracing::debug!(
+                kernel = %spec.kernel.name,
+                pass = i,
+                groups_x = g[0], groups_y = g[1], groups_z = g[2],
+                tpg_x = t[0], tpg_y = t[1], tpg_z = t[2],
+                "chain pass dispatch"
+            );
             enc.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize { width: g[0], height: g[1], depth: g[2] },
                 MTLSize { width: t[0], height: t[1], depth: t[2] },
@@ -1037,6 +1063,7 @@ impl Context {
             per_spec_bufs.push(bufs);
         }
 
+        tracing::debug!(spec_count = specs.len(), "chain dispatch committed");
         (*cb).commit();
         (*cb).waitUntilCompleted();
 

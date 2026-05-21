@@ -34,6 +34,7 @@ impl super::Pass for TypeCheckPass {
     fn name(&self) -> &str { "type_check" }
 
     fn run(&self, kernel: &mut Kernel) -> crate::error::Result<()> {
+        tracing::trace!("type_check pass");
         run_inner(kernel).map_err(crate::error::Error::Core)
     }
 }

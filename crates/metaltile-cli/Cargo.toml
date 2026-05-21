@@ -26,3 +26,5 @@ serde_json.workspace = true
 clap.workspace = true
 anstyle = "1"
 anstream = "1"
+tracing.workspace = true
+tracing-subscriber.workspace = true

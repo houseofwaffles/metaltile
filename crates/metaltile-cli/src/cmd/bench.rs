@@ -24,6 +24,8 @@ use crate::{
 };
 
 pub fn run(args: &BenchArgs) -> Result<(), crate::CliError> {
+    let _span =
+        tracing::info_span!("bench", filter = ?args.filter, verbose = args.verbose).entered();
     let json_out = &args.json;
     let filter = &args.filter;
     let verbose = args.verbose;
@@ -118,6 +120,9 @@ pub fn run(args: &BenchArgs) -> Result<(), crate::CliError> {
                 if matches_filter(filter.as_deref(), spec.op) {
                     matched_filter = true;
                     for &dt in spec.dtypes {
+                        let _kspan =
+                            tracing::debug_span!("kernel", op = spec.op, dtype = %dt).entered();
+                        tracing::debug!(op = spec.op, dtype = %dt, "running benchmark");
                         runner.flush_slc();
                         all.extend(run_spec(spec, &runner, dt));
                     }

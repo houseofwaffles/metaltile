@@ -72,6 +72,7 @@ impl MslGenerator {
     pub fn new(config: MslConfig) -> Self { MslGenerator { config } }
 
     /// Like [`generate`] but also returns per-pass statistics.
+    #[tracing::instrument(skip(self, kernel), fields(kernel = %kernel.name))]
     pub fn generate_with_stats(&self, kernel: &Kernel) -> Result<(String, Vec<passes::PassStats>)> {
         let mut k = kernel.clone();
         let stats = passes::run_passes_with_stats(&mut k, &passes::standard_pipeline())?;
@@ -79,6 +80,7 @@ impl MslGenerator {
         Ok((msl, stats))
     }
 
+    #[tracing::instrument(skip(self, kernel), fields(kernel = %kernel.name))]
     pub fn generate(&self, kernel: &Kernel) -> Result<String> {
         // Run the optimization pipeline on a clone before emitting.
         let mut k = kernel.clone();
@@ -97,6 +99,7 @@ impl MslGenerator {
     }
 
     fn emit_msl(&self, k: &Kernel) -> Result<String> {
+        tracing::debug!(kernel = %k.name, "starting MSL emit");
         let type_env = infer_types(k)?;
         let feat = self.analyze(k);
         let mut out = String::new();
@@ -113,6 +116,7 @@ impl MslGenerator {
         self.emit_activation_helpers(&feat, &mut out);
         wl!(out);
         self.emit_kernel(k, &feat, &type_env, &mut out)?;
+        tracing::debug!(kernel = %k.name, bytes = out.len(), "MSL emit complete");
         Ok(out)
     }
 

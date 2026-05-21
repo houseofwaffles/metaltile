@@ -26,9 +26,17 @@ use crate::{
 };
 
 pub fn run(args: &InspectArgs) -> Result<(), CliError> {
+    let filter_val = args.filter.as_ref().or(args.kernel.as_ref());
+    let _span = tracing::info_span!(
+        "inspect",
+        filter = ?filter_val,
+        ir = args.ir,
+        stats = args.stats,
+    )
+    .entered();
     let dir = &args.dir;
     // filter is either --filter flag or the positional kernel name
-    let filter = args.filter.as_ref().or(args.kernel.as_ref());
+    let filter = filter_val;
     let all_flag = args.all;
     let ir_flag = args.ir;
     let stats_flag = args.stats;

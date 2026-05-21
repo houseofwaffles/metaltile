@@ -58,6 +58,7 @@ impl super::Pass for UnrollPass {
     fn name(&self) -> &str { "unroll" }
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
+        tracing::trace!("unroll pass");
         let max_vid = remap::find_max_vid(kernel);
         let mut next_vid = (max_vid + 1).max(10_000);
         let max_block_id = kernel.blocks.keys().map(|b| b.as_u32()).max().unwrap_or(0);

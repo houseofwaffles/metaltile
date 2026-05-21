@@ -18,6 +18,12 @@ use crate::{
 };
 
 pub fn run(args: &DiffArgs) -> Result<(), CliError> {
+    let _span = tracing::info_span!(
+        "diff",
+        baseline = %args.baseline,
+        threshold = args.threshold,
+    )
+    .entered();
     let baseline_path = &args.baseline;
     let current_path = &args.current;
 

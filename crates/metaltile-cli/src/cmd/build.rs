@@ -50,6 +50,7 @@ fn pad_left(text: &str, width: usize) -> String { format!("{text:<width$}") }
 fn pad_right(text: &str, width: usize) -> String { format!("{text:>width$}") }
 
 pub fn run(args: &BuildArgs) -> Result<(), CliError> {
+    let _span = tracing::info_span!("build", filter = ?args.filter, emit = ?args.emit).entered();
     let filter = &args.filter;
     let dtypes_arg = &args.dtypes;
     let verbose = args.verbose > 0;
@@ -168,6 +169,8 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
         if !matches_filter(filter.as_deref(), name) {
             continue;
         }
+        let _kspan = tracing::debug_span!("kernel", name).entered();
+        tracing::debug!(kernel = name, "building kernel");
 
         // Filter dtypes if --dtypes was specified.
         let dtypes_to_check: Vec<DType> = match &dtypes_filter {
@@ -203,8 +206,12 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
             // Compile-check via generate.
             let msl_result = generator.generate(&k);
             let msl = match msl_result {
-                Ok(msl) => msl,
+                Ok(msl) => {
+                    tracing::debug!(kernel = %k.name, dtype = %dt, bytes = msl.len(), "codegen ok");
+                    msl
+                },
                 Err(e) => {
+                    tracing::warn!(kernel = %k.name, dtype = %dt, error = %e, "codegen failed");
                     dtypes_err.push((dt, format!("{e:?}")));
                     errors += 1;
                     continue;

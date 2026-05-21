@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub fn run(args: &DeviceArgs) -> Result<(), crate::CliError> {
+    let _span = tracing::info_span!("device", json = args.json).entered();
     let json_out = args.json;
 
     let runner = match GpuRunner::new() {

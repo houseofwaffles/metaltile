@@ -32,6 +32,7 @@ struct Snapshot {
 }
 
 pub fn run(args: &SnapArgs) -> Result<(), CliError> {
+    let _span = tracing::info_span!("snap", out = ?args.out, from = ?args.from).entered();
     let out_path = args.out.as_deref();
     let from_path = args.from.as_deref();
     let note = &args.note;

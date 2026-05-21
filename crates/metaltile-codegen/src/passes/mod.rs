@@ -38,6 +38,7 @@ pub trait Pass {
 /// Run a sequence of passes on a kernel.
 pub fn run_passes(kernel: &mut Kernel, passes: &[Box<dyn Pass>]) -> Result<()> {
     for pass in passes {
+        tracing::debug!(kernel = %kernel.name, pass = pass.name(), "running pass");
         pass.run(kernel)?;
     }
     Ok(())
@@ -62,15 +63,25 @@ pub fn run_passes_with_stats(
     for pass in passes {
         let ops_before = count_total_ops(kernel);
         let start = Instant::now();
+        tracing::debug!(kernel = %kernel.name, pass = pass.name(), ops = ops_before, "running pass");
         pass.run(kernel)?;
         let elapsed = start.elapsed();
         let ops_after = count_total_ops(kernel);
-        stats.push(PassStats {
+        let s = PassStats {
             name: pass.name().to_string(),
             ops_before,
             ops_after,
             wall_us: elapsed.as_micros() as u64,
-        });
+        };
+        tracing::trace!(
+            pass = pass.name(),
+            wall_us = s.wall_us,
+            ops_before = ops_before,
+            ops_after = ops_after,
+            eliminated = ops_before.saturating_sub(ops_after),
+            "pass complete"
+        );
+        stats.push(s);
     }
 
     Ok(stats)

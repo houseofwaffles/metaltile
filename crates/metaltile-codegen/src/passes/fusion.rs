@@ -54,6 +54,7 @@ impl super::Pass for FusionPass {
     fn name(&self) -> &str { "fusion" }
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
+        let mut total_chains = 0usize;
         // Build a map: ValueId → the BlockId that defines (produces) it.
         let mut def_block: FxHashMap<ValueId, BlockId> = FxHashMap::default();
         for vid in kernel.body.results.iter().flatten() {
@@ -109,6 +110,15 @@ impl super::Pass for FusionPass {
                 fuse_block(block, &pins)?;
             }
         }
+
+        // Count total FusedElementwise ops created across all blocks.
+        total_chains +=
+            kernel.body.ops.iter().filter(|op| matches!(op, Op::FusedElementwise { .. })).count();
+        for block in kernel.blocks.values() {
+            total_chains +=
+                block.ops.iter().filter(|op| matches!(op, Op::FusedElementwise { .. })).count();
+        }
+        tracing::debug!(chains = total_chains, "fusion pass complete");
         Ok(())
     }
 }
