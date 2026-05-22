@@ -46,14 +46,13 @@
 //! is the runtime gate; downstream callers route to `mt_qmm_mma` (the
 //! non-MPP `simdgroup_matmul` variant) when `needs_mpp` is unsupported.
 
-use std::collections::BTreeMap;
-
 use metaltile_core::{
     constexpr::ConstExpr,
     dtype::DType,
     ir::{Block, BlockId, ConstExprDecl, Kernel, KernelMode, Op, Param, ParamKind},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 /// Tile geometry — keep in lock-step with the inline MSL below.
 pub const BM: u32 = 32;
@@ -360,7 +359,7 @@ pub fn kernel_ir_for(dt: DType) -> Kernel {
         outputs: Vec::new(),
     });
     k.body = body.clone();
-    let mut blocks = BTreeMap::new();
+    let mut blocks = FxHashMap::default();
     blocks.insert(BlockId::new(0), body);
     k.blocks = blocks;
 
@@ -411,7 +410,7 @@ mod tests {
         use metaltile_codegen::msl::MslGenerator;
         for (dt, t_name) in [(DType::F32, "float"), (DType::F16, "half")] {
             let mut k = kernel_ir_for(dt);
-            // Per-dtype naming convention used by metaltile-emit/main.rs.
+            // Per-dtype naming convention used by the `tile emit` subcommand.
             let suffix = match dt {
                 DType::F32 => "f32",
                 DType::F16 => "f16",

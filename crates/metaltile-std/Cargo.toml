@@ -18,6 +18,7 @@ metaltile-runtime.workspace = true
 inventory.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+rustc-hash.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

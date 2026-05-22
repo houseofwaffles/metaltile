@@ -23,7 +23,7 @@ static QUANTIZED_SHAPES: &[(usize, usize)] =
     tol=1e-3,
     mlx="affine_qmv_fast_float16_t_gs_64_b_4_batch_0",
     metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
 )]
 #[kernel]
 pub fn mt_qmv<T>(
@@ -387,7 +387,7 @@ pub fn mt_qmv<T>(
     tol=1e-3,
     mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
     metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
 )]
 #[kernel]
 pub fn mt_qmm<T>(
@@ -732,7 +732,7 @@ pub fn mt_qmm<T>(
     tol=1e-3,
     mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
     metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
 )]
 #[kernel]
 pub fn mt_qmm_bm2<T>(
@@ -1183,7 +1183,7 @@ pub fn mt_qmm_bm2<T>(
     tol=1e-3,
     mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
     metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
 )]
 #[kernel]
 pub fn mt_qmm_bm4<T>(
@@ -1635,7 +1635,7 @@ pub fn mt_qmm_bm4<T>(
     tol=1e-3,
     mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
     metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
 )]
 #[kernel]
 pub fn mt_qmm_mma<T>(
@@ -1973,7 +1973,7 @@ pub fn mt_qmm_mma<T>(
     tol=1e-3,
     mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
     metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16],
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
 )]
 #[kernel]
 pub fn mt_qmm_mma_m16<T>(

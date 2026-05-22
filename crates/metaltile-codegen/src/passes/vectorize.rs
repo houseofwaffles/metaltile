@@ -46,7 +46,12 @@ impl super::Pass for VectorizePass {
     fn name(&self) -> &str { "vectorize" }
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
-        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        // Sort explicitly: `kernel.blocks` is `FxHashMap` so iteration order
+        // is non-deterministic; `next_vid` is incremented across blocks, so
+        // the order in which blocks consume fresh ValueIds affects emitted
+        // MSL variable names — sort for byte-stable output.
+        let mut block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        block_ids.sort_unstable_by_key(|b| b.as_u32());
         let params = kernel.params.clone();
         // Allocate fresh ValueIds starting one past the current max.
         let max_vid = kernel

@@ -21,6 +21,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use metaltile_macros::{OpFlags, ValueRefs, VariantName};
+use rustc_hash::FxHashMap;
 
 use crate::{constexpr::ConstExpr, dtype::DType, shape::Shape};
 
@@ -1310,12 +1311,12 @@ pub struct Kernel {
     /// Entry block of the kernel body.
     pub body: Block,
     /// All blocks in this kernel (including nested loop bodies, etc.).
-    pub blocks: BTreeMap<BlockId, Block>,
+    pub blocks: FxHashMap<BlockId, Block>,
     /// Return shapes — for each output tensor, the shape of the written region.
     pub return_shapes: Vec<Shape>,
     /// Tile schedule annotations set by SchedulePass.
     /// Keys are ValueId of Dot ops; values are (tile_m, tile_n, tile_k).
-    pub tile_annotations: BTreeMap<ValueId, (u32, u32, u32)>,
+    pub tile_annotations: FxHashMap<ValueId, (u32, u32, u32)>,
     /// Per-kernel opt-in for the MFA-style f32→bf16 reinterpret cast.
     /// Overrides `MslConfig::bfloat_reinterpret_cast` when set true:
     /// the codegen emits `as_type<bfloat2>(fp32)[1]` (truncation, fast)
@@ -1331,7 +1332,7 @@ pub struct Kernel {
 impl Kernel {
     pub fn new(name: impl Into<String>) -> Self {
         let body = Block::new(BlockId::new(0));
-        let mut blocks = BTreeMap::new();
+        let mut blocks = FxHashMap::default();
         blocks.insert(BlockId::new(0), body.clone());
 
         Kernel {
@@ -1342,7 +1343,7 @@ impl Kernel {
             body,
             blocks,
             return_shapes: Vec::new(),
-            tile_annotations: BTreeMap::new(),
+            tile_annotations: FxHashMap::default(),
             bfloat_reinterpret_cast: false,
         }
     }

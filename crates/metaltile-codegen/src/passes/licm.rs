@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use metaltile_core::ir::{Block, BlockId, Kernel, Op, ParamKind, ValueId};
+use rustc_hash::FxHashMap;
 
 use super::remap;
 use crate::error::{Error, Result};
@@ -101,7 +102,7 @@ impl super::Pass for LicmPass {
 /// `blocks` is the mutable block map so loop bodies can be modified.
 fn licm_block(
     block: &mut Block,
-    blocks: &mut BTreeMap<BlockId, Block>,
+    blocks: &mut FxHashMap<BlockId, Block>,
     def_block: &BTreeMap<ValueId, BlockId>,
     read_only: &BTreeSet<String>,
 ) {

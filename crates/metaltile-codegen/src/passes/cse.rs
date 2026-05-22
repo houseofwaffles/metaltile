@@ -87,7 +87,13 @@ impl super::Pass for CsePass {
         // CSE each nested block. After each one, propagate its remap to the
         // kernel body and to every other block — a value defined in one
         // nested block may be referenced from a sibling or from the body.
-        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        //
+        // Sort explicitly: `kernel.blocks` is `FxHashMap`, so `.keys()` order
+        // is non-deterministic; the per-block remap is propagated to sibling
+        // blocks, so the order in which blocks are processed affects the
+        // final state — sort for byte-stable MSL output.
+        let mut block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        block_ids.sort_unstable_by_key(|b| b.as_u32());
         for bid in &block_ids {
             let Some(mut block) = kernel.blocks.remove(bid) else { continue };
             let remap = cse_block(&mut block, &read_only);

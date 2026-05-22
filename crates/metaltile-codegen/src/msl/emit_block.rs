@@ -8,6 +8,7 @@ use metaltile_core::{
     dtype::DType,
     ir::{BinOpKind, Block, BlockId, Kernel, KernelMode, Op, ReduceKind, ValueId},
 };
+use rustc_hash::FxHashMap;
 
 use super::{
     MslGenerator,
@@ -20,7 +21,7 @@ impl MslGenerator {
     pub(super) fn emit_block(
         &self,
         block: &Block,
-        all_blocks: &BTreeMap<BlockId, Block>,
+        all_blocks: &FxHashMap<BlockId, Block>,
         out: &mut String,
         indent: usize,
         kernel: &Kernel,

@@ -34,13 +34,12 @@
 //! `metaltile-runtime` already routes via `KernelFeatures::needs_mpp`, so
 //! downstream callers don't need to gate explicitly.
 
-use std::collections::BTreeMap;
-
 use metaltile_core::{
     dtype::DType,
     ir::{Block, BlockId, Kernel, KernelMode, Op, Param, ParamKind},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 // Inline MSL body. References the kernel parameter names (`A`, `B`, `C`)
 // directly — the codegen emits them as `const device half*` / `device float*`
@@ -144,7 +143,7 @@ pub fn kernel_ir() -> Kernel {
         outputs: Vec::new(),
     });
     k.body = body.clone();
-    let mut blocks = BTreeMap::new();
+    let mut blocks = FxHashMap::default();
     blocks.insert(BlockId::new(0), body);
     k.blocks = blocks;
 

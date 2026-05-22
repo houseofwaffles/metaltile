@@ -22,6 +22,7 @@ use metaltile_core::{
     ir::{BinOpKind, Block, BlockId, Kernel, Op, Param, ReduceKind, ValueId},
     shape::{Dim, Shape},
 };
+use rustc_hash::FxHashMap;
 
 /// Internal result type — all helpers in this module use the core error type
 /// so they can construct `Error::Validation`, `Error::ShapeMismatch`, etc.
@@ -367,7 +368,7 @@ fn first_input_shape(op: &Op) -> Option<ValueId> {
 fn infer_block(
     block: &Block,
     kernel: &Kernel,
-    all_blocks: &BTreeMap<BlockId, Block>,
+    all_blocks: &FxHashMap<BlockId, Block>,
     env: &mut TypeEnv,
 ) -> CoreResult<()> {
     // Scan the entry body + child blocks for threadgroup_alloc dtypes by

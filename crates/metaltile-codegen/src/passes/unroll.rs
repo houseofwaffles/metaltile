@@ -36,6 +36,7 @@
 use std::collections::BTreeMap;
 
 use metaltile_core::ir::{Block, BlockId, Kernel, Op, ValueId};
+use rustc_hash::FxHashMap;
 
 use super::remap;
 use crate::error::{Error, Result};
@@ -77,7 +78,11 @@ impl super::Pass for UnrollPass {
         // captured before the body's parent ran may no longer exist by
         // the time we get to it — use `.remove(...)` + `if let Some(...)`
         // rather than `.unwrap()` so the pass tolerates that race.
-        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        // Sort explicitly: `kernel.blocks` is `FxHashMap`, so iteration
+        // order is non-deterministic — parent-before-child stability
+        // matters when an outer pass inlines a child body.
+        let mut block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        block_ids.sort_unstable_by_key(|b| b.as_u32());
         for bid in &block_ids {
             let Some(mut block) = kernel.blocks.remove(bid) else {
                 continue;
@@ -116,7 +121,7 @@ fn find_const_in_block(block: &Block, vid: ValueId) -> Option<i64> {
 
 fn unroll_block(
     block: &mut Block,
-    blocks: &mut BTreeMap<BlockId, Block>,
+    blocks: &mut FxHashMap<BlockId, Block>,
     next_vid: &mut u32,
     next_block_id: &mut u32,
     factor: u32,

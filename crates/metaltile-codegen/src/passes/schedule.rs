@@ -17,9 +17,8 @@
 //!   Performance Computing", ACM Computing Surveys 26(4):345–420.
 //!   Surveys loop tiling and scheduling transformations.
 
-use std::collections::BTreeMap;
-
 use metaltile_core::ir::{Block, Kernel, Op, ValueId};
+use rustc_hash::FxHashMap;
 
 use crate::error::Result;
 
@@ -95,7 +94,7 @@ impl super::Pass for SchedulePass {
 fn annotate_block(
     block: &Block,
     config: &ScheduleConfig,
-    annotations: &mut BTreeMap<ValueId, (u32, u32, u32)>,
+    annotations: &mut FxHashMap<ValueId, (u32, u32, u32)>,
     next_vid_hint: &mut u32,
 ) {
     for (i, op) in block.ops.iter().enumerate() {

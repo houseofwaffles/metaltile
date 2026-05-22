@@ -1,6 +1,12 @@
 //! Unary elementwise benchmark — #[kernel] DSL vs MLX metal/unary.metal
 
 use metaltile::{bench_kernel, kernel};
+use metaltile_core::ir::KernelMode;
+
+use crate::{
+    bench_types::DType,
+    spec::{BenchDispatch, BenchSpec},
+};
 
 #[bench_kernel(
     op="unary",
@@ -582,4 +588,114 @@ pub fn mt_softplus<T>(a: Tensor<T>, out: Tensor<T>) {
     let ax = select(pos, x, zero - x);
     let r = m + log(1.0f32 + exp(zero - ax));
     store(out[idx], r.cast::<T>());
+}
+
+/// Cast a tensor of model dtype `T` to fp32 in-place per element. One
+/// thread per element. Used by callers that need to mix fp32 state with
+/// bf16 / f16 model activations on the GPU without a host round-trip —
+/// the fused GDN prep step is the immediate consumer (its cache state
+/// stays fp32 to avoid the 7-bit-mantissa drift over long decodes, but
+/// the model activations into the kernel are bf16).
+#[kernel]
+pub fn mt_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
+    let idx = program_id(0);
+    store(out[idx], load(input[idx]).cast::<f32>());
+}
+
+/// Fused silu + cast-to-f32. Replaces the `silu(bf16) → cast_to_f32`
+/// two-dispatch chain in FFAI's batched-prefill GDN inner loop with a
+/// single dispatch: read bf16/f16, apply silu, write f32.
+///
+/// silu(x) = x · sigmoid(x) = x · (1 / (1 + exp(-x))) computed at f32
+/// precision to match the bf16 → fp32 + silu → fp32 chain bit-for-bit
+/// (modulo rounding mode on the final write — same as the standalone
+/// silu kernel).
+///
+/// Saves T·30 ≈ 15k dispatches per Qwen3.6-A3B prefill at T=512 (one
+/// silu + one cast per GDN-layer per-token iter → one fused dispatch).
+#[kernel]
+pub fn mt_silu_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
+    let idx = program_id(0);
+    let x = load(input[idx]).cast::<f32>();
+    let sig = 1.0f32 / (1.0f32 + exp(0.0f32 - x));
+    store(out[idx], x * sig);
+}
+
+/// Fused scalar-sigmoid fan-out + FMA. Computes
+///   `out[i] = base[i] + sigmoid(gate[0]) * value[i]`
+/// for `i in 0..hidden`, broadcasting the scalar `gate` across the
+/// `[hidden]` vectors. One thread per output element; the scalar
+/// re-loads through the GPU L1 cache so the broadcast is free.
+///
+/// Replaces FFAI's shared-expert host detour: `gateLogit.toFloatArray()`
+/// + host `sigmoid()` + `Tensor.filled([hidden])` + `Ops.mul` + `Ops.add`
+/// + a `commit + wait` to ensure the scalar is resident. With this
+/// kernel the entire fan-out stays on the GPU and the command buffer
+/// the gate was produced on no longer needs a host stall before the
+/// next layer queues work.
+///
+/// Inputs are all in model dtype `T` (typically bf16 on Qwen3.6); the
+/// internal accumulation widens to fp32 via the load-side `.cast` to
+/// preserve sigmoid precision near saturation.
+#[kernel]
+pub fn mt_sigmoid_scalar_fma<T>(
+    gate: Tensor<T>,
+    value: Tensor<T>,
+    base: Tensor<T>,
+    out: Tensor<T>,
+) {
+    let idx = program_id(0);
+    let gx = load(gate[0]).cast::<f32>();
+    let g = 1.0f32 / (1.0f32 + exp(0.0f32 - gx));
+    let v = load(value[idx]).cast::<f32>();
+    let b = load(base[idx]).cast::<f32>();
+    store(out[idx], (b + g * v).cast::<T>());
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "sigmoid_scalar_fma",
+        kernel_name: "mt_sigmoid_scalar_fma",
+        kernel_ir: mt_sigmoid_scalar_fma::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "cast_to_f32",
+        kernel_name: "mt_cast_to_f32",
+        kernel_ir: mt_cast_to_f32::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 0.0,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "silu_cast_to_f32",
+        kernel_name: "mt_silu_cast_to_f32",
+        kernel_ir: mt_silu_cast_to_f32::kernel_ir_for,
+        dtypes: &[DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
 }

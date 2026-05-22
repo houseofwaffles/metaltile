@@ -27,6 +27,7 @@ pub mod hadamard;
 pub mod layer_norm;
 pub mod logsumexp;
 pub mod quantized;
+pub mod quantized_mma_dynamic_m;
 pub mod quantized_mpp;
 #[cfg(feature = "nax")]
 pub mod quantized_nax;

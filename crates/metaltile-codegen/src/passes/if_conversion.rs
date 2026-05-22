@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 
 use metaltile_core::ir::{Block, BlockId, Kernel, Op, ValueId};
+use rustc_hash::FxHashMap;
 
 use super::remap;
 use crate::error::Result;
@@ -57,7 +58,11 @@ impl super::Pass for IfConversionPass {
     fn name(&self) -> &str { "if_conversion" }
 
     fn run(&self, kernel: &mut Kernel) -> Result<()> {
-        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        // Sort explicitly: `kernel.blocks` is `FxHashMap`, so `.keys()`
+        // order is non-deterministic — the inside-out `.rev()` walk
+        // below relies on ascending BlockId order.
+        let mut block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        block_ids.sort_unstable_by_key(|b| b.as_u32());
 
         // Process the body first.
         if_convert_block(&mut kernel.body, &mut kernel.blocks);
@@ -127,7 +132,7 @@ fn is_profitable(shape: CfgShape, then_block: &Block, else_block: Option<&Block>
 // main transform
 // ---------------------------------------------------------------------------
 
-fn if_convert_block(block: &mut Block, blocks: &mut BTreeMap<BlockId, Block>) {
+fn if_convert_block(block: &mut Block, blocks: &mut FxHashMap<BlockId, Block>) {
     let n = block.ops.len();
 
     struct Conversion {

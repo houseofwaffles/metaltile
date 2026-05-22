@@ -38,6 +38,12 @@
 //!   that into `nRows` threadgroups of `TPG` threads each.
 
 use metaltile::{bench_kernel, kernel};
+use metaltile_core::ir::KernelMode;
+
+use crate::{
+    bench_types::DType,
+    spec::{BenchDispatch, BenchSpec},
+};
 
 /// Cross-kernel callee: threadgroup-wide RMS inverse.
 ///
@@ -207,4 +213,97 @@ pub fn mt_rms_norm_small<T>(
     let rms = rsqrt(tg_ssq / n + eps);
     store(out[base], (x0 * rms * load(w[col]).cast::<f32>()).cast::<T>());
     store(out[base + 1u32], (x1 * rms * load(w[col + 1u32]).cast::<f32>()).cast::<T>());
+}
+
+/// Fused gated-mixer-norm: `out = rms_norm(y, w) · silu(z)`. Per-row
+/// across `[Hv, Dv]` — one row per threadgroup. Used by the FFAI
+/// Qwen3.5 / Qwen3.6 GDN mixer's phase-2 step (`y` is the recurrence
+/// output in fp32; `z` is the gate from `in_proj_z` in the model
+/// dtype; `w` is `mixer.norm.weight`). Folding RMSNorm + weight +
+/// `silu(z)` into one dispatch kills the host round-trip the legacy
+/// path needed to compute this on the CPU between phases — 30 host
+/// commit+waits per Qwen3.6-A3B decode token recovered.
+///
+/// Math (one row):
+///   rms = rsqrt(mean(y²) + eps)
+///   y_normed[i] = y[i] * rms * w[i]
+///   silu(z)[i]  = z[i] / (1 + exp(-z[i]))
+///   out[i] = y_normed[i] * silu(z)[i]
+///
+/// Same `N = TPG * 4` invariant as `mt_rms_norm` — Dv is multiple of
+/// 4 on every shipped Qwen3 hybrid (128 / 256 / 512). One thread owns
+/// 4 consecutive `Dv`-axis elements; the OOB clamp + mask copies the
+/// `mt_rms_norm` template so a wrong-TPG dispatch fails loudly rather
+/// than silently miscomputing.
+#[kernel]
+pub fn mt_gated_mixer_norm<T>(
+    y: Tensor<f32>,
+    z: Tensor<T>,
+    w: Tensor<T>,
+    out: Tensor<T>,
+    eps_buf: Tensor<f32>,
+    #[constexpr] n: u32,
+) {
+    let row = program_id::<0>();
+    let rs = row * n;
+    let col = tid * 4u32;
+    let in_bounds = col + 3u32 < n;
+    let safe_col = select(in_bounds, col, 0u32);
+    let safe_base = rs + safe_col;
+    let base = rs + col;
+    // y is already fp32, but mirror the mt_rms_norm load pattern
+    // (`.cast::<f32>()` after each load) — the vectorize pass on this
+    // codegen reads the cast as the consumer hook for the float4
+    // load+extract emit. Removing the cast leaves the vectorize pass
+    // half-finished (load merges into a float4, scalar y_n references
+    // never get rewritten into VectorExtract — see emit + bug-report
+    // in metaltile codegen `vectorize.rs`).
+    let y0 = load(y[safe_base]).cast::<f32>();
+    let y1 = load(y[safe_base + 1u32]).cast::<f32>();
+    let y2 = load(y[safe_base + 2u32]).cast::<f32>();
+    let y3 = load(y[safe_base + 3u32]).cast::<f32>();
+    let raw_ssq = y0 * y0 + y1 * y1 + y2 * y2 + y3 * y3;
+    let partial_ssq = select(in_bounds, raw_ssq, 0.0f32);
+    let tg_ssq = reduce_sum(partial_ssq);
+    let eps = load(eps_buf[0]);
+    let rms = rsqrt(tg_ssq / n + eps);
+    if in_bounds {
+        let w0 = load(w[col]).cast::<f32>();
+        let w1 = load(w[col + 1u32]).cast::<f32>();
+        let w2 = load(w[col + 2u32]).cast::<f32>();
+        let w3 = load(w[col + 3u32]).cast::<f32>();
+        let z0 = load(z[base]).cast::<f32>();
+        let z1 = load(z[base + 1u32]).cast::<f32>();
+        let z2 = load(z[base + 2u32]).cast::<f32>();
+        let z3 = load(z[base + 3u32]).cast::<f32>();
+        // silu(z) = z / (1 + exp(-z)). Inlined per the `mt_sigmoid`
+        // precedent — Activation::Sigmoid folds into FusedElementwise
+        // and the per-kernel feature analyzer would miss it, so the
+        // emitted MSL stays self-contained without an `mt_sigmoid`
+        // helper. Same as `mt_gated_delta_prep_step`'s `beta` path.
+        let silu0 = z0 / (1.0f32 + exp(0.0f32 - z0));
+        let silu1 = z1 / (1.0f32 + exp(0.0f32 - z1));
+        let silu2 = z2 / (1.0f32 + exp(0.0f32 - z2));
+        let silu3 = z3 / (1.0f32 + exp(0.0f32 - z3));
+        store(out[base], ((y0 * rms * w0) * silu0).cast::<T>());
+        store(out[base + 1u32], ((y1 * rms * w1) * silu1).cast::<T>());
+        store(out[base + 2u32], ((y2 * rms * w2) * silu2).cast::<T>());
+        store(out[base + 3u32], ((y3 * rms * w3) * silu3).cast::<T>());
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "rms_norm",
+        subop: "gated_mixer_norm",
+        kernel_name: "mt_gated_mixer_norm",
+        kernel_ir: mt_gated_mixer_norm::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
 }
