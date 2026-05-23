@@ -149,15 +149,25 @@ jobs:
           # warning instead of failing the job; the comment body is
           # already in the step log right above.
           MARKER="<!-- bench-diff:${SLUG} -->"
-          # `gh --jq` only takes a jq expression — `--arg` is a jq
-          # flag, not a gh flag, so `gh pr view --jq <expr> --arg ...`
-          # tokenises `--arg / name / value / <expr>` as four trailing
-          # positional args and fails with "accepts at most 1 arg(s),
-          # received 4". Pipe to a real `jq` invocation instead so
-          # `--arg` lands on the right binary.
-          EXISTING_ID=$(gh pr view "$PR_NUMBER" --json comments \
-            | jq -r --arg marker "$MARKER" \
-              '[.comments[] | select(.body | contains($marker)) | .id] | first')
+          # `gh --jq` takes a jq expression but NOT `--arg` (that's a
+          # jq-binary flag), so we inline the marker via shell
+          # interpolation instead of `--arg marker $MARKER`. The
+          # marker is a known-safe HTML comment with the runner-slug
+          # in it — no shell or jq metachars to escape.
+          #
+          # The trailing `2>/dev/null || echo ""` makes the lookup
+          # graceful: if gh hits a transient API error, a fork-PR
+          # token rejection, or anything else, EXISTING_ID just ends
+          # up empty and we fall through to the "post a new comment"
+          # path below. Better than failing the whole Bench-diff step
+          # because of a comment-dedup lookup. PR #159 first tried
+          # `gh pr view --json comments | jq -r --arg marker ...`
+          # which fixed the `--arg` tokenisation but introduced a
+          # second failure mode (the pipe propagating jq parse errors
+          # back through `set -o pipefail` on the shebang).
+          EXISTING_ID=$(gh pr view "$PR_NUMBER" --json comments --jq \
+            "[.comments[] | select(.body | contains(\"$MARKER\")) | .id] | first" \
+            2>/dev/null || echo "")
 
           REPO="${{ github.repository }}"
           if [ -n "$EXISTING_ID" ]; then
