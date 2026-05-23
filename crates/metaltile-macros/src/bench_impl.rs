@@ -767,9 +767,20 @@ pub fn generate_submit(fn_name: &syn::Ident, a: &BenchArgs, is_generic: bool) ->
             let sh = a.shapes.as_ref().expect("QuantizedMatVec requires shapes");
             let gs = a.group_size.as_ref().expect("QuantizedMatVec requires group_size");
             let tpg_val = a.tpg.as_ref().expect("QuantizedMatVec requires tpg");
+            // `bits` defaults to 4 (the int4 contract `run_quantized_mat_vec`
+            // used to hard-code) so every existing `QuantizedMatVec` kernel
+            // keeps its current behaviour. int8 perf kernels opt in with
+            // `bits=8`.
+            let bits_ts = match a.bits.as_ref() {
+                Some(b) => quote! { #b as u32 },
+                None => quote! { 4u32 },
+            };
             (quote! { &[] }, quote! {
                 crate::spec::BenchDispatch::QuantizedMatVec {
-                    shapes: #sh, group_size: #gs as usize, tpg: #tpg_val as usize,
+                    shapes: #sh,
+                    group_size: #gs as usize,
+                    tpg: #tpg_val as usize,
+                    bits: #bits_ts,
                 }
             })
         },
@@ -779,12 +790,17 @@ pub fn generate_submit(fn_name: &syn::Ident, a: &BenchArgs, is_generic: bool) ->
             let gs = a.group_size.as_ref().expect("QuantizedMatMul requires group_size");
             let tpg_val = a.tpg.as_ref().expect("QuantizedMatMul requires tpg");
             let m_val = a.m.as_ref().expect("QuantizedMatMul requires m (token count)");
+            let bits_ts = match a.bits.as_ref() {
+                Some(b) => quote! { #b as u32 },
+                None => quote! { 4u32 },
+            };
             (quote! { &[] }, quote! {
                 crate::spec::BenchDispatch::QuantizedMatMul {
                     shapes: #sh,
                     m: #m_val as usize,
                     group_size: #gs as usize,
                     tpg: #tpg_val as usize,
+                    bits: #bits_ts,
                 }
             })
         },

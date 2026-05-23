@@ -33,8 +33,11 @@ pub mod logsumexp;
 pub mod quantized;
 pub mod quantized_mma_dynamic_m;
 pub mod quantized_mpp;
+pub mod quantized_mpp_int8;
 #[cfg(feature = "nax")]
 pub mod quantized_nax;
+#[cfg(feature = "nax")]
+pub mod quantized_nax_int8;
 pub mod random;
 pub mod reduce;
 pub mod rms_norm;

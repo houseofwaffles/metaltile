@@ -1591,6 +1591,730 @@ pub fn mt_qmm_bm4<T>(
     }
 }
 
+// ─── mt_qmv_int8_fast ───────────────────────────────────────────────────
+//
+// Int8 decode GEMV — mirrors `mt_qmv`'s 8-row-per-TG geometry but for
+// int8 weights (4 bytes/u32).
+//
+// ## Geometry
+//   tpg = 64 = 2 simdgroups × 32 lanes
+//   8 output rows per TG (each SG handles 4 rows indexed by simd_id)
+//   Block = 4 X × 32 lanes = 128 K elements per outer iter
+//   Grid: [m / 8, 1, 1]
+//
+// ## Int8 vs int4 adaptations
+//   - Pack factor: 4 bytes/u32 (not 8 nibbles). Inner per-pack loop = 4.
+//   - K-block = 128 (lane×4 X values × 32 lanes), not 512.
+//   - Explicit byte shifts (0, 8, 16, 24) instead of the int4
+//     mask-without-shift trick. The byte-position scale factors would be
+//     1/256, 1/65536, 1/16777216 — four orders of magnitude smaller than
+//     the int4 factors (1/16, 1/256, 1/4096) and too small to be useful
+//     against typical f32 X values; explicit shifts are cleaner and avoid
+//     the precision hazard of multiplying by ~6e-8.
+//   - Bias hoist (algebraic split) retained: xs accumulates raw X per
+//     block; acc += scale * qdot + bias * xs mirrors `mt_qmv` exactly.
+//   - `& 0xFF` mask extracts byte codes 0..255 (unsigned int8).
+//
+// ## Layouts (same field names as mt_qmv)
+//   w       [m, k/4]               u32   — int8 codes (4 per uint32)
+//   scales  [m, k/group_size]      T
+//   biases  [m, k/group_size]      T
+//   x       [k]                    T
+//   out     [m]                    T
+
+#[bench_kernel(
+    op="quantized",
+    subop="qmv_int8_fast",
+    class=QuantizedMatVec,
+    shapes=&QUANTIZED_SHAPES,
+    group_size=64,
+    tpg=64,
+    // bits=8: drives `run_quantized_mat_vec`'s W pack-factor (4
+    // bytes/u32) + the bit-stream extract in the correctness oracle.
+    // Without this the runner defaults to bits=4 and the int8 kernel
+    // reads 2× the int4-sized W buffer.
+    bits=8,
+    tol=1e-3,
+    mlx="affine_qmv_fast_float16_t_gs_64_b_8_batch_0",
+    metal_file="quantized.metal",
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+)]
+#[kernel]
+pub fn mt_qmv_int8_fast<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    // 8-row-per-TG geometry: 2 simdgroups × 32 lanes, each SG handles
+    // 4 consecutive output rows. X loads are shared across all 4 rows
+    // in a simdgroup, reducing X bandwidth by 4×. Mirrors `mt_qmv` for
+    // int4 except K-block = 128 (4 X per lane × 32 lanes) and weight
+    // codes use explicit byte extraction (shift 0/8/16/24, mask 0xFF).
+    let tg = tgid_x;
+    let sg = simd_id;
+    let lane = simd_lane;
+    let row0 = tg * 8u32 + sg * 4u32;
+    let row1 = row0 + 1u32;
+    let row2 = row0 + 2u32;
+    let row3 = row0 + 3u32;
+
+    // int8: 4 codes per u32. packs_per_row = k/4.
+    let packs_per_row = k / 4u32;
+    let w_base0 = row0 * packs_per_row;
+    let w_base1 = row1 * packs_per_row;
+    let w_base2 = row2 * packs_per_row;
+    let w_base3 = row3 * packs_per_row;
+
+    let sb_base0 = row0 * gs_per_row;
+    let sb_base1 = row1 * gs_per_row;
+    let sb_base2 = row2 * gs_per_row;
+    let sb_base3 = row3 * gs_per_row;
+
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+
+    // Each lane owns 4 X values per K-block (32 lanes × 4 = 128 K elements).
+    let lane_x_off = lane * 4u32;
+    // One pack per lane per K-block (4 int8 codes per u32).
+    let lane_pack_off = lane;
+
+    for _b in range(0u32, k, 128u32) {
+        // 4 X loads per lane — consecutive for vectorise fusion.
+        let xb = _b + lane_x_off;
+        let x0 = load(x[xb]).cast::<f32>();
+        let x1 = load(x[xb + 1u32]).cast::<f32>();
+        let x2 = load(x[xb + 2u32]).cast::<f32>();
+        let x3 = load(x[xb + 3u32]).cast::<f32>();
+        // Bias-hoist xs: raw X sum for the bias accumulation term.
+        let xs = x0 + x1 + x2 + x3;
+
+        // Group index: each lane's 4 X values fall within one group
+        // (group_size=64; 4 × 32 lanes = 128 K-block ≥ 2 groups, but
+        // within a lane the 4 slots belong to the same group).
+        let g = xb / 64u32;
+        let pack_off = _b / 4u32 + lane_pack_off;
+
+        // ── Row 0 ──
+        let p0 = load(w[w_base0 + pack_off]);
+        let s0 = load(scales[sb_base0 + g]).cast::<f32>();
+        let bi0 = load(biases[sb_base0 + g]).cast::<f32>();
+        // Explicit byte extract: byte0 = p & 0xFF, byte1 = (p>>8) & 0xFF, etc.
+        let q00 = (p0 & 255u32).cast::<f32>();
+        let q01 = ((p0 >> 8u32) & 255u32).cast::<f32>();
+        let q02 = ((p0 >> 16u32) & 255u32).cast::<f32>();
+        let q03 = ((p0 >> 24u32) & 255u32).cast::<f32>();
+        let qd0 = q00 * x0 + q01 * x1 + q02 * x2 + q03 * x3;
+        acc0 = acc0 + s0 * qd0 + bi0 * xs;
+
+        // ── Row 1 ──
+        let p1 = load(w[w_base1 + pack_off]);
+        let s1 = load(scales[sb_base1 + g]).cast::<f32>();
+        let bi1 = load(biases[sb_base1 + g]).cast::<f32>();
+        let q10 = (p1 & 255u32).cast::<f32>();
+        let q11 = ((p1 >> 8u32) & 255u32).cast::<f32>();
+        let q12 = ((p1 >> 16u32) & 255u32).cast::<f32>();
+        let q13 = ((p1 >> 24u32) & 255u32).cast::<f32>();
+        let qd1 = q10 * x0 + q11 * x1 + q12 * x2 + q13 * x3;
+        acc1 = acc1 + s1 * qd1 + bi1 * xs;
+
+        // ── Row 2 ──
+        let p2 = load(w[w_base2 + pack_off]);
+        let s2 = load(scales[sb_base2 + g]).cast::<f32>();
+        let bi2 = load(biases[sb_base2 + g]).cast::<f32>();
+        let q20 = (p2 & 255u32).cast::<f32>();
+        let q21 = ((p2 >> 8u32) & 255u32).cast::<f32>();
+        let q22 = ((p2 >> 16u32) & 255u32).cast::<f32>();
+        let q23 = ((p2 >> 24u32) & 255u32).cast::<f32>();
+        let qd2 = q20 * x0 + q21 * x1 + q22 * x2 + q23 * x3;
+        acc2 = acc2 + s2 * qd2 + bi2 * xs;
+
+        // ── Row 3 ──
+        let p3 = load(w[w_base3 + pack_off]);
+        let s3 = load(scales[sb_base3 + g]).cast::<f32>();
+        let bi3 = load(biases[sb_base3 + g]).cast::<f32>();
+        let q30 = (p3 & 255u32).cast::<f32>();
+        let q31 = ((p3 >> 8u32) & 255u32).cast::<f32>();
+        let q32 = ((p3 >> 16u32) & 255u32).cast::<f32>();
+        let q33 = ((p3 >> 24u32) & 255u32).cast::<f32>();
+        let qd3 = q30 * x0 + q31 * x1 + q32 * x2 + q33 * x3;
+        acc3 = acc3 + s3 * qd3 + bi3 * xs;
+    }
+
+    // Cross-lane reduction: each row's partial → single value, lane 0 stores.
+    let r0 = simd_sum(acc0);
+    let r1 = simd_sum(acc1);
+    let r2 = simd_sum(acc2);
+    let r3 = simd_sum(acc3);
+    if lane == 0u32 {
+        store(out[row0], r0.cast::<T>());
+        store(out[row1], r1.cast::<T>());
+        store(out[row2], r2.cast::<T>());
+        store(out[row3], r3.cast::<T>());
+    }
+}
+
+// ─── mt_qmm_int8_fast ───────────────────────────────────────────────────
+//
+// Int8 matmul (M=1 batched form) — mirrors `mt_qmm` for int4 but adapted
+// for int8 weights (4 bytes/u32). Same 8-row-per-TG geometry: 2 SG × 32
+// lanes, each SG handles 4 N-rows. K-block = 128 (4 X per lane × 32
+// lanes). Grid: [n / 8, m, 1].
+//
+// At M = 1 this is byte-identical to `mt_qmv_int8_fast` with the X
+// index incorporating the M-row base. Bias hoist, explicit byte shifts,
+// and algebraic-split accumulator all match `mt_qmv_int8_fast`.
+//
+// ## Layouts
+//   w       [n, k/4]               u32   — int8 codes (4 per uint32)
+//   scales  [n, k/group_size]      T
+//   biases  [n, k/group_size]      T
+//   x       [m, k]                 T
+//   out     [m, n]                 T
+
+#[bench_kernel(
+    op="quantized",
+    subop="qmm_int8_fast",
+    class=QuantizedMatMul,
+    shapes=&QUANTIZED_SHAPES,
+    m=4,
+    group_size=64,
+    tpg=64,
+    bits=8,
+    tol=1e-2,
+    mlx="affine_qmm_fast_float16_t_gs_64_b_8_alN_true_batch_0",
+    metal_file="quantized.metal",
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+)]
+#[kernel]
+pub fn mt_qmm_int8_fast<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    let tg = tgid_x;
+    let m_row = tgid_y;
+    let sg = simd_id;
+    let lane = simd_lane;
+    let row0 = tg * 8u32 + sg * 4u32;
+    let row1 = row0 + 1u32;
+    let row2 = row0 + 2u32;
+    let row3 = row0 + 3u32;
+
+    // int8: 4 codes per u32.
+    let packs_per_row = k / 4u32;
+    let w_base0 = row0 * packs_per_row;
+    let w_base1 = row1 * packs_per_row;
+    let w_base2 = row2 * packs_per_row;
+    let w_base3 = row3 * packs_per_row;
+
+    let sb_base0 = row0 * gs_per_row;
+    let sb_base1 = row1 * gs_per_row;
+    let sb_base2 = row2 * gs_per_row;
+    let sb_base3 = row3 * gs_per_row;
+
+    let x_row_base = m_row * k;
+
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+
+    let lane_x_off = lane * 4u32;
+    let lane_pack_off = lane;
+
+    for _b in range(0u32, k, 128u32) {
+        let xb = x_row_base + _b + lane_x_off;
+        let x0 = load(x[xb]).cast::<f32>();
+        let x1 = load(x[xb + 1u32]).cast::<f32>();
+        let x2 = load(x[xb + 2u32]).cast::<f32>();
+        let x3 = load(x[xb + 3u32]).cast::<f32>();
+        let xs = x0 + x1 + x2 + x3;
+
+        // Group index recomputed against K-local base (xb includes x_row_base).
+        let g = (_b + lane_x_off) / 64u32;
+        let pack_off = _b / 4u32 + lane_pack_off;
+
+        // ── Row 0 ──
+        let p0 = load(w[w_base0 + pack_off]);
+        let s0 = load(scales[sb_base0 + g]).cast::<f32>();
+        let bi0 = load(biases[sb_base0 + g]).cast::<f32>();
+        let q00 = (p0 & 255u32).cast::<f32>();
+        let q01 = ((p0 >> 8u32) & 255u32).cast::<f32>();
+        let q02 = ((p0 >> 16u32) & 255u32).cast::<f32>();
+        let q03 = ((p0 >> 24u32) & 255u32).cast::<f32>();
+        let qd0 = q00 * x0 + q01 * x1 + q02 * x2 + q03 * x3;
+        acc0 = acc0 + s0 * qd0 + bi0 * xs;
+
+        // ── Row 1 ──
+        let p1 = load(w[w_base1 + pack_off]);
+        let s1 = load(scales[sb_base1 + g]).cast::<f32>();
+        let bi1 = load(biases[sb_base1 + g]).cast::<f32>();
+        let q10 = (p1 & 255u32).cast::<f32>();
+        let q11 = ((p1 >> 8u32) & 255u32).cast::<f32>();
+        let q12 = ((p1 >> 16u32) & 255u32).cast::<f32>();
+        let q13 = ((p1 >> 24u32) & 255u32).cast::<f32>();
+        let qd1 = q10 * x0 + q11 * x1 + q12 * x2 + q13 * x3;
+        acc1 = acc1 + s1 * qd1 + bi1 * xs;
+
+        // ── Row 2 ──
+        let p2 = load(w[w_base2 + pack_off]);
+        let s2 = load(scales[sb_base2 + g]).cast::<f32>();
+        let bi2 = load(biases[sb_base2 + g]).cast::<f32>();
+        let q20 = (p2 & 255u32).cast::<f32>();
+        let q21 = ((p2 >> 8u32) & 255u32).cast::<f32>();
+        let q22 = ((p2 >> 16u32) & 255u32).cast::<f32>();
+        let q23 = ((p2 >> 24u32) & 255u32).cast::<f32>();
+        let qd2 = q20 * x0 + q21 * x1 + q22 * x2 + q23 * x3;
+        acc2 = acc2 + s2 * qd2 + bi2 * xs;
+
+        // ── Row 3 ──
+        let p3 = load(w[w_base3 + pack_off]);
+        let s3 = load(scales[sb_base3 + g]).cast::<f32>();
+        let bi3 = load(biases[sb_base3 + g]).cast::<f32>();
+        let q30 = (p3 & 255u32).cast::<f32>();
+        let q31 = ((p3 >> 8u32) & 255u32).cast::<f32>();
+        let q32 = ((p3 >> 16u32) & 255u32).cast::<f32>();
+        let q33 = ((p3 >> 24u32) & 255u32).cast::<f32>();
+        let qd3 = q30 * x0 + q31 * x1 + q32 * x2 + q33 * x3;
+        acc3 = acc3 + s3 * qd3 + bi3 * xs;
+    }
+
+    let r0 = simd_sum(acc0);
+    let r1 = simd_sum(acc1);
+    let r2 = simd_sum(acc2);
+    let r3 = simd_sum(acc3);
+    if lane == 0u32 {
+        store(out[m_row * n + row0], r0.cast::<T>());
+        store(out[m_row * n + row1], r1.cast::<T>());
+        store(out[m_row * n + row2], r2.cast::<T>());
+        store(out[m_row * n + row3], r3.cast::<T>());
+    }
+}
+
+// ─── mt_qmm_bm2_int8_fast ───────────────────────────────────────────────
+//
+// Int8 matmul BM=2 — mirrors `mt_qmm_bm2` for int4 but adapted for
+// int8 weights. Two M-rows per TG; W packs extracted once per K-block
+// per N-row, reused across both M-rows. K-block = 128.
+//
+// ## Geometry
+//   tpg = 64 = 2 SG × 32 lanes
+//   BM = 2 (M-rows per TG), BN = 8 (N-rows per TG)
+//   16 outputs per TG, Grid: [n / 8, m / 2, 1]
+//
+// ## Layouts
+//   w       [n, k/4]               u32
+//   scales  [n, k/group_size]      T
+//   biases  [n, k/group_size]      T
+//   x       [m, k]                 T
+//   out     [m, n]                 T
+
+#[bench_kernel(
+    op="quantized",
+    subop="qmm_bm2_int8_fast",
+    class=QuantizedMatMul,
+    shapes=&QUANTIZED_SHAPES,
+    m=8,
+    group_size=64,
+    tpg=64,
+    bits=8,
+    tol=1e-2,
+    mlx="affine_qmm_fast_float16_t_gs_64_b_8_alN_true_batch_0",
+    metal_file="quantized.metal",
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+)]
+#[kernel]
+pub fn mt_qmm_bm2_int8_fast<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    let tg = tgid_x;
+    let m_tile = tgid_y;
+    let sg = simd_id;
+    let lane = simd_lane;
+    let row0 = tg * 8u32 + sg * 4u32;
+    let row1 = row0 + 1u32;
+    let row2 = row0 + 2u32;
+    let row3 = row0 + 3u32;
+
+    // int8: 4 codes per u32.
+    let packs_per_row = k / 4u32;
+    let w_base0 = row0 * packs_per_row;
+    let w_base1 = row1 * packs_per_row;
+    let w_base2 = row2 * packs_per_row;
+    let w_base3 = row3 * packs_per_row;
+
+    let sb_base0 = row0 * gs_per_row;
+    let sb_base1 = row1 * gs_per_row;
+    let sb_base2 = row2 * gs_per_row;
+    let sb_base3 = row3 * gs_per_row;
+
+    // BM=2 M-rows per TG.
+    let m_row_a = m_tile * 2u32;
+    let m_row_b = m_row_a + 1u32;
+    let x_base_a = m_row_a * k;
+    let x_base_b = m_row_b * k;
+
+    // 8 accumulators: 4 N-rows × 2 M-rows.
+    let mut acc0_a = 0.0f32;
+    let mut acc0_b = 0.0f32;
+    let mut acc1_a = 0.0f32;
+    let mut acc1_b = 0.0f32;
+    let mut acc2_a = 0.0f32;
+    let mut acc2_b = 0.0f32;
+    let mut acc3_a = 0.0f32;
+    let mut acc3_b = 0.0f32;
+
+    let lane_x_off = lane * 4u32;
+    let lane_pack_off = lane;
+
+    for _b in range(0u32, k, 128u32) {
+        // ── Load 4 X values for M-row A ──
+        let xb_a = x_base_a + _b + lane_x_off;
+        let x0_a = load(x[xb_a]).cast::<f32>();
+        let x1_a = load(x[xb_a + 1u32]).cast::<f32>();
+        let x2_a = load(x[xb_a + 2u32]).cast::<f32>();
+        let x3_a = load(x[xb_a + 3u32]).cast::<f32>();
+        let xs_a = x0_a + x1_a + x2_a + x3_a;
+
+        // ── Load 4 X values for M-row B ──
+        let xb_b = x_base_b + _b + lane_x_off;
+        let x0_b = load(x[xb_b]).cast::<f32>();
+        let x1_b = load(x[xb_b + 1u32]).cast::<f32>();
+        let x2_b = load(x[xb_b + 2u32]).cast::<f32>();
+        let x3_b = load(x[xb_b + 3u32]).cast::<f32>();
+        let xs_b = x0_b + x1_b + x2_b + x3_b;
+
+        let g = (_b + lane_x_off) / 64u32;
+        let pack_off = _b / 4u32 + lane_pack_off;
+
+        // ── Row 0 (shared W extract, dual qdots) ──
+        let p0 = load(w[w_base0 + pack_off]);
+        let s0 = load(scales[sb_base0 + g]).cast::<f32>();
+        let bi0 = load(biases[sb_base0 + g]).cast::<f32>();
+        let q00 = (p0 & 255u32).cast::<f32>();
+        let q01 = ((p0 >> 8u32) & 255u32).cast::<f32>();
+        let q02 = ((p0 >> 16u32) & 255u32).cast::<f32>();
+        let q03 = ((p0 >> 24u32) & 255u32).cast::<f32>();
+        let qd0_a = q00 * x0_a + q01 * x1_a + q02 * x2_a + q03 * x3_a;
+        let qd0_b = q00 * x0_b + q01 * x1_b + q02 * x2_b + q03 * x3_b;
+        acc0_a = acc0_a + s0 * qd0_a + bi0 * xs_a;
+        acc0_b = acc0_b + s0 * qd0_b + bi0 * xs_b;
+
+        // ── Row 1 ──
+        let p1 = load(w[w_base1 + pack_off]);
+        let s1 = load(scales[sb_base1 + g]).cast::<f32>();
+        let bi1 = load(biases[sb_base1 + g]).cast::<f32>();
+        let q10 = (p1 & 255u32).cast::<f32>();
+        let q11 = ((p1 >> 8u32) & 255u32).cast::<f32>();
+        let q12 = ((p1 >> 16u32) & 255u32).cast::<f32>();
+        let q13 = ((p1 >> 24u32) & 255u32).cast::<f32>();
+        let qd1_a = q10 * x0_a + q11 * x1_a + q12 * x2_a + q13 * x3_a;
+        let qd1_b = q10 * x0_b + q11 * x1_b + q12 * x2_b + q13 * x3_b;
+        acc1_a = acc1_a + s1 * qd1_a + bi1 * xs_a;
+        acc1_b = acc1_b + s1 * qd1_b + bi1 * xs_b;
+
+        // ── Row 2 ──
+        let p2 = load(w[w_base2 + pack_off]);
+        let s2 = load(scales[sb_base2 + g]).cast::<f32>();
+        let bi2 = load(biases[sb_base2 + g]).cast::<f32>();
+        let q20 = (p2 & 255u32).cast::<f32>();
+        let q21 = ((p2 >> 8u32) & 255u32).cast::<f32>();
+        let q22 = ((p2 >> 16u32) & 255u32).cast::<f32>();
+        let q23 = ((p2 >> 24u32) & 255u32).cast::<f32>();
+        let qd2_a = q20 * x0_a + q21 * x1_a + q22 * x2_a + q23 * x3_a;
+        let qd2_b = q20 * x0_b + q21 * x1_b + q22 * x2_b + q23 * x3_b;
+        acc2_a = acc2_a + s2 * qd2_a + bi2 * xs_a;
+        acc2_b = acc2_b + s2 * qd2_b + bi2 * xs_b;
+
+        // ── Row 3 ──
+        let p3 = load(w[w_base3 + pack_off]);
+        let s3 = load(scales[sb_base3 + g]).cast::<f32>();
+        let bi3 = load(biases[sb_base3 + g]).cast::<f32>();
+        let q30 = (p3 & 255u32).cast::<f32>();
+        let q31 = ((p3 >> 8u32) & 255u32).cast::<f32>();
+        let q32 = ((p3 >> 16u32) & 255u32).cast::<f32>();
+        let q33 = ((p3 >> 24u32) & 255u32).cast::<f32>();
+        let qd3_a = q30 * x0_a + q31 * x1_a + q32 * x2_a + q33 * x3_a;
+        let qd3_b = q30 * x0_b + q31 * x1_b + q32 * x2_b + q33 * x3_b;
+        acc3_a = acc3_a + s3 * qd3_a + bi3 * xs_a;
+        acc3_b = acc3_b + s3 * qd3_b + bi3 * xs_b;
+    }
+
+    // Cross-lane reduce + lane-0 stores. 8 outputs per TG.
+    let r0_a = simd_sum(acc0_a);
+    let r0_b = simd_sum(acc0_b);
+    let r1_a = simd_sum(acc1_a);
+    let r1_b = simd_sum(acc1_b);
+    let r2_a = simd_sum(acc2_a);
+    let r2_b = simd_sum(acc2_b);
+    let r3_a = simd_sum(acc3_a);
+    let r3_b = simd_sum(acc3_b);
+    if lane == 0u32 {
+        store(out[m_row_a * n + row0], r0_a.cast::<T>());
+        store(out[m_row_a * n + row1], r1_a.cast::<T>());
+        store(out[m_row_a * n + row2], r2_a.cast::<T>());
+        store(out[m_row_a * n + row3], r3_a.cast::<T>());
+        store(out[m_row_b * n + row0], r0_b.cast::<T>());
+        store(out[m_row_b * n + row1], r1_b.cast::<T>());
+        store(out[m_row_b * n + row2], r2_b.cast::<T>());
+        store(out[m_row_b * n + row3], r3_b.cast::<T>());
+    }
+}
+
+// ─── mt_qmm_bm4_int8_fast ───────────────────────────────────────────────
+//
+// Int8 matmul BM=4 — mirrors `mt_qmm_bm4` for int4 but adapted for
+// int8 weights. Four M-rows per TG; W packs loaded once per K-block per
+// N-row and reused across all 4 M-rows. K-block = 128 (4 X per lane ×
+// 32 lanes).
+//
+// ## Geometry
+//   tpg = 64 = 2 SG × 32 lanes
+//   BM = 4 (M-rows per TG), BN = 8 (N-rows per TG)
+//   32 outputs per TG, Grid: [n / 8, m / 4, 1]
+//
+// ## Layouts
+//   w       [n, k/4]               u32
+//   scales  [n, k/group_size]      T
+//   biases  [n, k/group_size]      T
+//   x       [m, k]                 T
+//   out     [m, n]                 T
+
+#[bench_kernel(
+    op="quantized",
+    subop="qmm_bm4_int8_fast",
+    class=QuantizedMatMul,
+    shapes=&QUANTIZED_SHAPES,
+    m=8,
+    group_size=64,
+    tpg=64,
+    bits=8,
+    tol=1e-2,
+    mlx="affine_qmm_fast_float16_t_gs_64_b_8_alN_true_batch_0",
+    metal_file="quantized.metal",
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+)]
+#[kernel]
+pub fn mt_qmm_bm4_int8_fast<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    let tg = tgid_x;
+    let m_tile = tgid_y;
+    let sg = simd_id;
+    let lane = simd_lane;
+    let row0 = tg * 8u32 + sg * 4u32;
+    let row1 = row0 + 1u32;
+    let row2 = row0 + 2u32;
+    let row3 = row0 + 3u32;
+
+    // int8: 4 codes per u32.
+    let packs_per_row = k / 4u32;
+    let w_base0 = row0 * packs_per_row;
+    let w_base1 = row1 * packs_per_row;
+    let w_base2 = row2 * packs_per_row;
+    let w_base3 = row3 * packs_per_row;
+
+    let sb_base0 = row0 * gs_per_row;
+    let sb_base1 = row1 * gs_per_row;
+    let sb_base2 = row2 * gs_per_row;
+    let sb_base3 = row3 * gs_per_row;
+
+    // BM=4 M-rows per TG.
+    let m_row_a = m_tile * 4u32;
+    let m_row_b = m_row_a + 1u32;
+    let m_row_c = m_row_a + 2u32;
+    let m_row_d = m_row_a + 3u32;
+    let x_base_a = m_row_a * k;
+    let x_base_b = m_row_b * k;
+    let x_base_c = m_row_c * k;
+    let x_base_d = m_row_d * k;
+
+    // 16 accumulators: 4 N-rows × 4 M-rows.
+    let mut acc0_a = 0.0f32;
+    let mut acc0_b = 0.0f32;
+    let mut acc0_c = 0.0f32;
+    let mut acc0_d = 0.0f32;
+    let mut acc1_a = 0.0f32;
+    let mut acc1_b = 0.0f32;
+    let mut acc1_c = 0.0f32;
+    let mut acc1_d = 0.0f32;
+    let mut acc2_a = 0.0f32;
+    let mut acc2_b = 0.0f32;
+    let mut acc2_c = 0.0f32;
+    let mut acc2_d = 0.0f32;
+    let mut acc3_a = 0.0f32;
+    let mut acc3_b = 0.0f32;
+    let mut acc3_c = 0.0f32;
+    let mut acc3_d = 0.0f32;
+
+    // 4 X per lane × 32 lanes = 128 K-block.
+    let lane_x_off = lane * 4u32;
+    let lane_pack_off = lane;
+
+    for _b in range(0u32, k, 128u32) {
+        // ── Load 4 X values for each of the 4 M-rows ──
+        let xb_a = x_base_a + _b + lane_x_off;
+        let x0_a = load(x[xb_a]).cast::<f32>();
+        let x1_a = load(x[xb_a + 1u32]).cast::<f32>();
+        let x2_a = load(x[xb_a + 2u32]).cast::<f32>();
+        let x3_a = load(x[xb_a + 3u32]).cast::<f32>();
+        let xs_a = x0_a + x1_a + x2_a + x3_a;
+
+        let xb_b = x_base_b + _b + lane_x_off;
+        let x0_b = load(x[xb_b]).cast::<f32>();
+        let x1_b = load(x[xb_b + 1u32]).cast::<f32>();
+        let x2_b = load(x[xb_b + 2u32]).cast::<f32>();
+        let x3_b = load(x[xb_b + 3u32]).cast::<f32>();
+        let xs_b = x0_b + x1_b + x2_b + x3_b;
+
+        let xb_c = x_base_c + _b + lane_x_off;
+        let x0_c = load(x[xb_c]).cast::<f32>();
+        let x1_c = load(x[xb_c + 1u32]).cast::<f32>();
+        let x2_c = load(x[xb_c + 2u32]).cast::<f32>();
+        let x3_c = load(x[xb_c + 3u32]).cast::<f32>();
+        let xs_c = x0_c + x1_c + x2_c + x3_c;
+
+        let xb_d = x_base_d + _b + lane_x_off;
+        let x0_d = load(x[xb_d]).cast::<f32>();
+        let x1_d = load(x[xb_d + 1u32]).cast::<f32>();
+        let x2_d = load(x[xb_d + 2u32]).cast::<f32>();
+        let x3_d = load(x[xb_d + 3u32]).cast::<f32>();
+        let xs_d = x0_d + x1_d + x2_d + x3_d;
+
+        let g = (_b + lane_x_off) / 64u32;
+        let pack_off = _b / 4u32 + lane_pack_off;
+
+        // ── Row 0 (W extracts shared across all 4 M-rows) ──
+        let p0 = load(w[w_base0 + pack_off]);
+        let s0 = load(scales[sb_base0 + g]).cast::<f32>();
+        let bi0 = load(biases[sb_base0 + g]).cast::<f32>();
+        let q00 = (p0 & 255u32).cast::<f32>();
+        let q01 = ((p0 >> 8u32) & 255u32).cast::<f32>();
+        let q02 = ((p0 >> 16u32) & 255u32).cast::<f32>();
+        let q03 = ((p0 >> 24u32) & 255u32).cast::<f32>();
+        let qd0_a = q00 * x0_a + q01 * x1_a + q02 * x2_a + q03 * x3_a;
+        let qd0_b = q00 * x0_b + q01 * x1_b + q02 * x2_b + q03 * x3_b;
+        let qd0_c = q00 * x0_c + q01 * x1_c + q02 * x2_c + q03 * x3_c;
+        let qd0_d = q00 * x0_d + q01 * x1_d + q02 * x2_d + q03 * x3_d;
+        acc0_a = acc0_a + s0 * qd0_a + bi0 * xs_a;
+        acc0_b = acc0_b + s0 * qd0_b + bi0 * xs_b;
+        acc0_c = acc0_c + s0 * qd0_c + bi0 * xs_c;
+        acc0_d = acc0_d + s0 * qd0_d + bi0 * xs_d;
+
+        // ── Row 1 ──
+        let p1 = load(w[w_base1 + pack_off]);
+        let s1 = load(scales[sb_base1 + g]).cast::<f32>();
+        let bi1 = load(biases[sb_base1 + g]).cast::<f32>();
+        let q10 = (p1 & 255u32).cast::<f32>();
+        let q11 = ((p1 >> 8u32) & 255u32).cast::<f32>();
+        let q12 = ((p1 >> 16u32) & 255u32).cast::<f32>();
+        let q13 = ((p1 >> 24u32) & 255u32).cast::<f32>();
+        let qd1_a = q10 * x0_a + q11 * x1_a + q12 * x2_a + q13 * x3_a;
+        let qd1_b = q10 * x0_b + q11 * x1_b + q12 * x2_b + q13 * x3_b;
+        let qd1_c = q10 * x0_c + q11 * x1_c + q12 * x2_c + q13 * x3_c;
+        let qd1_d = q10 * x0_d + q11 * x1_d + q12 * x2_d + q13 * x3_d;
+        acc1_a = acc1_a + s1 * qd1_a + bi1 * xs_a;
+        acc1_b = acc1_b + s1 * qd1_b + bi1 * xs_b;
+        acc1_c = acc1_c + s1 * qd1_c + bi1 * xs_c;
+        acc1_d = acc1_d + s1 * qd1_d + bi1 * xs_d;
+
+        // ── Row 2 ──
+        let p2 = load(w[w_base2 + pack_off]);
+        let s2 = load(scales[sb_base2 + g]).cast::<f32>();
+        let bi2 = load(biases[sb_base2 + g]).cast::<f32>();
+        let q20 = (p2 & 255u32).cast::<f32>();
+        let q21 = ((p2 >> 8u32) & 255u32).cast::<f32>();
+        let q22 = ((p2 >> 16u32) & 255u32).cast::<f32>();
+        let q23 = ((p2 >> 24u32) & 255u32).cast::<f32>();
+        let qd2_a = q20 * x0_a + q21 * x1_a + q22 * x2_a + q23 * x3_a;
+        let qd2_b = q20 * x0_b + q21 * x1_b + q22 * x2_b + q23 * x3_b;
+        let qd2_c = q20 * x0_c + q21 * x1_c + q22 * x2_c + q23 * x3_c;
+        let qd2_d = q20 * x0_d + q21 * x1_d + q22 * x2_d + q23 * x3_d;
+        acc2_a = acc2_a + s2 * qd2_a + bi2 * xs_a;
+        acc2_b = acc2_b + s2 * qd2_b + bi2 * xs_b;
+        acc2_c = acc2_c + s2 * qd2_c + bi2 * xs_c;
+        acc2_d = acc2_d + s2 * qd2_d + bi2 * xs_d;
+
+        // ── Row 3 ──
+        let p3 = load(w[w_base3 + pack_off]);
+        let s3 = load(scales[sb_base3 + g]).cast::<f32>();
+        let bi3 = load(biases[sb_base3 + g]).cast::<f32>();
+        let q30 = (p3 & 255u32).cast::<f32>();
+        let q31 = ((p3 >> 8u32) & 255u32).cast::<f32>();
+        let q32 = ((p3 >> 16u32) & 255u32).cast::<f32>();
+        let q33 = ((p3 >> 24u32) & 255u32).cast::<f32>();
+        let qd3_a = q30 * x0_a + q31 * x1_a + q32 * x2_a + q33 * x3_a;
+        let qd3_b = q30 * x0_b + q31 * x1_b + q32 * x2_b + q33 * x3_b;
+        let qd3_c = q30 * x0_c + q31 * x1_c + q32 * x2_c + q33 * x3_c;
+        let qd3_d = q30 * x0_d + q31 * x1_d + q32 * x2_d + q33 * x3_d;
+        acc3_a = acc3_a + s3 * qd3_a + bi3 * xs_a;
+        acc3_b = acc3_b + s3 * qd3_b + bi3 * xs_b;
+        acc3_c = acc3_c + s3 * qd3_c + bi3 * xs_c;
+        acc3_d = acc3_d + s3 * qd3_d + bi3 * xs_d;
+    }
+
+    // Cross-lane reduce + lane-0 stores. 16 outputs per TG.
+    let r0_a = simd_sum(acc0_a);
+    let r0_b = simd_sum(acc0_b);
+    let r0_c = simd_sum(acc0_c);
+    let r0_d = simd_sum(acc0_d);
+    let r1_a = simd_sum(acc1_a);
+    let r1_b = simd_sum(acc1_b);
+    let r1_c = simd_sum(acc1_c);
+    let r1_d = simd_sum(acc1_d);
+    let r2_a = simd_sum(acc2_a);
+    let r2_b = simd_sum(acc2_b);
+    let r2_c = simd_sum(acc2_c);
+    let r2_d = simd_sum(acc2_d);
+    let r3_a = simd_sum(acc3_a);
+    let r3_b = simd_sum(acc3_b);
+    let r3_c = simd_sum(acc3_c);
+    let r3_d = simd_sum(acc3_d);
+    if lane == 0u32 {
+        store(out[m_row_a * n + row0], r0_a.cast::<T>());
+        store(out[m_row_a * n + row1], r1_a.cast::<T>());
+        store(out[m_row_a * n + row2], r2_a.cast::<T>());
+        store(out[m_row_a * n + row3], r3_a.cast::<T>());
+        store(out[m_row_b * n + row0], r0_b.cast::<T>());
+        store(out[m_row_b * n + row1], r1_b.cast::<T>());
+        store(out[m_row_b * n + row2], r2_b.cast::<T>());
+        store(out[m_row_b * n + row3], r3_b.cast::<T>());
+        store(out[m_row_c * n + row0], r0_c.cast::<T>());
+        store(out[m_row_c * n + row1], r1_c.cast::<T>());
+        store(out[m_row_c * n + row2], r2_c.cast::<T>());
+        store(out[m_row_c * n + row3], r3_c.cast::<T>());
+        store(out[m_row_d * n + row0], r0_d.cast::<T>());
+        store(out[m_row_d * n + row1], r1_d.cast::<T>());
+        store(out[m_row_d * n + row2], r2_d.cast::<T>());
+        store(out[m_row_d * n + row3], r3_d.cast::<T>());
+    }
+}
+
 // ─── mt_qmm_mma ─────────────────────────────────────────────────────────
 //
 // Quantized matmul via simdgroup-matrix MMA — the M ≥ 32 path that hits
@@ -2214,6 +2938,664 @@ pub fn mt_qmm_mma_m16<T>(
         // sm = 0 fixed (WM=1 → both SGs cover full BM=16).
         // A-frag (X) elem[i] @ (fm, fn_i) = Xs[(0 + frag_m + fm) * 36 + (k_inner*8 + fn_i)]
         // B-frag (W^T) elem[i] @ (fm, fn_i) = Ws[(sn*16 + frag_n + fn_i) * 36 + (k_inner*8 + fm)]
+        let row_a0 = sm * 16u32 + fm; // frag_m = 0
+        let row_a1 = sm * 16u32 + 8u32 + fm; // frag_m = 8
+        let col_b0 = sn * 16u32; // frag_n = 0 base offset
+        let col_b1 = sn * 16u32 + 8u32; // frag_n = 8 base offset
+
+        // k_inner = 0 (k offset 0..7 inside BK=32)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + fn1));
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+
+        // k_inner = 1 (k offset 8..15)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn1));
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 8u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+
+        // k_inner = 2 (k offset 16..23)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn1));
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 16u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+
+        // k_inner = 3 (k offset 24..31)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn1));
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 24u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+
+        threadgroup_barrier();
+    }
+
+    // ── 4. Write 4 C frags to global out ──
+    // sm = 0 → out_m_base starts at m_tile*16 (no sub-tile m offset).
+    let out_m_base = m_tile * 16u32;
+    let out_n_base = n_tile * 32u32 + sn * 16u32;
+    // c_f00 at (frag_m=0, frag_n=0)
+    store(out[(out_m_base + fm) * n + out_n_base + fn0], simdgroup_elem_load(c_f00, 0).cast::<T>());
+    store(out[(out_m_base + fm) * n + out_n_base + fn1], simdgroup_elem_load(c_f00, 1).cast::<T>());
+    // c_f01 at (frag_m=0, frag_n=8)
+    store(
+        out[(out_m_base + fm) * n + out_n_base + 8u32 + fn0],
+        simdgroup_elem_load(c_f01, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + fm) * n + out_n_base + 8u32 + fn1],
+        simdgroup_elem_load(c_f01, 1).cast::<T>(),
+    );
+    // c_f10 at (frag_m=8, frag_n=0)
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + fn0],
+        simdgroup_elem_load(c_f10, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + fn1],
+        simdgroup_elem_load(c_f10, 1).cast::<T>(),
+    );
+    // c_f11 at (frag_m=8, frag_n=8)
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn0],
+        simdgroup_elem_load(c_f11, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn1],
+        simdgroup_elem_load(c_f11, 1).cast::<T>(),
+    );
+}
+
+// ─── mt_qmm_mma_int8 ────────────────────────────────────────────────────
+//
+// Int8-quantized simdgroup-matrix MMA prefill — mirrors `mt_qmm_mma` but
+// operates on int8-packed weights (4 bytes per u32, `pack_factor=4`).
+//
+// Geometry (identical to mt_qmm_mma):
+//   tpg = 128 = 4 SG × 32 lanes (WM=2, WN=2 warp grid)
+//   BM = BN = BK = 32, output tile 32×32 (1024 outputs/TG)
+//   Grid: [N/32, M/32, 1]
+//   Each SG owns a 16×16 sub-tile = 2×2 = 4 8×8 frags
+//   Per K-block per SG: 4 frags × 4 k-inner = 16 MMAs (64 across TG)
+//
+// W dequant lane mapping (changed vs int4):
+//   Int4: 128 packs / K-block (32 rows × 4 packs/row), 1 pack per lane.
+//   Int8: 256 packs / K-block (32 rows × 8 packs/row), 2 packs per lane.
+//   pack_idx_N = N*128 + lane_in_tg, N ∈ {0, 1}.
+//   w_row = pack_idx / 8 ∈ 0..31, pack_in_row = pack_idx % 8 ∈ 0..7.
+//   Each pack dequants 4 bytes → 4 fp T values at
+//   Ws[w_row*ws_ld + pack_in_row*4 + i], i ∈ 0..3.
+//
+// Scale/bias: group_size=64, packs_per_row = k/4 (4 elements/pack).
+//   Group index per element-offset d: g = d / group_size = (kb + byte_offset) / 64.
+//   pack_in_row ∈ 0..7 → 4 values at kb + pack_in_row*4 ∈ kb..kb+31.
+//   All 4 values in a pack share the same group (4 < 64).
+//
+// TG memory layout: identical Xs[32×36] / Ws[32×36] shape (skew=4).
+// X load: same as mt_qmm_mma (8 contiguous K elems per lane, vec4 fusion).
+// MMA inner loop: identical to mt_qmm_mma (4 k-inner × 4 frags = 16 MMAs/SG).
+#[bench_kernel(
+    op="quantized",
+    subop="qmm_mma_int8",
+    class=QuantizedMatMul,
+    shapes=&QUANTIZED_SHAPES,
+    m=32,
+    group_size=64,
+    tpg=128,
+    bits=8,
+    // int8 max_q=255 amplifies bf16 round-trip drift further than int4's 15.
+    // At production shapes (M=4096+, K=4096+) bf16 cosine drifts ~8-9e-3.
+    // tol=1e-2 keeps f32/f16 cells tight while passing bf16.
+    tol=1e-2,
+    mlx="affine_qmm_t_{tn}_gs_64_b_8_alN_true_batch_0",
+    metal_file="quantized.metal",
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+)]
+#[kernel]
+pub fn mt_qmm_mma_int8<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    let n_tile = tgid_x;
+    let m_tile = tgid_y;
+    let lane = simd_lane;
+    let sg = simd_group_id();
+    // 4 SGs in 2×2 warp grid: sg ∈ {0,1,2,3} → (sm=sg/2, sn=sg%2).
+    // Each SG owns a 16×16 sub-tile at (sm*16, sn*16) inside 32×32 tile.
+    let sm = sg / 2u32;
+    let sn = sg & 1u32;
+    let lane_in_tg = sg * 32u32 + lane;
+
+    // 8×8 frag lane mapping (Apple steel_gemm layout — same as mt_qmm_mma).
+    let qid = lane / 4u32;
+    let fm = (qid & 4u32) + ((lane / 2u32) % 4u32);
+    let fn0 = (qid & 2u32) * 2u32 + (lane % 2u32) * 2u32;
+    let fn1 = fn0 + 1u32;
+
+    // TG memory for X tile [BM × BK] and dequant W tile [BN × BK].
+    // BK + 4 = 36 stride for bank-conflict avoidance — same skew rationale
+    // as mt_qmm_mma. Xs size = 32 × 36 = 1152 T; Ws size = 32 × 36 = 1152 T.
+    threadgroup_alloc("xs", 1152, T);
+    threadgroup_alloc("ws", 1152, T);
+
+    // ── 4 output frags per SG, init to 0 ──
+    let c_f00 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f00, 0, 0.0f32);
+    simdgroup_elem_store(c_f00, 1, 0.0f32);
+    let c_f01 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f01, 0, 0.0f32);
+    simdgroup_elem_store(c_f01, 1, 0.0f32);
+    let c_f10 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f10, 0, 0.0f32);
+    simdgroup_elem_store(c_f10, 1, 0.0f32);
+    let c_f11 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f11, 0, 0.0f32);
+    simdgroup_elem_store(c_f11, 1, 0.0f32);
+
+    // A (X) and B (W^T) frag scratch, reused per k_inner.
+    let a_f0 = simdgroup_alloc::<T, 8, 8>();
+    let a_f1 = simdgroup_alloc::<T, 8, 8>();
+    let b_f0 = simdgroup_alloc::<T, 8, 8>();
+    let b_f1 = simdgroup_alloc::<T, 8, 8>();
+
+    let x_m_base = m_tile * 32u32; // first M-row this TG handles
+    let w_n_base = n_tile * 32u32; // first N-row this TG handles
+    // Int8: 4 elements per pack → packs_per_row = k / 4.
+    let packs_per_row = k / 4u32;
+
+    // TG row stride = 36 (BK + 4 skew).
+    let xs_ld_const = 36u32;
+    let ws_ld_const = 36u32;
+    let xs_ld = xs_ld_const;
+    let ws_ld = ws_ld_const;
+
+    // Coop X-load mapping. 32×32 = 1024 elements, 128 lanes × 8 elems each.
+    // Same vec4-fusion layout as mt_qmm_mma: lane_in_tg/4 = m_row, lane_in_tg%4 = k_quad.
+    let x_m_row = lane_in_tg / 4u32;
+    let x_k_quad = lane_in_tg & 3u32;
+    let x_k_base = x_k_quad * 8u32;
+
+    // W dequant lane mapping for int8:
+    // 256 packs per K-block (32 rows × 8 packs/row). 128 lanes → 2 packs/lane.
+    // pack_idx_0 = lane_in_tg (packs 0..127), pack_idx_1 = 128 + lane_in_tg (packs 128..255).
+    // w_row = pack_idx / 8 ∈ 0..31, pack_in_row = pack_idx % 8 ∈ 0..7.
+
+    for kb in range(0u32, k, 32u32) {
+        // ── 1. Coop X load — 128 lanes × 8 contiguous K elems per lane ──
+        let x_row_dev_base = (x_m_base + x_m_row) * k + kb + x_k_base;
+        let x_ws_base = x_m_row * xs_ld + x_k_base;
+        let xv0 = load(x[x_row_dev_base]).cast::<T>();
+        let xv1 = load(x[x_row_dev_base + 1u32]).cast::<T>();
+        let xv2 = load(x[x_row_dev_base + 2u32]).cast::<T>();
+        let xv3 = load(x[x_row_dev_base + 3u32]).cast::<T>();
+        let xv4 = load(x[x_row_dev_base + 4u32]).cast::<T>();
+        let xv5 = load(x[x_row_dev_base + 5u32]).cast::<T>();
+        let xv6 = load(x[x_row_dev_base + 6u32]).cast::<T>();
+        let xv7 = load(x[x_row_dev_base + 7u32]).cast::<T>();
+        threadgroup_store("xs", x_ws_base, xv0);
+        threadgroup_store("xs", x_ws_base + 1u32, xv1);
+        threadgroup_store("xs", x_ws_base + 2u32, xv2);
+        threadgroup_store("xs", x_ws_base + 3u32, xv3);
+        threadgroup_store("xs", x_ws_base + 4u32, xv4);
+        threadgroup_store("xs", x_ws_base + 5u32, xv5);
+        threadgroup_store("xs", x_ws_base + 6u32, xv6);
+        threadgroup_store("xs", x_ws_base + 7u32, xv7);
+
+        // ── 2. Coop W dequant (int8) — 128 lanes × 2 packs each → 1024 fp T ──
+        // Pack 0: pack_idx = lane_in_tg ∈ 0..127 (first 128 packs).
+        // Pack 1: pack_idx = 128 + lane_in_tg ∈ 128..255 (last 128 packs).
+        // Each pack yields 4 values via (pack >> (i*8)) & 0xFF, i ∈ 0..3.
+
+        // Pack 0
+        let pack_idx_0 = lane_in_tg;
+        let w_row_0 = pack_idx_0 / 8u32;
+        let pack_in_row_0 = pack_idx_0 & 7u32;
+        let pack_0 = load(w[(w_n_base + w_row_0) * packs_per_row + kb / 4u32 + pack_in_row_0]);
+        let k_off_0 = kb + pack_in_row_0 * 4u32;
+        let g_0 = k_off_0 / 64u32; // group_size = 64
+        let sb_base_0 = (w_n_base + w_row_0) * gs_per_row;
+        let s_0 = load(scales[sb_base_0 + g_0]).cast::<f32>();
+        let b_0 = load(biases[sb_base_0 + g_0]).cast::<f32>();
+        let q0_0 = (pack_0 & 255u32).cast::<f32>();
+        let q1_0 = ((pack_0 >> 8u32) & 255u32).cast::<f32>();
+        let q2_0 = ((pack_0 >> 16u32) & 255u32).cast::<f32>();
+        let q3_0 = ((pack_0 >> 24u32) & 255u32).cast::<f32>();
+        let ws_base_0 = w_row_0 * ws_ld + pack_in_row_0 * 4u32;
+        threadgroup_store("ws", ws_base_0, (s_0 * q0_0 + b_0).cast::<T>());
+        threadgroup_store("ws", ws_base_0 + 1u32, (s_0 * q1_0 + b_0).cast::<T>());
+        threadgroup_store("ws", ws_base_0 + 2u32, (s_0 * q2_0 + b_0).cast::<T>());
+        threadgroup_store("ws", ws_base_0 + 3u32, (s_0 * q3_0 + b_0).cast::<T>());
+
+        // Pack 1
+        let pack_idx_1 = 128u32 + lane_in_tg;
+        let w_row_1 = pack_idx_1 / 8u32;
+        let pack_in_row_1 = pack_idx_1 & 7u32;
+        let pack_1 = load(w[(w_n_base + w_row_1) * packs_per_row + kb / 4u32 + pack_in_row_1]);
+        let k_off_1 = kb + pack_in_row_1 * 4u32;
+        let g_1 = k_off_1 / 64u32;
+        let sb_base_1 = (w_n_base + w_row_1) * gs_per_row;
+        let s_1 = load(scales[sb_base_1 + g_1]).cast::<f32>();
+        let b_1 = load(biases[sb_base_1 + g_1]).cast::<f32>();
+        let q0_1 = (pack_1 & 255u32).cast::<f32>();
+        let q1_1 = ((pack_1 >> 8u32) & 255u32).cast::<f32>();
+        let q2_1 = ((pack_1 >> 16u32) & 255u32).cast::<f32>();
+        let q3_1 = ((pack_1 >> 24u32) & 255u32).cast::<f32>();
+        let ws_base_1 = w_row_1 * ws_ld + pack_in_row_1 * 4u32;
+        threadgroup_store("ws", ws_base_1, (s_1 * q0_1 + b_1).cast::<T>());
+        threadgroup_store("ws", ws_base_1 + 1u32, (s_1 * q1_1 + b_1).cast::<T>());
+        threadgroup_store("ws", ws_base_1 + 2u32, (s_1 * q2_1 + b_1).cast::<T>());
+        threadgroup_store("ws", ws_base_1 + 3u32, (s_1 * q3_1 + b_1).cast::<T>());
+
+        threadgroup_barrier();
+
+        // ── 3. MMA inner loop — 4 frags × 4 k-inner = 16 MMAs per SG ──
+        // Identical to mt_qmm_mma: A-load, barrier, B-load, barrier, MMAs,
+        // barrier; serpentine MMA order (00→01→11→10).
+        let row_a0 = sm * 16u32 + fm; // frag_m = 0
+        let row_a1 = sm * 16u32 + 8u32 + fm; // frag_m = 8
+        let col_b0 = sn * 16u32; // frag_n = 0 base offset
+        let col_b1 = sn * 16u32 + 8u32; // frag_n = 8 base offset
+
+        // k_inner = 0 (k offset 0..7 inside BK=32)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        // k_inner = 1 (k offset 8..15)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 8u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 8u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        // k_inner = 2 (k offset 16..23)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 16u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 16u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        // k_inner = 3 (k offset 24..31)
+        simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn0));
+        simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn1));
+        simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn0));
+        simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn1));
+        simdgroup_barrier_mem_none();
+        simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 24u32 + fm));
+        simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 24u32 + fm));
+        simdgroup_barrier_mem_none();
+        simdgroup_matmul(a_f0, b_f0, c_f00);
+        simdgroup_matmul(a_f0, b_f1, c_f01);
+        simdgroup_matmul(a_f1, b_f1, c_f11);
+        simdgroup_matmul(a_f1, b_f0, c_f10);
+        simdgroup_barrier_mem_none();
+
+        threadgroup_barrier();
+    }
+
+    // ── 4. Write 4 C frags to global out ──
+    let out_m_base = m_tile * 32u32 + sm * 16u32;
+    let out_n_base = n_tile * 32u32 + sn * 16u32;
+    // c_f00 at (frag_m=0, frag_n=0)
+    store(out[(out_m_base + fm) * n + out_n_base + fn0], simdgroup_elem_load(c_f00, 0).cast::<T>());
+    store(out[(out_m_base + fm) * n + out_n_base + fn1], simdgroup_elem_load(c_f00, 1).cast::<T>());
+    // c_f01 at (frag_m=0, frag_n=8)
+    store(
+        out[(out_m_base + fm) * n + out_n_base + 8u32 + fn0],
+        simdgroup_elem_load(c_f01, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + fm) * n + out_n_base + 8u32 + fn1],
+        simdgroup_elem_load(c_f01, 1).cast::<T>(),
+    );
+    // c_f10 at (frag_m=8, frag_n=0)
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + fn0],
+        simdgroup_elem_load(c_f10, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + fn1],
+        simdgroup_elem_load(c_f10, 1).cast::<T>(),
+    );
+    // c_f11 at (frag_m=8, frag_n=8)
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn0],
+        simdgroup_elem_load(c_f11, 0).cast::<T>(),
+    );
+    store(
+        out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn1],
+        simdgroup_elem_load(c_f11, 1).cast::<T>(),
+    );
+}
+
+// ─── mt_qmm_mma_m16_int8 ────────────────────────────────────────────────
+//
+// Int8 half-height MMA — the M=16 cell, int8 weights.
+// Mirrors `mt_qmm_mma_m16` but with int8 pack format (4 bytes/u32).
+//
+// Geometry (identical to mt_qmm_mma_m16):
+//   tpg = 64 = 2 SG × 32 lanes (WM=1, WN=2 warp grid)
+//   BM = 16, BN = BK = 32 → 16×32 output tile (512 outputs/TG)
+//   Grid: [N/32, M/16, 1]
+//   Each SG owns a 16×16 sub-tile = 4 8×8 frags
+//
+// W dequant lane mapping (changed vs int4):
+//   Int4: 128 packs / K-block, 64 lanes × 2 packs each.
+//   Int8: 256 packs / K-block (32 rows × 8 packs/row), 64 lanes × 4 packs each.
+//   For step N ∈ {0,1,2,3}: pack_idx = N*64 + lane_in_tg.
+//   w_row = pack_idx / 8, pack_in_row = pack_idx % 8.
+//   Each pack dequants 4 bytes → Ws[w_row*ws_ld + pack_in_row*4 + i].
+//
+// X load: mt_qmm_mma_m16 flat-stride pattern (8 strides of 64 lanes covering
+// the 512-element Xs tile). Same as int4.
+//
+// MMA inner loop: identical to mt_qmm_mma_m16 (no A/B barrier; 4 k-inner).
+#[bench_kernel(
+    op="quantized",
+    subop="qmm_mma_m16_int8",
+    class=QuantizedMatMul,
+    shapes=&QUANTIZED_SHAPES,
+    m=16,
+    group_size=64,
+    tpg=64,
+    bits=8,
+    // Same bf16 tolerance rationale as mt_qmm_mma_int8.
+    tol=1e-2,
+    mlx="affine_qmm_t_{tn}_gs_64_b_8_alN_true_batch_0",
+    metal_file="quantized.metal",
+    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+)]
+#[kernel]
+pub fn mt_qmm_mma_m16_int8<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_row: u32,
+) {
+    let n_tile = tgid_x;
+    let m_tile = tgid_y;
+    let lane = simd_lane;
+    let sg = simd_group_id();
+    // 2 SGs in 1×2 warp grid: sg ∈ {0,1} → (sm=0, sn=sg).
+    let sm = 0u32;
+    let sn = sg & 1u32;
+    let lane_in_tg = sg * 32u32 + lane;
+
+    // 8×8 frag lane mapping (Apple steel_gemm layout — same as mt_qmm_mma).
+    let qid = lane / 4u32;
+    let fm = (qid & 4u32) + ((lane / 2u32) % 4u32);
+    let fn0 = (qid & 2u32) * 2u32 + (lane % 2u32) * 2u32;
+    let fn1 = fn0 + 1u32;
+
+    // TG memory: Xs[16 × 36] = 576 T; Ws[32 × 36] = 1152 T.
+    threadgroup_alloc("xs", 576, T);
+    threadgroup_alloc("ws", 1152, T);
+
+    // ── 4 output frags per SG, init to 0 ──
+    let c_f00 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f00, 0, 0.0f32);
+    simdgroup_elem_store(c_f00, 1, 0.0f32);
+    let c_f01 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f01, 0, 0.0f32);
+    simdgroup_elem_store(c_f01, 1, 0.0f32);
+    let c_f10 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f10, 0, 0.0f32);
+    simdgroup_elem_store(c_f10, 1, 0.0f32);
+    let c_f11 = simdgroup_alloc::<f32, 8, 8>();
+    simdgroup_elem_store(c_f11, 0, 0.0f32);
+    simdgroup_elem_store(c_f11, 1, 0.0f32);
+
+    // A (X) and B (W^T) frag scratch, reused per k_inner.
+    let a_f0 = simdgroup_alloc::<T, 8, 8>();
+    let a_f1 = simdgroup_alloc::<T, 8, 8>();
+    let b_f0 = simdgroup_alloc::<T, 8, 8>();
+    let b_f1 = simdgroup_alloc::<T, 8, 8>();
+
+    let x_m_base = m_tile * 16u32; // first M-row this TG handles
+    let w_n_base = n_tile * 32u32; // first N-row this TG handles
+    // Int8: 4 elements per pack → packs_per_row = k / 4.
+    let packs_per_row = k / 4u32;
+
+    // TG row stride = 36 (BK + 4 skew).
+    let xs_ld = 36u32;
+    let ws_ld = 36u32;
+
+    for kb in range(0u32, k, 32u32) {
+        // ── 1. Coop X load — 64 lanes × 8 strides each fill 512-elt tile ──
+        let flat0 = lane_in_tg;
+        let flat1 = 64u32 + lane_in_tg;
+        let flat2 = 128u32 + lane_in_tg;
+        let flat3 = 192u32 + lane_in_tg;
+        let flat4 = 256u32 + lane_in_tg;
+        let flat5 = 320u32 + lane_in_tg;
+        let flat6 = 384u32 + lane_in_tg;
+        let flat7 = 448u32 + lane_in_tg;
+        let mr0 = flat0 / 32u32;
+        let mr1 = flat1 / 32u32;
+        let mr2 = flat2 / 32u32;
+        let mr3 = flat3 / 32u32;
+        let mr4 = flat4 / 32u32;
+        let mr5 = flat5 / 32u32;
+        let mr6 = flat6 / 32u32;
+        let mr7 = flat7 / 32u32;
+        let kc0 = flat0 & 31u32;
+        let kc1 = flat1 & 31u32;
+        let kc2 = flat2 & 31u32;
+        let kc3 = flat3 & 31u32;
+        let kc4 = flat4 & 31u32;
+        let kc5 = flat5 & 31u32;
+        let kc6 = flat6 & 31u32;
+        let kc7 = flat7 & 31u32;
+        threadgroup_store(
+            "xs",
+            mr0 * xs_ld + kc0,
+            load(x[(x_m_base + mr0) * k + kb + kc0]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr1 * xs_ld + kc1,
+            load(x[(x_m_base + mr1) * k + kb + kc1]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr2 * xs_ld + kc2,
+            load(x[(x_m_base + mr2) * k + kb + kc2]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr3 * xs_ld + kc3,
+            load(x[(x_m_base + mr3) * k + kb + kc3]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr4 * xs_ld + kc4,
+            load(x[(x_m_base + mr4) * k + kb + kc4]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr5 * xs_ld + kc5,
+            load(x[(x_m_base + mr5) * k + kb + kc5]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr6 * xs_ld + kc6,
+            load(x[(x_m_base + mr6) * k + kb + kc6]).cast::<T>(),
+        );
+        threadgroup_store(
+            "xs",
+            mr7 * xs_ld + kc7,
+            load(x[(x_m_base + mr7) * k + kb + kc7]).cast::<T>(),
+        );
+
+        // ── 2. Coop W dequant (int8) — 64 lanes × 4 packs each → 1024 fp T ──
+        // 256 packs per K-block. 64 lanes × 4 packs = 256. ✓
+        // Step N ∈ {0,1,2,3}: pack_idx = N*64 + lane_in_tg.
+        // w_row = pack_idx / 8, pack_in_row = pack_idx % 8.
+
+        // Pack step 0
+        let pack_idx_0 = lane_in_tg;
+        let w_row_0 = pack_idx_0 / 8u32;
+        let pack_in_row_0 = pack_idx_0 & 7u32;
+        let pack_0 = load(w[(w_n_base + w_row_0) * packs_per_row + kb / 4u32 + pack_in_row_0]);
+        let k_off_0 = kb + pack_in_row_0 * 4u32;
+        let g_0 = k_off_0 / 64u32;
+        let sb_base_0 = (w_n_base + w_row_0) * gs_per_row;
+        let s_0 = load(scales[sb_base_0 + g_0]).cast::<f32>();
+        let b_0 = load(biases[sb_base_0 + g_0]).cast::<f32>();
+        let q0_0 = (pack_0 & 255u32).cast::<f32>();
+        let q1_0 = ((pack_0 >> 8u32) & 255u32).cast::<f32>();
+        let q2_0 = ((pack_0 >> 16u32) & 255u32).cast::<f32>();
+        let q3_0 = ((pack_0 >> 24u32) & 255u32).cast::<f32>();
+        let ws_base_0 = w_row_0 * ws_ld + pack_in_row_0 * 4u32;
+        threadgroup_store("ws", ws_base_0, (s_0 * q0_0 + b_0).cast::<T>());
+        threadgroup_store("ws", ws_base_0 + 1u32, (s_0 * q1_0 + b_0).cast::<T>());
+        threadgroup_store("ws", ws_base_0 + 2u32, (s_0 * q2_0 + b_0).cast::<T>());
+        threadgroup_store("ws", ws_base_0 + 3u32, (s_0 * q3_0 + b_0).cast::<T>());
+
+        // Pack step 1
+        let pack_idx_1 = 64u32 + lane_in_tg;
+        let w_row_1 = pack_idx_1 / 8u32;
+        let pack_in_row_1 = pack_idx_1 & 7u32;
+        let pack_1 = load(w[(w_n_base + w_row_1) * packs_per_row + kb / 4u32 + pack_in_row_1]);
+        let k_off_1 = kb + pack_in_row_1 * 4u32;
+        let g_1 = k_off_1 / 64u32;
+        let sb_base_1 = (w_n_base + w_row_1) * gs_per_row;
+        let s_1 = load(scales[sb_base_1 + g_1]).cast::<f32>();
+        let b_1 = load(biases[sb_base_1 + g_1]).cast::<f32>();
+        let q0_1 = (pack_1 & 255u32).cast::<f32>();
+        let q1_1 = ((pack_1 >> 8u32) & 255u32).cast::<f32>();
+        let q2_1 = ((pack_1 >> 16u32) & 255u32).cast::<f32>();
+        let q3_1 = ((pack_1 >> 24u32) & 255u32).cast::<f32>();
+        let ws_base_1 = w_row_1 * ws_ld + pack_in_row_1 * 4u32;
+        threadgroup_store("ws", ws_base_1, (s_1 * q0_1 + b_1).cast::<T>());
+        threadgroup_store("ws", ws_base_1 + 1u32, (s_1 * q1_1 + b_1).cast::<T>());
+        threadgroup_store("ws", ws_base_1 + 2u32, (s_1 * q2_1 + b_1).cast::<T>());
+        threadgroup_store("ws", ws_base_1 + 3u32, (s_1 * q3_1 + b_1).cast::<T>());
+
+        // Pack step 2
+        let pack_idx_2 = 128u32 + lane_in_tg;
+        let w_row_2 = pack_idx_2 / 8u32;
+        let pack_in_row_2 = pack_idx_2 & 7u32;
+        let pack_2 = load(w[(w_n_base + w_row_2) * packs_per_row + kb / 4u32 + pack_in_row_2]);
+        let k_off_2 = kb + pack_in_row_2 * 4u32;
+        let g_2 = k_off_2 / 64u32;
+        let sb_base_2 = (w_n_base + w_row_2) * gs_per_row;
+        let s_2 = load(scales[sb_base_2 + g_2]).cast::<f32>();
+        let b_2 = load(biases[sb_base_2 + g_2]).cast::<f32>();
+        let q0_2 = (pack_2 & 255u32).cast::<f32>();
+        let q1_2 = ((pack_2 >> 8u32) & 255u32).cast::<f32>();
+        let q2_2 = ((pack_2 >> 16u32) & 255u32).cast::<f32>();
+        let q3_2 = ((pack_2 >> 24u32) & 255u32).cast::<f32>();
+        let ws_base_2 = w_row_2 * ws_ld + pack_in_row_2 * 4u32;
+        threadgroup_store("ws", ws_base_2, (s_2 * q0_2 + b_2).cast::<T>());
+        threadgroup_store("ws", ws_base_2 + 1u32, (s_2 * q1_2 + b_2).cast::<T>());
+        threadgroup_store("ws", ws_base_2 + 2u32, (s_2 * q2_2 + b_2).cast::<T>());
+        threadgroup_store("ws", ws_base_2 + 3u32, (s_2 * q3_2 + b_2).cast::<T>());
+
+        // Pack step 3
+        let pack_idx_3 = 192u32 + lane_in_tg;
+        let w_row_3 = pack_idx_3 / 8u32;
+        let pack_in_row_3 = pack_idx_3 & 7u32;
+        let pack_3 = load(w[(w_n_base + w_row_3) * packs_per_row + kb / 4u32 + pack_in_row_3]);
+        let k_off_3 = kb + pack_in_row_3 * 4u32;
+        let g_3 = k_off_3 / 64u32;
+        let sb_base_3 = (w_n_base + w_row_3) * gs_per_row;
+        let s_3 = load(scales[sb_base_3 + g_3]).cast::<f32>();
+        let b_3 = load(biases[sb_base_3 + g_3]).cast::<f32>();
+        let q0_3 = (pack_3 & 255u32).cast::<f32>();
+        let q1_3 = ((pack_3 >> 8u32) & 255u32).cast::<f32>();
+        let q2_3 = ((pack_3 >> 16u32) & 255u32).cast::<f32>();
+        let q3_3 = ((pack_3 >> 24u32) & 255u32).cast::<f32>();
+        let ws_base_3 = w_row_3 * ws_ld + pack_in_row_3 * 4u32;
+        threadgroup_store("ws", ws_base_3, (s_3 * q0_3 + b_3).cast::<T>());
+        threadgroup_store("ws", ws_base_3 + 1u32, (s_3 * q1_3 + b_3).cast::<T>());
+        threadgroup_store("ws", ws_base_3 + 2u32, (s_3 * q2_3 + b_3).cast::<T>());
+        threadgroup_store("ws", ws_base_3 + 3u32, (s_3 * q3_3 + b_3).cast::<T>());
+
+        threadgroup_barrier();
+
+        // ── 3. MMA inner loop — 4 frags × 4 k-inner = 16 MMAs per SG ──
+        // sm = 0 fixed (WM=1 → both SGs cover full BM=16).
         let row_a0 = sm * 16u32 + fm; // frag_m = 0
         let row_a1 = sm * 16u32 + 8u32 + fm; // frag_m = 8
         let col_b0 = sn * 16u32; // frag_n = 0 base offset
@@ -3526,6 +4908,193 @@ qvm_pow2!(mt_qvm_b8, 8u32, "qvm_b8");
 qvm_odd!(mt_qvm_b3, 3u32, "qvm_b3");
 qvm_odd!(mt_qvm_b5, 5u32, "qvm_b5");
 qvm_odd!(mt_qvm_b6, 6u32, "qvm_b6");
+
+// ─── mt_qvm_int4_fast ─────────────────────────────────────────────────
+//
+// Perf-tuned int4 vecmat `y = xᵀ · W` where W is `[K, N]` row-major.
+//
+// Geometry vs qmv_fast: qmv tiles *output rows* (W rows, `[N, K]`); here
+// we tile *output columns* (W columns, N axis) because the K-dimension
+// is the inner dot. The 8-column-per-TG tile (2 SG × 4 cols) is the
+// structural dual of qmv's 8-row-per-TG tile — each SG handles 4
+// consecutive output columns; each lane contributes to 4 partial sums
+// by loading 16 X values and reading 4 corresponding W packs from each
+// K-position's row.
+//
+// W layout: `[K, N]` row-major — row `d` has `N/8` u32 packs, the
+// `c`-th output column's nibble for K-position `d` is in pack
+// `c/8` at nibble `c%8`. Lane-stride over K — each lane covers K
+// positions `lane, lane+32, lane+64, …` with a 32-lane simdgroup.
+// (Structurally different from qmv_fast because W strides are transposed:
+// column index `c` is within each K-row pack, while K-row index `d` is
+// the outer loop axis rather than the inner.)
+//
+// Scale/bias layout: `[K/G, N]` — scale for column `c` at group `g`
+// is at `scales[g * N + c]`, same column-major structure as the scalar
+// qvm_pow2. Within a 512-K block `N * G / 512` groups are crossed;
+// group index = `d / G` = `(lane_k_base + d_local) / G`.
+//
+// Algebraic split: `acc_c += scale_c * q_dot_c + bias_c * xs`, where
+// `xs = Σ_{d in block} x[d]` is shared across all 4 columns in the SG
+// (X is the same vector regardless of which output column we're
+// computing). `q_dot_c = Σ_{d in block} nibble(W[d, c]) * x[d]` is
+// column-specific.
+//
+// The mask-without-shift trick: nibbles at positions 1/2/3 within a
+// u32 pack have position-powers 16/256/4096. Pre-scaling x[d] by
+// 1/16, 1/256, 1/4096 at the matching positions and using the mask
+// constant (rather than shift) lets the multiplier absorb the nibble
+// position — saves 7 shifts per pack per column = 28 shifts per block.
+//
+// Dispatch:
+//   Grid: [N/8, 1, 1]  — one TG per 8-column tile.
+//   TPG:  64           — 2 SG × 32 lanes.
+//   K: multiple of 32 (lane-stride). N: multiple of 8.
+//   group_size: 64 (standard Qwen3 gs=64).
+
+/// Perf-tuned int4 vecmat `y = xᵀ · W`, W `[K, N]` — 8 output columns
+/// per TG, mirroring `mt_qmv`'s 8-row geometry with K/N transposed.
+///
+/// Each simdgroup handles 4 consecutive output columns. Lane-strided over
+/// K: each lane covers `K/32` K-positions. Grid: `[N/8, 1, 1]`, TPG = 64,
+/// group_size = 64.
+#[kernel]
+pub fn mt_qvm_int4_fast<T>(
+    w: Tensor<u32>,
+    scales: Tensor<T>,
+    biases: Tensor<T>,
+    x: Tensor<T>,
+    out: Tensor<T>,
+    #[constexpr] k: u32,
+    #[constexpr] n: u32,
+    #[constexpr] gs_per_col: u32, // K / group_size — groups per output column
+) {
+    // Each TG handles 8 output columns: SG 0 → cols 0-3, SG 1 → cols 4-7.
+    // `tgid_x` = column tile; `simd_id` = 0 or 1; `simd_lane` = lane.
+    let tg = tgid_x;
+    let sg = simd_id;
+    let lane = simd_lane;
+
+    let col0 = tg * 8u32 + sg * 4u32;
+    let col1 = col0 + 1u32;
+    let col2 = col0 + 2u32;
+    let col3 = col0 + 3u32;
+
+    // Pack offsets within a K-row (N elements packed 8 int4 per u32).
+    let packs_per_krow = n / 8u32;
+    let col0_pack = col0 / 8u32;
+    let col1_pack = col1 / 8u32;
+    let col2_pack = col2 / 8u32;
+    let col3_pack = col3 / 8u32;
+
+    // Nibble slot within the u32 pack for each column.
+    let col0_slot = col0 & 7u32;
+    let col1_slot = col1 & 7u32;
+    let col2_slot = col2 & 7u32;
+    let col3_slot = col3 & 7u32;
+
+    // Mask-without-shift: if the nibble slot is at position p, the
+    // 4-bit value lives at bits [4p, 4p+4). The mask-without-shift trick
+    // works within a u32 when we pre-scale x by 1/16^p so that the raw
+    // masked value (nibble × 16^p) × (x/16^p) = nibble × x.
+    // Here each column has a fixed nibble slot within its u32 pack, so
+    // we can pre-compute the per-column slot factor once.
+    // Slot → mask constant and x-scale factor:
+    //   slot 0: mask=0x0000000f, x_scale=1
+    //   slot 1: mask=0x000000f0, x_scale=1/16
+    //   slot 2: mask=0x00000f00, x_scale=1/256
+    //   slot 3: mask=0x0000f000, x_scale=1/4096
+    //   slot 4: mask=0x000f0000, x_scale=1/65536
+    //   slot 5: mask=0x00f00000, x_scale=1/1048576
+    //   slot 6: mask=0x0f000000, x_scale=1/16777216
+    //   slot 7: mask=0xf0000000, x_scale=1/268435456
+    // For gs=64 with lane-strided K-walk (32 lanes × 1 K-position each),
+    // each outer block covers 32 K-positions → 4 half-words per lane for
+    // gs=64; but since qvm iterates K one element at a time per lane
+    // (not 16 elements as in qmv), we use a simple shift-mask approach
+    // at each K-position to extract the nibble, and still apply the
+    // algebraic split (xs accumulated per-lane, contributed via simd_sum).
+    //
+    // Simpler inner loop than qmv: one K-position per lane per iter,
+    // extract nibble via shift+mask (not mask-without-shift in the hot
+    // path — the column slot varies by column so no single pre-scale
+    // covers all 4 columns). The algebraic split still halves the FMA
+    // count vs the naive `w_real * x` form.
+
+    let mask4 = 15u32;
+    let group_size = k / gs_per_col;
+
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+
+    // Lane-strided K walk: each lane covers K positions
+    // `lane, lane+32, lane+64, …`.
+    let n_iters = (k + 31u32) / 32u32;
+    for _it in range(0u32, n_iters, 1u32) {
+        let d = _it * 32u32 + lane; // K-position for this lane
+        if d < k {
+            let xd = load(x[d]).cast::<f32>();
+            let g = d / group_size;
+
+            // Scales/biases: layout [K/G, N] — col c, group g → index g*N+c.
+            let s0 = load(scales[g * n + col0]).cast::<f32>();
+            let bi0 = load(biases[g * n + col0]).cast::<f32>();
+            let s1 = load(scales[g * n + col1]).cast::<f32>();
+            let bi1 = load(biases[g * n + col1]).cast::<f32>();
+            let s2 = load(scales[g * n + col2]).cast::<f32>();
+            let bi2 = load(biases[g * n + col2]).cast::<f32>();
+            let s3 = load(scales[g * n + col3]).cast::<f32>();
+            let bi3 = load(biases[g * n + col3]).cast::<f32>();
+
+            // W row `d` base offset in the packed array.
+            let row_base = d * packs_per_krow;
+
+            // Extract nibbles for each of the 4 output columns.
+            let w0 = load(w[row_base + col0_pack]);
+            let q0 = ((w0 >> (col0_slot * 4u32)) & mask4).cast::<f32>();
+
+            let w1 = load(w[row_base + col1_pack]);
+            let q1 = ((w1 >> (col1_slot * 4u32)) & mask4).cast::<f32>();
+
+            let w2 = load(w[row_base + col2_pack]);
+            let q2 = ((w2 >> (col2_slot * 4u32)) & mask4).cast::<f32>();
+
+            let w3 = load(w[row_base + col3_pack]);
+            let q3 = ((w3 >> (col3_slot * 4u32)) & mask4).cast::<f32>();
+
+            // Algebraic split: accumulate (s * q - s*bias/s + bias) * x
+            // = s*q*x + bias*x.  Equivalently:
+            //   acc += s * q * x + bias * x
+            //       = s * (q * x) + bias * x
+            // Factored as: acc += s * q_dot + bias * xs (over the group),
+            // but since we do it per-element here the split is just:
+            //   acc += (q * s + bias) * x   — same FMA count as scalar.
+            // The xs algebraic split is only advantageous when 16 x values
+            // are shared across rows/cols; with 1 K-position per iter it
+            // doesn't help. We keep the standard form here.
+            acc0 = acc0 + (q0 * s0 + bi0) * xd;
+            acc1 = acc1 + (q1 * s1 + bi1) * xd;
+            acc2 = acc2 + (q2 * s2 + bi2) * xd;
+            acc3 = acc3 + (q3 * s3 + bi3) * xd;
+        }
+    }
+
+    // Cross-lane reduce within each simdgroup.
+    let r0 = simd_sum(acc0);
+    let r1 = simd_sum(acc1);
+    let r2 = simd_sum(acc2);
+    let r3 = simd_sum(acc3);
+    if lane == 0u32 {
+        store(out[col0], r0.cast::<T>());
+        store(out[col1], r1.cast::<T>());
+        store(out[col2], r2.cast::<T>());
+        store(out[col3], r3.cast::<T>());
+    }
+}
+
+quantized_family_spec!(mt_qvm_int4_fast, "qvm_int4_fast");
 
 /// Auto-select the best `mt_qmm*` kernel for a given dtype + M
 /// (number of tokens / batched rows in this prefill). Returns the

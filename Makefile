@@ -61,17 +61,41 @@ coverage: ## test coverage report (requires cargo-llvm-cov)
 	./scripts/coverage.sh
 
 # ─── Lint / format ────────────────────────────────────────────────────
+#
+# `rustfmt.toml` uses nightly-only options. The repo pins
+# `nightly-2026-05-15` via `rust-toolchain.toml`, and rustup-managed
+# `cargo` respects it. But two things commonly shadow the pinned
+# toolchain on a dev machine:
+#
+#   1. Homebrew installs `/opt/homebrew/bin/cargo` (stable). If that
+#      lands on $PATH before `~/.cargo/bin`, `cargo fmt` invokes
+#      stable rustfmt — which warns about every nightly-only option
+#      and silently reformats things differently.
+#   2. `cargo fmt` resolves the rustfmt binary via `$RUSTFMT` first,
+#      then PATH — so even `rustup run <channel> cargo fmt` will pick
+#      up `/opt/homebrew/bin/rustfmt` (stable) before the nightly one.
+#
+# CI uses dtolnay/rust-toolchain → rustup → reads rust-toolchain.toml
+# → nightly rustfmt → no drift.
+#
+# Local fix: read the pinned channel from rust-toolchain.toml and
+# resolve the absolute path to its rustfmt binary via `rustup which`,
+# then export it as `RUSTFMT`. `cargo fmt` then runs the right binary
+# regardless of $PATH ordering or which `cargo` shim is invoked.
+RUSTUP_CHANNEL := $(shell sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null)
+RUSTFMT_BIN := $(shell rustup which --toolchain $(RUSTUP_CHANNEL) rustfmt 2>/dev/null)
+
 .PHONY: clippy
 clippy: ## run clippy on all targets with -D warnings
 	cargo clippy --all-targets --all-features -- -D warnings
 
 .PHONY: fmt
-fmt: ## run rustfmt on all crates
-	cargo fmt --all
+fmt: ## run rustfmt on all crates (uses the nightly pinned in rust-toolchain.toml)
+	RUSTFMT=$(RUSTFMT_BIN) cargo fmt --all
 
 .PHONY: fmt-check
-fmt-check: ## check formatting without modifying files
-	cargo fmt --all -- --check
+fmt-check: ## check formatting without modifying files (uses the pinned nightly)
+	RUSTFMT=$(RUSTFMT_BIN) cargo fmt --all -- --check
 
 .PHONY: typos
 typos: ## run typos checker (same config CI uses)

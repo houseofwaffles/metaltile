@@ -41,10 +41,10 @@ pub fn run(spec: &BenchSpec, runner: &GpuRunner, dt: DType) -> Vec<OpResult> {
         BenchDispatch::Random { n, tpg } => run_random(spec, runner, dt, &bench, *n, *tpg),
         BenchDispatch::FpQuantized { n, tpg } =>
             run_fp_quantized(spec, runner, dt, &bench, *n, *tpg),
-        BenchDispatch::QuantizedMatVec { shapes, group_size, tpg } =>
-            run_quantized_mat_vec(spec, runner, dt, &bench, shapes, *group_size, *tpg),
-        BenchDispatch::QuantizedMatMul { shapes, m, group_size, tpg } =>
-            run_quantized_mat_mul(spec, runner, dt, &bench, shapes, *m, *group_size, *tpg),
+        BenchDispatch::QuantizedMatVec { shapes, group_size, tpg, bits } =>
+            run_quantized_mat_vec(spec, runner, dt, &bench, shapes, *group_size, *tpg, *bits),
+        BenchDispatch::QuantizedMatMul { shapes, m, group_size, tpg, bits } =>
+            run_quantized_mat_mul(spec, runner, dt, &bench, shapes, *m, *group_size, *tpg, *bits),
         BenchDispatch::Rope { b, h, l, d, n_per_group } =>
             run_rope(spec, runner, dt, &bench, *b, *h, *l, *d, *n_per_group),
         BenchDispatch::Attention { shapes, tpg } =>
@@ -877,6 +877,7 @@ fn run_fp_quantized(
 
 // ── QuantizedMatVec ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_quantized_mat_vec(
     spec: &BenchSpec,
     runner: &GpuRunner,
@@ -885,7 +886,19 @@ fn run_quantized_mat_vec(
     shapes: &[(usize, usize)],
     group_size: usize,
     tpg: usize,
+    bits: u32,
 ) -> Vec<OpResult> {
+    // `bits` must divide 32 cleanly (4 or 8 today). The W pack format is
+    // `vals_per_pack = 32 / bits` codes per u32; each lane in the kernel
+    // reads `packs_per_row = k / vals_per_pack` u32 per row. The
+    // correctness oracle and the bench-time W buffer must size
+    // identically — under-sizing (the old int4-hardcoded path used
+    // `k / 8` u32 for every kernel regardless of `bits`) causes OOB
+    // reads on the int8 kernel, which poisons the Metal command queue
+    // on virtualised GPUs (GitHub CI's Apple Paravirtual device).
+    assert!(bits == 4 || bits == 8, "QuantizedMatVec bench currently supports bits ∈ {{4, 8}}");
+    let vals_per_pack: usize = 32 / bits as usize;
+    let mask: u32 = (1u32 << bits) - 1;
     let msl = match msl_reduction(spec, dt, Some(tpg as u32)) {
         Some(s) => s,
         None => return vec![],
@@ -936,7 +949,9 @@ fn run_quantized_mat_vec(
         }
     };
     for &(m, k) in shapes {
-        let w_elems = m * k / 8;
+        // Bit-width-aware W sizing: `packs_per_row * m` u32 elements.
+        // int4 → m*k/8 (8 nibbles/u32); int8 → m*k/4 (4 bytes/u32).
+        let w_elems = m * k / vals_per_pack;
         let sb_elems = m * k / group_size;
         let gs_per_row = k / group_size;
         // Correctness check: M=8 rows × K=512 (one TG = 2 SG × 4 rows × 8 groups).
@@ -944,11 +959,15 @@ fn run_quantized_mat_vec(
         let cm = 8usize;
         let ck = 512usize;
         let cgs_per_row = ck / group_size;
-        let w_check: Vec<u32> = (0..cm * ck / 8)
+        let cpacks_per_row = ck / vals_per_pack;
+        // Per-row pack layout: each u32 holds `vals_per_pack` codes; we
+        // pack `(i + bit) & mask` into slot `bit` to give the oracle a
+        // deterministic dequant pattern.
+        let w_check: Vec<u32> = (0..cm * cpacks_per_row)
             .map(|i| {
                 let mut v = 0u32;
-                for bit in 0..8u32 {
-                    v |= ((i as u32 + bit) & 0xF) << (bit * 4);
+                for bit in 0..vals_per_pack as u32 {
+                    v |= ((i as u32 + bit) & mask) << (bit * bits);
                 }
                 v
             })
@@ -961,18 +980,23 @@ fn run_quantized_mat_vec(
         let s_dt: Vec<f32> = s_check.iter().map(|&v| round(v)).collect();
         let b_dt: Vec<f32> = b_check.iter().map(|&v| round(v)).collect();
         let x_dt: Vec<f32> = x_check.iter().map(|&v| round(v)).collect();
+        // Per-row CPU dequant oracle, bit-width-generic. For each
+        // group: walk every pack (`packs_per_group` per group), extract
+        // each of the `vals_per_pack` codes by shifting `bit * bits`,
+        // mask with `(1<<bits)-1`, then FMA into the accumulator.
+        let packs_per_group = group_size / vals_per_pack;
         let ref_out: Vec<f32> = (0..cm)
             .map(|row| {
                 let mut acc = 0.0f32;
                 for g in 0..cgs_per_row {
                     let s = s_dt[row * cgs_per_row + g];
                     let bias = b_dt[row * cgs_per_row + g];
-                    for p in 0..8usize {
-                        let packed = w_check[row * ck / 8 + g * 8 + p];
-                        for bit in 0..8u32 {
-                            let int4_val = ((packed >> (bit * 4)) & 0xF) as f32;
-                            acc +=
-                                (s * int4_val + bias) * x_dt[g * group_size + p * 8 + bit as usize];
+                    for p in 0..packs_per_group {
+                        let packed = w_check[row * cpacks_per_row + g * packs_per_group + p];
+                        for slot in 0..vals_per_pack as u32 {
+                            let code = ((packed >> (slot * bits)) & mask) as f32;
+                            let x_idx = g * group_size + p * vals_per_pack + slot as usize;
+                            acc += (s * code + bias) * x_dt[x_idx];
                         }
                     }
                 }
@@ -1002,18 +1026,32 @@ fn run_quantized_mat_vec(
             1,
         );
         let mt_out_c = read_mt_out(runner, &out_c, cm);
-        // f16/bf16 have only ~3 decimal digits of precision; tolerance must
-        // match dtype. bf16's 8-bit mantissa is *coarser* than f16's, so it
-        // needs the same loose bound — not the f32 `1e-3`.
-        let tol: f32 = if matches!(dt, DType::F16 | DType::BF16) { 1.0 } else { 1e-3 };
-        let n_bad =
-            ref_out.iter().zip(mt_out_c.iter()).filter(|(r, m)| (*r - *m).abs() > tol).count();
-        let equiv = EquivResult {
-            n_checked: cm,
-            max_abs_err: if n_bad == 0 { 0.0 } else { f32::INFINITY },
-            cosine_sim: if n_bad == 0 { 1.0 } else { 0.0 },
-            passed: n_bad == 0,
-        };
+        // Cosine-similarity equivalence (matches what the kernel-level
+        // GPU-correctness tests use). An absolute tolerance is the
+        // wrong tool here: per-row sums scale with `max_code` (int4
+        // ≈ 384, int8 ≈ 6500 at the bench's synthetic inputs), and
+        // f32 fp accumulator drift via the kernel's `simd_sum` (32-way
+        // reorder vs the oracle's sequential sum) scales the same way
+        // (`ε × max_value × √N` ≈ 1e-4 for int4, ≈ 2e-3 for int8).
+        // Cosine is magnitude-agnostic — every quantized matvec kernel
+        // we ship today (int4, int8, soon int{3,5,6}) trips the
+        // ≥ 0.999 threshold by orders of magnitude when correct and
+        // drops below it when broken.
+        let (mut dot, mut norm_r, mut norm_m) = (0.0f64, 0.0f64, 0.0f64);
+        let mut max_abs_err = 0.0f32;
+        for (&r, &m) in ref_out.iter().zip(mt_out_c.iter()) {
+            let (rd, md) = (r as f64, m as f64);
+            dot += rd * md;
+            norm_r += rd * rd;
+            norm_m += md * md;
+            let e = (r - m).abs();
+            if e > max_abs_err {
+                max_abs_err = e;
+            }
+        }
+        let cosine = (dot / (norm_r.sqrt() * norm_m.sqrt()).max(1e-30)) as f32;
+        let passed = cosine >= 0.999;
+        let equiv = EquivResult { n_checked: cm, max_abs_err, cosine_sim: cosine, passed };
 
         let w_data: Vec<u8> = (0..w_elems * 4).map(|i| (i % 256) as u8).collect();
         let scales_f32: Vec<f32> = (0..sb_elems).map(|_| 0.05f32).collect();
@@ -1025,8 +1063,10 @@ fn run_quantized_mat_vec(
         let x_mt_buf = make_buf(runner, &x_f32);
         let k_buf = runner.buffer_u32(k as u32);
         let gpr_buf = runner.buffer_u32(gs_per_row as u32);
+        // W bytes = m * k * bits / 8 (int4: m*k/2; int8: m*k).
+        let w_bytes_mt = m * k * bits as usize / 8;
         let bytes_mt =
-            (m * k / 2 + sb_elems * dtype_bytes * 2 + k * dtype_bytes + m * dtype_bytes) as f64;
+            (w_bytes_mt + sb_elems * dtype_bytes * 2 + k * dtype_bytes + m * dtype_bytes) as f64;
         let mt_perf = {
             let out_buf = runner.buffer_zeros(m * dtype_bytes);
             bench_gbps_only(
@@ -1053,7 +1093,7 @@ fn run_quantized_mat_vec(
             let batch_zero = runner.buffer_i32(0i32);
             let zero = runner.buffer_zeros(8);
             let y_buf = runner.buffer_zeros(m * 2);
-            let bytes_f16 = (m * k / 2 + sb_elems * 2 * 2 + k * 2 + m * 2) as f64;
+            let bytes_f16 = (w_bytes_mt + sb_elems * 2 * 2 + k * 2 + m * 2) as f64;
             bench_gbps_only(
                 runner,
                 rk,
@@ -1081,7 +1121,7 @@ fn run_quantized_mat_vec(
         });
         results.push(bench.result_sub(
             Some(spec.subop),
-            format!("M={m} K={k} {dtype_label} gs{group_size} b4"),
+            format!("M={m} K={k} {dtype_label} gs{group_size} b{bits}"),
             ref_perf,
             mt_perf,
             Some(equiv),
@@ -1102,7 +1142,11 @@ fn run_quantized_mat_mul(
     m: usize,
     group_size: usize,
     tpg: usize,
+    bits: u32,
 ) -> Vec<OpResult> {
+    // See `run_quantized_mat_vec` for the bits-vs-pack-factor rationale.
+    assert!(bits == 4 || bits == 8, "QuantizedMatMul bench currently supports bits ∈ {{4, 8}}");
+    let vals_per_pack: usize = 32 / bits as usize;
     let msl = match msl_reduction(spec, dt, Some(tpg as u32)) {
         Some(s) => s,
         None => return vec![],
@@ -1162,7 +1206,10 @@ fn run_quantized_mat_mul(
     let _ = (&round, &read_mt_out);
 
     for &(n_dim, k_dim) in shapes {
-        let w_elems = n_dim * k_dim / 8;
+        // Bit-width-aware W sizing: `n*k/vals_per_pack` u32 elements.
+        // int4 → n*k/8, int8 → n*k/4 — under-sizing causes OOB reads
+        // that crash the Metal queue on virtualised GPUs.
+        let w_elems = n_dim * k_dim / vals_per_pack;
         let sb_elems = n_dim * k_dim / group_size;
         let gs_per_row = k_dim / group_size;
 
@@ -1178,9 +1225,10 @@ fn run_quantized_mat_mul(
         let n_buf = runner.buffer_u32(n_dim as u32);
         let gpr_buf = runner.buffer_u32(gs_per_row as u32);
 
-        // Bytes touched per kernel: W (q4 = K*N/2) + scales (N * gs_per_row * eb)
-        // + biases (same) + X (M*K*eb) + Y (M*N*eb).
-        let bytes_mt = (n_dim * k_dim / 2
+        // Bytes touched per kernel: W (N*K*bits/8) + scales/biases (N *
+        // gs_per_row * eb each) + X (M*K*eb) + Y (M*N*eb).
+        let w_bytes = n_dim * k_dim * bits as usize / 8;
+        let bytes_mt = (w_bytes
             + sb_elems * dtype_bytes * 2
             + m * k_dim * dtype_bytes
             + m * n_dim * dtype_bytes) as f64;
@@ -1194,11 +1242,13 @@ fn run_quantized_mat_mul(
         // mt_qmm_mma_m16 packs BM=16, BN=32 → 512 outputs (grid Y / 16,
         // grid X / 32); half-height MMA for the M=16 cell, WM=1 × WN=2 ×
         // 32 lanes = 64 tpg.
+        // int8 perf siblings share the int4 geometry — only the W pack
+        // factor differs (handled above by `bits`); grid dims are identical.
         let (n_per_tg, bm) = match spec.kernel_name {
-            "mt_qmm_mma" => (32usize, 32usize),
-            "mt_qmm_mma_m16" => (32usize, 16usize),
-            "mt_qmm_bm4" => (8usize, 4usize),
-            "mt_qmm_bm2" => (8usize, 2usize),
+            "mt_qmm_mma" | "mt_qmm_mma_int8" => (32usize, 32usize),
+            "mt_qmm_mma_m16" | "mt_qmm_mma_m16_int8" => (32usize, 16usize),
+            "mt_qmm_bm4" | "mt_qmm_bm4_int8_fast" => (8usize, 4usize),
+            "mt_qmm_bm2" | "mt_qmm_bm2_int8_fast" => (8usize, 2usize),
             _ => (8usize, 1usize),
         };
         let mt_perf = {
@@ -1254,7 +1304,7 @@ fn run_quantized_mat_mul(
         });
         results.push(bench.result_sub(
             Some(spec.subop),
-            format!("M={m} N={n_dim} K={k_dim} {dtype_label} gs{group_size} b4"),
+            format!("M={m} N={n_dim} K={k_dim} {dtype_label} gs{group_size} b{bits}"),
             ref_perf,
             mt_perf,
             Some(equiv),

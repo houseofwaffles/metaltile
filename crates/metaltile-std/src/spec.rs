@@ -238,6 +238,12 @@ pub enum BenchDispatch {
         shapes: &'static [(usize, usize)],
         group_size: usize,
         tpg: usize,
+        /// Bit-width of the affine-quant W codes (4 or 8). Drives the W
+        /// buffer pack-factor (4 → 8 nibbles/u32, 8 → 4 bytes/u32) and
+        /// the correctness oracle's dequant extract in
+        /// `run_quantized_mat_vec`. Defaults to 4 in the macro to
+        /// preserve the int4 contract every existing kernel relies on.
+        bits: u32,
     },
     /// Quantized matmul (B>1 / prefill path). `shapes` is the same
     /// `(out_dim, in_dim)` list `QuantizedMatVec` uses; `m` is the
@@ -249,6 +255,9 @@ pub enum BenchDispatch {
         m: usize,
         group_size: usize,
         tpg: usize,
+        /// Bit-width of the affine-quant W codes (4 or 8). Drives W
+        /// buffer sizing in `run_quantized_mat_mul`.
+        bits: u32,
     },
     Rope {
         b: usize,

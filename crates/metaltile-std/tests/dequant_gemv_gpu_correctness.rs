@@ -42,6 +42,7 @@ use metaltile_runtime::Context;
 use metaltile_std::ffai::dequant_gemv::{
     dequant_gemv_int3,
     dequant_gemv_int4,
+    dequant_gemv_int4_fast,
     dequant_gemv_int5,
     dequant_gemv_int6,
     dequant_gemv_int8,
@@ -346,4 +347,102 @@ fn dequant_gemv_int3_word_spill_path_f32() {
 fn dequant_gemv_int5_word_spill_path_f32() {
     // int5: quant step = 4 / 31 ≈ 0.129; tighter than int3 + int6.
     run_one_test(5, Dt::F32, 64, 32, 4, 8e-3);
+}
+
+// ── dequant_gemv_int4_fast ─────────────────────────────────────────────────
+//
+// 8-row-per-TG fast variant: `in_dim` must be a multiple of 512;
+// `out_dim` must be a multiple of 8; `group_size` must be 64.
+// Grid: [out_dim/8, 1, 1]; TPG = 64.
+
+#[allow(clippy::too_many_arguments)]
+fn run_dequant_gemv_int4_fast(
+    weight: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    input: &[f32],
+    dt: Dt,
+    in_dim: usize,
+    group_size: usize,
+    out_dim: usize,
+) -> Vec<f32> {
+    let mut buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    buffers.insert("weight".into(), pack_u32_bytes(weight));
+    buffers.insert("scales".into(), pack_bytes(scales, dt));
+    buffers.insert("biases".into(), pack_bytes(biases, dt));
+    buffers.insert("input".into(), pack_bytes(input, dt));
+    buffers.insert("output".into(), pack_bytes(&vec![0.0_f32; out_dim], dt));
+    buffers.insert("in_dim".into(), (in_dim as u32).to_le_bytes().to_vec());
+    buffers.insert("group_size".into(), (group_size as u32).to_le_bytes().to_vec());
+
+    let ctx = Context::new().expect("Context::new on macOS");
+    let mut kernel = dequant_gemv_int4_fast::kernel_ir_for(dt.to_dtype());
+    kernel.mode = KernelMode::Reduction;
+
+    // Fast variant: grid=[out_dim/8, 1, 1], TPG=64.
+    let result = ctx
+        .dispatch_with_grid(&kernel, &buffers, &BTreeMap::new(), [out_dim / 8, 1, 1], [64, 1, 1])
+        .expect("dequant_gemv_int4_fast dispatch");
+    unpack_bytes(result.outputs.get("output").expect("output"), dt)
+}
+
+fn run_one_test_fast(dt: Dt, in_dim: usize, group_size: usize, out_dim: usize, tol: f32) {
+    assert_eq!(in_dim % 512, 0, "fast variant requires in_dim % 512 == 0");
+    assert_eq!(out_dim % 8, 0, "fast variant requires out_dim % 8 == 0");
+    assert_eq!(group_size, 64, "fast variant requires group_size == 64");
+
+    let _g = gpu_lock();
+    let rows = build_source(out_dim, in_dim, 0x9E37_79B9 ^ (4u64 << 16));
+    let input_raw = build_input(in_dim, 0xDEAD_BEEF ^ (4u64 << 16));
+    let input: Vec<f32> = input_raw.iter().map(|&v| dt.round(v)).collect();
+
+    let (weight, scales, biases) = dequantize_full(&rows, out_dim, in_dim, group_size, 4);
+
+    let scales_rounded: Vec<f32> = scales.iter().map(|&v| dt.round(v)).collect();
+    let biases_rounded: Vec<f32> = biases.iter().map(|&v| dt.round(v)).collect();
+
+    let expected = naive_dequant_gemv(
+        &weight,
+        &scales_rounded,
+        &biases_rounded,
+        &input,
+        in_dim,
+        group_size,
+        4,
+        out_dim,
+    );
+    let actual = run_dequant_gemv_int4_fast(
+        &weight, &scales, &biases, &input, dt, in_dim, group_size, out_dim,
+    );
+
+    assert_eq!(actual.len(), out_dim, "output length mismatch");
+    let mut max_rel = 0.0_f32;
+    let mut worst_row = 0usize;
+    for (row, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let rel = (a - e).abs() / e.abs().max(1e-3);
+        if rel > max_rel {
+            max_rel = rel;
+            worst_row = row;
+        }
+    }
+    assert!(
+        max_rel <= tol,
+        "int4_fast dt={:?} in_dim={in_dim} out_dim={out_dim}: max rel = {max_rel:.3e} > {tol:.3e} at row {worst_row}",
+        dt as u32,
+    );
+}
+
+#[test]
+fn dequant_gemv_int4_fast_f32() { run_one_test_fast(Dt::F32, 512, 64, 8, 5e-3); }
+
+#[test]
+fn dequant_gemv_int4_fast_f16() { run_one_test_fast(Dt::F16, 512, 64, 8, 1e-2); }
+
+#[test]
+fn dequant_gemv_int4_fast_bf16() { run_one_test_fast(Dt::Bf16, 512, 64, 8, 3e-2); }
+
+#[test]
+fn dequant_gemv_int4_fast_f32_large() {
+    // Larger shape exercises multiple blocks per row.
+    run_one_test_fast(Dt::F32, 1024, 64, 16, 5e-3);
 }
