@@ -745,6 +745,100 @@ inventory::submit! {
     }
 }
 
+/// ⚠️ BROKEN — produces NaN/wrong output in FFAI integration test
+/// (forwardManyEquivalence fails T=8 + T=128). Kept here as a stub
+/// for future debug. Likely issue: multi-output codegen + the inlined
+/// `mt_rms_inv_scalar` reduction call don't compose correctly in this
+/// kernel shape. Possible fix paths:
+///   1. Manually inline the reduction without `mt_rms_inv_scalar`
+///   2. Use TWO compiled variants — one for residual write only, one
+///      for residual+norm — and dispatch both in a shared encoder
+///   3. Investigate the codegen MSL output for residual_out + normed_out
+///      ordering vs the reduction-tg threadgroup layout
+///
+/// Fused residual-add + RMSNorm. For each row of `[n]` elements:
+///   residual_out[i] = a[i] + b[i]
+///   normed_out[i]   = (a[i] + b[i]) * w[i] / sqrt(mean((a+b)^2) + eps)
+///
+/// Standard transformer pattern at layer boundary:
+///   h_new = h_old + mixer_out           (residual add)
+///   normed = rms_norm(h_new, w)         (pre-norm for next mixer)
+///
+/// Both outputs are needed downstream: `residual_out` is the persistent
+/// residual stream (input to the SECOND residual add of the same
+/// layer); `normed_out` is the pre-FFN/pre-next-mixer input.
+///
+/// Same TG=n/4 contract as `mt_rms_norm`. Saves 1 dispatch per
+/// residual-add+norm pair × 80 such pairs in Qwen3.6-A3B decode
+/// (2 per layer × 40 layers) = ~1.4 ms / token at 17 µs encoder
+/// overhead each.
+#[kernel]
+pub fn mt_add_rms_norm<T>(
+    a: Tensor<T>,
+    b: Tensor<T>,
+    w: Tensor<T>,
+    mut residual_out: Tensor<T>,
+    mut normed_out: Tensor<T>,
+    eps_buf: Tensor<f32>,
+    #[constexpr] n: u32,
+) {
+    let row = program_id::<0>();
+    let rs = row * n;
+    let col = tid * 4u32;
+    let in_bounds = col + 3u32 < n;
+    let safe_col = select(in_bounds, col, 0u32);
+    let safe_base = rs + safe_col;
+    let base = rs + col;
+    // Read a + b for 4 elements.
+    let a0 = load(a[safe_base]).cast::<f32>();
+    let a1 = load(a[safe_base + 1u32]).cast::<f32>();
+    let a2 = load(a[safe_base + 2u32]).cast::<f32>();
+    let a3 = load(a[safe_base + 3u32]).cast::<f32>();
+    let b0 = load(b[safe_base]).cast::<f32>();
+    let b1 = load(b[safe_base + 1u32]).cast::<f32>();
+    let b2 = load(b[safe_base + 2u32]).cast::<f32>();
+    let b3 = load(b[safe_base + 3u32]).cast::<f32>();
+    let s0 = a0 + b0;
+    let s1 = a1 + b1;
+    let s2 = a2 + b2;
+    let s3 = a3 + b3;
+    let raw_ssq = s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+    let partial_ssq = select(in_bounds, raw_ssq, 0.0f32);
+    let rms = mt_rms_inv_scalar(partial_ssq, eps_buf, n);
+    if in_bounds {
+        // Write the residual stream (just the add).
+        store(residual_out[base], s0.cast::<T>());
+        store(residual_out[base + 1u32], s1.cast::<T>());
+        store(residual_out[base + 2u32], s2.cast::<T>());
+        store(residual_out[base + 3u32], s3.cast::<T>());
+        // Write the normalized stream.
+        let n0 = s0 * rms * load(w[col]).cast::<f32>();
+        let n1 = s1 * rms * load(w[col + 1u32]).cast::<f32>();
+        let n2 = s2 * rms * load(w[col + 2u32]).cast::<f32>();
+        let n3 = s3 * rms * load(w[col + 3u32]).cast::<f32>();
+        store(normed_out[base], n0.cast::<T>());
+        store(normed_out[base + 1u32], n1.cast::<T>());
+        store(normed_out[base + 2u32], n2.cast::<T>());
+        store(normed_out[base + 3u32], n3.cast::<T>());
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "add_rms_norm",
+        kernel_name: "mt_add_rms_norm",
+        kernel_ir: mt_add_rms_norm::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
 inventory::submit! {
     BenchSpec {
         op: "unary",
