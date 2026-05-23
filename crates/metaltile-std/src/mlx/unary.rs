@@ -668,6 +668,48 @@ inventory::submit! {
     }
 }
 
+/// Scalar-broadcast FMA. Computes
+///   `out[i] = base[i] + scalar[0] * value[i]`
+/// for `i in 0..n`, broadcasting a 1-element scalar buffer across the
+/// `[n]` vectors. One thread per output element; the scalar re-loads
+/// through the GPU L1 cache so the broadcast is free.
+///
+/// Replaces FFAI's MoE per-expert weighted-add chain at decode T=1:
+/// instead of `Tensor.filled([hidden], weight)` (host alloc + memcpy)
+/// + `Ops.mul(expertOut, broadcast)` + `Ops.add(accumulator, scaled)`,
+/// we pack the routing weight into a 4-byte scalar buffer + dispatch
+/// this kernel once. Saves 8 host allocations + 16 dispatches per MoE
+/// layer × 40 layers = 320 allocations + 640 dispatches per
+/// Qwen3.6-A3B decode token.
+///
+/// Numerical: accumulation widens to f32 via load-side `.cast` to keep
+/// long sums of many small-weight expert outputs precise, then narrows
+/// back to T on store.
+#[kernel]
+pub fn mt_scalar_fma<T>(scalar: Tensor<T>, value: Tensor<T>, base: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    let s = load(scalar[0]).cast::<f32>();
+    let v = load(value[idx]).cast::<f32>();
+    let b = load(base[idx]).cast::<f32>();
+    store(out[idx], (b + s * v).cast::<T>());
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "scalar_fma",
+        kernel_name: "mt_scalar_fma",
+        kernel_ir: mt_scalar_fma::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
 inventory::submit! {
     BenchSpec {
         op: "unary",
