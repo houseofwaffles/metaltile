@@ -710,6 +710,69 @@ inventory::submit! {
     }
 }
 
+/// 8-way fused scalar-FMA chain. Computes
+///   `out[i] = sum_{k=0..8} scalar_k[0] * value_k[i]`
+/// in a single dispatch. Replaces the topK=8 expert accumulator chain
+/// in FFAI's MoE decode (8 sequential `mt_scalar_fma` dispatches +
+/// 1 acc.zero) with one fused kernel that reads each value tensor
+/// once and writes the output once — saving 7 acc reads + 1 zero
+/// dispatch per MoE layer × 40 layers = 320 dispatches + ~660 KB of
+/// L1/L2 traffic per Qwen3.6-A3B decode token.
+///
+/// Accumulation widens to f32 via load-side `.cast` to preserve
+/// precision on long sums of small-weight expert outputs, then
+/// narrows back to T on store. Bit-equivalent to the 8-call chain
+/// modulo final-rounding mode.
+#[kernel]
+pub fn mt_scalar_fma_chain8<T>(
+    scalar0: Tensor<T>, value0: Tensor<T>,
+    scalar1: Tensor<T>, value1: Tensor<T>,
+    scalar2: Tensor<T>, value2: Tensor<T>,
+    scalar3: Tensor<T>, value3: Tensor<T>,
+    scalar4: Tensor<T>, value4: Tensor<T>,
+    scalar5: Tensor<T>, value5: Tensor<T>,
+    scalar6: Tensor<T>, value6: Tensor<T>,
+    scalar7: Tensor<T>, value7: Tensor<T>,
+    out: Tensor<T>,
+) {
+    let idx = program_id(0);
+    let sa = load(scalar0[0]).cast::<f32>();
+    let sb = load(scalar1[0]).cast::<f32>();
+    let sc = load(scalar2[0]).cast::<f32>();
+    let sd = load(scalar3[0]).cast::<f32>();
+    let se = load(scalar4[0]).cast::<f32>();
+    let sf = load(scalar5[0]).cast::<f32>();
+    let sg = load(scalar6[0]).cast::<f32>();
+    let sh = load(scalar7[0]).cast::<f32>();
+    let va = load(value0[idx]).cast::<f32>();
+    let vb = load(value1[idx]).cast::<f32>();
+    let vc = load(value2[idx]).cast::<f32>();
+    let vd = load(value3[idx]).cast::<f32>();
+    let ve = load(value4[idx]).cast::<f32>();
+    let vf = load(value5[idx]).cast::<f32>();
+    let vg = load(value6[idx]).cast::<f32>();
+    let vh = load(value7[idx]).cast::<f32>();
+    let sum = sa * va + sb * vb + sc * vc + sd * vd
+            + se * ve + sf * vf + sg * vg + sh * vh;
+    store(out[idx], sum.cast::<T>());
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "scalar_fma_chain8",
+        kernel_name: "mt_scalar_fma_chain8",
+        kernel_ir: mt_scalar_fma_chain8::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
 /// Fused elementwise sigmoid + mul. Computes
 ///   `out[i] = a[i] * sigmoid(b[i])`
 /// in one dispatch. Used by Qwen3 attention layer's output gate:

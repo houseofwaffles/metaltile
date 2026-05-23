@@ -248,6 +248,15 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
                 }
             }
             if !emit_kinds.is_empty() {
+                // Per-kernel opt-in for the `_indirect` Swift wrapper.
+                // Mirrors the `tile emit` path — kernels declare their
+                // own indirect-dispatch eligibility via the std helper.
+                // Without this, `tile build --emit swift` produces only
+                // direct wrappers and FFAI's GPU-router indirect paths
+                // fail to compile.
+                if metaltile_std::ffai::dequant_gemv::dequant_gemv_wants_indirect(&k.name) {
+                    k.wants_indirect_variant = true;
+                }
                 emitted_kernels.push(k.clone());
             }
 
