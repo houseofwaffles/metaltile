@@ -5096,6 +5096,337 @@ pub fn mt_qvm_int4_fast<T>(
 
 quantized_family_spec!(mt_qvm_int4_fast, "qvm_int4_fast");
 
+// ─── mt_qmm_mma_b{3,5,6} — bit-stream MMA for odd bit-widths ────────────────
+//
+// Bit-width-generalized siblings of `mt_qmm_mma` for int3 / int5 / int6
+// quantized dense GEMM. Identical tiled-MMA geometry (BM=BN=BK=32, 4 SGs,
+// 2×2 warp grid) — the *only* change is the per-lane W dequant: instead
+// of the int4-specific 8-nibble unpack, the weight row is treated as a
+// contiguous LSB-first bit-stream and each lane extracts 8 codes with the
+// straddle-aware two-word read.
+//
+// Mirrors the `gather_qmm_mma!` macro in `ffai/moe.rs` — exactly the same
+// coop-dequant strategy, just applied to the dense (non-expert) GEMM.
+//
+// `w` layout: `[N, k*bits/32]` uint32 LSB-first bit-stream packed.
+// `group_size` must divide `k`; the 8-K span per lane within a BK=32
+// block is group-aligned (`pack_in_row*8 % group_size == 0`).
+//
+// Grid: [N/32, M/32, 1], tpg=128 (4 SG × 32 lanes).
+macro_rules! qmm_mma_bitwidth {
+    ($name:ident, $bits:literal, $subop:literal) => {
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name<T>(
+            w: Tensor<u32>,
+            scales: Tensor<T>,
+            biases: Tensor<T>,
+            x: Tensor<T>,
+            out: Tensor<T>,
+            #[constexpr] k: u32,
+            #[constexpr] n: u32,
+            #[constexpr] gs_per_row: u32,
+        ) {
+            let n_tile = tgid_x;
+            let m_tile = tgid_y;
+            let lane = simd_lane;
+            let sg = simd_group_id();
+            let sm = sg / 2u32;
+            let sn = sg & 1u32;
+            let lane_in_tg = sg * 32u32 + lane;
+
+            let qid = lane / 4u32;
+            let fm = (qid & 4u32) + ((lane / 2u32) % 4u32);
+            let fn0 = (qid & 2u32) * 2u32 + (lane % 2u32) * 2u32;
+            let fn1 = fn0 + 1u32;
+
+            // TG memory: Xs [BM×BK], Ws [BN×BK], both stride BK+4=36
+            // (skew avoids 32-bank conflicts on the MMA frag column reads).
+            threadgroup_alloc("xs", 1152, T);
+            threadgroup_alloc("ws", 1152, T);
+
+            let c_f00 = simdgroup_alloc::<f32, 8, 8>();
+            simdgroup_elem_store(c_f00, 0, 0.0f32);
+            simdgroup_elem_store(c_f00, 1, 0.0f32);
+            let c_f01 = simdgroup_alloc::<f32, 8, 8>();
+            simdgroup_elem_store(c_f01, 0, 0.0f32);
+            simdgroup_elem_store(c_f01, 1, 0.0f32);
+            let c_f10 = simdgroup_alloc::<f32, 8, 8>();
+            simdgroup_elem_store(c_f10, 0, 0.0f32);
+            simdgroup_elem_store(c_f10, 1, 0.0f32);
+            let c_f11 = simdgroup_alloc::<f32, 8, 8>();
+            simdgroup_elem_store(c_f11, 0, 0.0f32);
+            simdgroup_elem_store(c_f11, 1, 0.0f32);
+
+            let a_f0 = simdgroup_alloc::<T, 8, 8>();
+            let a_f1 = simdgroup_alloc::<T, 8, 8>();
+            let b_f0 = simdgroup_alloc::<T, 8, 8>();
+            let b_f1 = simdgroup_alloc::<T, 8, 8>();
+
+            // W coop-dequant lane assignments:
+            //   w_row = lane_in_tg / 4  ∈ 0..32  (the N-row inside the BN=32 tile)
+            //   pack_in_row = lane_in_tg & 3  ∈ 0..4  (8-K span index within BK=32)
+            let w_row = lane_in_tg / 4u32;
+            let pack_in_row = lane_in_tg & 3u32;
+
+            // X coop-load lane assignments: same shape as mt_qmm_mma.
+            let x_m_row = lane_in_tg / 4u32;
+            let x_k_quad = lane_in_tg & 3u32;
+            let x_k_base = x_k_quad * 8u32;
+
+            let xs_ld = 36u32;
+            let ws_ld = 36u32;
+
+            let x_m_base = m_tile * 32u32;
+            let w_n_base = n_tile * 32u32;
+            // Bit-stream: u32_per_row = k * bits / 32 words per weight row.
+            let u32_per_row = k * $bits / 32u32;
+            let group_size = k / gs_per_row;
+            let sb_base = (w_n_base + w_row) * gs_per_row;
+            let w_row_base = (w_n_base + w_row) * u32_per_row;
+
+            for kb in range(0u32, k, 32u32) {
+                // ── 1. Coop X load — identical to mt_qmm_mma ──
+                let x_row_dev_base = (x_m_base + x_m_row) * k + kb + x_k_base;
+                let x_ws_base = x_m_row * xs_ld + x_k_base;
+                let xv0 = load(x[x_row_dev_base]).cast::<T>();
+                let xv1 = load(x[x_row_dev_base + 1u32]).cast::<T>();
+                let xv2 = load(x[x_row_dev_base + 2u32]).cast::<T>();
+                let xv3 = load(x[x_row_dev_base + 3u32]).cast::<T>();
+                let xv4 = load(x[x_row_dev_base + 4u32]).cast::<T>();
+                let xv5 = load(x[x_row_dev_base + 5u32]).cast::<T>();
+                let xv6 = load(x[x_row_dev_base + 6u32]).cast::<T>();
+                let xv7 = load(x[x_row_dev_base + 7u32]).cast::<T>();
+                threadgroup_store("xs", x_ws_base, xv0);
+                threadgroup_store("xs", x_ws_base + 1u32, xv1);
+                threadgroup_store("xs", x_ws_base + 2u32, xv2);
+                threadgroup_store("xs", x_ws_base + 3u32, xv3);
+                threadgroup_store("xs", x_ws_base + 4u32, xv4);
+                threadgroup_store("xs", x_ws_base + 5u32, xv5);
+                threadgroup_store("xs", x_ws_base + 6u32, xv6);
+                threadgroup_store("xs", x_ws_base + 7u32, xv7);
+
+                // ── 2. Coop W bit-stream dequant ──
+                // Each lane is responsible for 8 contiguous K positions
+                // starting at k0 = kb + pack_in_row*8. It extracts 8 codes
+                // from the LSB-first bit-stream, dequantizes them, and
+                // writes the 8 fp-T values into Ws[w_row*ws_ld + pack_in_row*8 + i].
+                let k0 = kb + pack_in_row * 8u32;
+                let g = k0 / group_size;
+                let s = load(scales[sb_base + g]).cast::<f32>();
+                let b = load(biases[sb_base + g]).cast::<f32>();
+                let ws_base = w_row * ws_ld + pack_in_row * 8u32;
+                for _ci in range(0u32, 8u32, 1u32) {
+                    // Straddle-aware two-word bit-stream extract.
+                    // bit_off = absolute bit position of this code's LSB.
+                    let bit_off = (k0 + _ci) * $bits;
+                    let word_idx = bit_off / 32u32;
+                    let bit_in_w = bit_off & 31u32;
+                    let bits_in_w0 = 32u32 - bit_in_w;
+                    let lo_bits = select(bits_in_w0 >= $bits, $bits, bits_in_w0);
+                    let spill = $bits - lo_bits;
+                    let w0 = load(w[w_row_base + word_idx]);
+                    // Avoid an out-of-bounds load when there is no spill: read
+                    // from the same word (the bits will be masked to 0 anyway).
+                    let w1idx = select(spill > 0u32, word_idx + 1u32, word_idx);
+                    let w1 = load(w[w_row_base + w1idx]);
+                    let lo = (w0 >> bit_in_w) & ((1u32 << lo_bits) - 1u32);
+                    let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
+                    let q = (lo | hi).cast::<f32>();
+                    threadgroup_store("ws", ws_base + _ci, (s * q + b).cast::<T>());
+                }
+
+                threadgroup_barrier();
+
+                // ── 3. MMA inner loop — 4 frags × 4 k-inner ──
+                // Identical to mt_qmm_mma: serpentine (0,0)→(0,1)→(1,1)→(1,0).
+                let row_a0 = sm * 16u32 + fm;
+                let row_a1 = sm * 16u32 + 8u32 + fm;
+                let col_b0 = sn * 16u32;
+                let col_b1 = sn * 16u32 + 8u32;
+
+                // k_inner = 0
+                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + fn0));
+                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + fn1));
+                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + fn0));
+                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + fn1));
+                simdgroup_barrier_mem_none();
+                simdgroup_elem_store(b_f0, 0, threadgroup_load("ws", (col_b0 + fn0) * ws_ld + fm));
+                simdgroup_elem_store(b_f0, 1, threadgroup_load("ws", (col_b0 + fn1) * ws_ld + fm));
+                simdgroup_elem_store(b_f1, 0, threadgroup_load("ws", (col_b1 + fn0) * ws_ld + fm));
+                simdgroup_elem_store(b_f1, 1, threadgroup_load("ws", (col_b1 + fn1) * ws_ld + fm));
+                simdgroup_barrier_mem_none();
+                simdgroup_matmul(a_f0, b_f0, c_f00);
+                simdgroup_matmul(a_f0, b_f1, c_f01);
+                simdgroup_matmul(a_f1, b_f1, c_f11);
+                simdgroup_matmul(a_f1, b_f0, c_f10);
+                simdgroup_barrier_mem_none();
+
+                // k_inner = 1
+                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn0));
+                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 8u32 + fn1));
+                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn0));
+                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 8u32 + fn1));
+                simdgroup_barrier_mem_none();
+                simdgroup_elem_store(
+                    b_f0,
+                    0,
+                    threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 8u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f0,
+                    1,
+                    threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 8u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f1,
+                    0,
+                    threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 8u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f1,
+                    1,
+                    threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 8u32 + fm),
+                );
+                simdgroup_barrier_mem_none();
+                simdgroup_matmul(a_f0, b_f0, c_f00);
+                simdgroup_matmul(a_f0, b_f1, c_f01);
+                simdgroup_matmul(a_f1, b_f1, c_f11);
+                simdgroup_matmul(a_f1, b_f0, c_f10);
+                simdgroup_barrier_mem_none();
+
+                // k_inner = 2
+                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn0));
+                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 16u32 + fn1));
+                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn0));
+                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 16u32 + fn1));
+                simdgroup_barrier_mem_none();
+                simdgroup_elem_store(
+                    b_f0,
+                    0,
+                    threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 16u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f0,
+                    1,
+                    threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 16u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f1,
+                    0,
+                    threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 16u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f1,
+                    1,
+                    threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 16u32 + fm),
+                );
+                simdgroup_barrier_mem_none();
+                simdgroup_matmul(a_f0, b_f0, c_f00);
+                simdgroup_matmul(a_f0, b_f1, c_f01);
+                simdgroup_matmul(a_f1, b_f1, c_f11);
+                simdgroup_matmul(a_f1, b_f0, c_f10);
+                simdgroup_barrier_mem_none();
+
+                // k_inner = 3
+                simdgroup_elem_store(a_f0, 0, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn0));
+                simdgroup_elem_store(a_f0, 1, threadgroup_load("xs", row_a0 * xs_ld + 24u32 + fn1));
+                simdgroup_elem_store(a_f1, 0, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn0));
+                simdgroup_elem_store(a_f1, 1, threadgroup_load("xs", row_a1 * xs_ld + 24u32 + fn1));
+                simdgroup_barrier_mem_none();
+                simdgroup_elem_store(
+                    b_f0,
+                    0,
+                    threadgroup_load("ws", (col_b0 + fn0) * ws_ld + 24u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f0,
+                    1,
+                    threadgroup_load("ws", (col_b0 + fn1) * ws_ld + 24u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f1,
+                    0,
+                    threadgroup_load("ws", (col_b1 + fn0) * ws_ld + 24u32 + fm),
+                );
+                simdgroup_elem_store(
+                    b_f1,
+                    1,
+                    threadgroup_load("ws", (col_b1 + fn1) * ws_ld + 24u32 + fm),
+                );
+                simdgroup_barrier_mem_none();
+                simdgroup_matmul(a_f0, b_f0, c_f00);
+                simdgroup_matmul(a_f0, b_f1, c_f01);
+                simdgroup_matmul(a_f1, b_f1, c_f11);
+                simdgroup_matmul(a_f1, b_f0, c_f10);
+                simdgroup_barrier_mem_none();
+
+                threadgroup_barrier();
+            }
+
+            // ── 4. Write 4 C frags to global out ──
+            let out_m_base = m_tile * 32u32 + sm * 16u32;
+            let out_n_base = n_tile * 32u32 + sn * 16u32;
+            store(
+                out[(out_m_base + fm) * n + out_n_base + fn0],
+                simdgroup_elem_load(c_f00, 0).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + fm) * n + out_n_base + fn1],
+                simdgroup_elem_load(c_f00, 1).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + fm) * n + out_n_base + 8u32 + fn0],
+                simdgroup_elem_load(c_f01, 0).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + fm) * n + out_n_base + 8u32 + fn1],
+                simdgroup_elem_load(c_f01, 1).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + 8u32 + fm) * n + out_n_base + fn0],
+                simdgroup_elem_load(c_f10, 0).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + 8u32 + fm) * n + out_n_base + fn1],
+                simdgroup_elem_load(c_f10, 1).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn0],
+                simdgroup_elem_load(c_f11, 0).cast::<T>(),
+            );
+            store(
+                out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn1],
+                simdgroup_elem_load(c_f11, 1).cast::<T>(),
+            );
+        }
+
+        inventory::submit! {
+            crate::spec::BenchSpec {
+                op: "quantized",
+                subop: $subop,
+                kernel_name: stringify!($name),
+                kernel_ir: $name::kernel_ir_for,
+                dtypes: &[
+                    metaltile_core::dtype::DType::F32,
+                    metaltile_core::dtype::DType::F16,
+                    metaltile_core::dtype::DType::BF16,
+                ],
+                tol: 5e-2,
+                mlx_src: None,
+                mlx_pattern: None,
+                shapes: &[],
+                dispatch: crate::spec::BenchDispatch::Generic,
+                kernel_mode: Some(metaltile_core::ir::KernelMode::Reduction),
+            }
+        }
+    };
+}
+
+qmm_mma_bitwidth!(mt_qmm_mma_b3, 3u32, "qmm_mma_b3");
+qmm_mma_bitwidth!(mt_qmm_mma_b5, 5u32, "qmm_mma_b5");
+qmm_mma_bitwidth!(mt_qmm_mma_b6, 6u32, "qmm_mma_b6");
+
 /// Auto-select the best `mt_qmm*` kernel for a given dtype + M
 /// (number of tokens / batched rows in this prefill). Returns the
 /// kernel IR ready to dispatch. Caller still owns grid sizing — see

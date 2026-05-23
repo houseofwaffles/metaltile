@@ -2838,19 +2838,33 @@ fn run_sdpa_batched_decode_form(
 ) -> Vec<OpResult> {
     assert_eq!(head_dim, 128, "sdpa_decode_batched hardcodes head_dim=128");
     assert!(
-        matches!(batch_q, 2 | 4),
-        "Decode variant ships K∈{{2,4}} specializations; got K={batch_q}",
+        matches!(batch_q, 2 | 4 | 8),
+        "Decode variant ships K∈{{2,4,8}} specializations; got K={batch_q}",
     );
-    // K=4 register pressure caps Metal's `maxTotalThreadsPerThreadgroup`
-    // at 768 on M1 Max; dispatching past that silently produces all-zero
-    // outputs (see DISPATCH INVARIANTS doc on `sdpa_decode_batched.rs`).
-    // K=2 has no such cap, so any TPG = 1024 dispatch is fine there.
+    // Register pressure scales with K (per-thread Q footprint is K ×
+    // head_dim × dtype_bytes), and Metal's `maxTotalThreadsPerThreadgroup`
+    // shrinks below 1024 on M1 Max when register usage exceeds the
+    // spill-free budget. Empirically:
+    //   K=2 → tpg ≤ 1024 (no cap)
+    //   K=4 → tpg ≤ 768  (≈ 80 regs/thread)
+    //   K=8 → tpg ≤ 384  (≈ 160 regs/thread — half of K=4, conservative)
+    // Dispatching past the cap silently writes all-zero outputs (see
+    // DISPATCH INVARIANTS doc on `sdpa_decode_batched.rs`). The per-K
+    // BenchSpec selects a portable `tpg` (256 for K=8) — this assert
+    // is the guardrail if someone raises it without re-checking the
+    // cap on the target chip.
+    let tpg_cap = match batch_q {
+        2 => 1024,
+        4 => 768,
+        8 => 384,
+        _ => unreachable!("guarded by the matches! above"),
+    };
     assert!(
-        tpg <= 768 || batch_q < 4,
+        tpg <= tpg_cap,
         "sdpa_decode_batched_q{batch_q} cannot dispatch at tpg={tpg}: \
-         K=4 requires tpg ≤ 768 (M1 Max maxTotalThreadsPerThreadgroup \
-         cap at this register pressure; dispatching past the cap \
-         silently writes all-zero outputs). Use tpg=512.",
+         K={batch_q} requires tpg ≤ {tpg_cap} on M1 Max \
+         (maxTotalThreadsPerThreadgroup cap at this register pressure; \
+         dispatching past the cap silently writes all-zero outputs).",
     );
     assert!(n_q_heads.is_multiple_of(gqa_factor), "n_q_heads must be divisible by gqa_factor");
     let n_kv_heads = n_q_heads / gqa_factor;

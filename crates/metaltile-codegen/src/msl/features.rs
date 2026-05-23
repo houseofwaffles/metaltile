@@ -112,7 +112,11 @@ impl MslGenerator {
                 if src == "simd_lane" {
                     feat.needs_simd_lane = true;
                 }
-                if src == "simd_group" || src == "simd_id" {
+                // `n_simd` is the number of simdgroups per threadgroup —
+                // it is derived from `lsize / 32` and emitted in the Reduction
+                // mode preamble alongside `simd_group`. Any kernel that reads
+                // `n_simd` also needs that preamble block.
+                if src == "simd_group" || src == "simd_id" || src == "n_simd" {
                     feat.needs_simd_group = true;
                 }
             },

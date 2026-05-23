@@ -194,3 +194,520 @@ inventory::submit! {
         kernel_mode: Some(KernelMode::Reduction),
     }
 }
+
+// ── Multi-op scan variants (prod / max / min) ────────────────────────────
+//
+// The same two-level (per-simdgroup + cross-simdgroup) prefix-scan
+// machinery from `mt_scan` / `mt_scan_exclusive`, parameterised by a
+// different binary operation and identity element:
+//
+//   | kernel                  | op  | identity |
+//   |-------------------------|-----|----------|
+//   | mt_scan_prod            | ×   | 1.0      |
+//   | mt_scan_prod_exclusive  | ×   | 1.0      |
+//   | mt_scan_max             | max | -∞       |
+//   | mt_scan_max_exclusive   | max | -∞       |
+//   | mt_scan_min             | min | +∞       |
+//   | mt_scan_min_exclusive   | min | +∞       |
+//
+// The exclusive variant stores the running prefix *before* the current
+// element — identical in structure to `mt_scan_exclusive`.
+//
+// MLX's `contig_scan_*` family carries `op ∈ {sum, prod, max, min}` and
+// an `exclusive` flag that cover all eight kernels (four ops × two
+// inclusive/exclusive variants).
+//
+// ## Implementation strategy
+//
+// The DSL provides `simd_scan_exclusive` only for sum (hardware
+// `simd_prefix_exclusive_sum`). For prod/max/min, both the within-SG
+// prefix and the cross-SG prefix are implemented via a `"tgs"` threadgroup
+// buffer of `lsize` f32 slots:
+//
+//   1. Each thread writes its chunk scalar (product / max / min of its 4
+//      values) to `tgs[lid]`.
+//   2. After a barrier, each thread reads the sequential prefix of
+//      `tgs[0..lid]` — `ns ≤ 8` simdgroups × up to 32 lanes = ≤ 256
+//      reads/thread, which is cheap for these ns sizes.
+//   3. The cross-SG running prefix (carried between `_r` iterations via
+//      `sgs[ns]`) is read and composed with the per-thread prefix.
+//
+// This avoids adding new simd intrinsics to the DSL while remaining
+// correct for all values, including zeros and negatives.
+//
+// DISPATCH INVARIANTS (same as mt_scan):
+//  - Reduction mode, `grid = [1, rows, 1]`, `tg = [tpg, 1, 1]`.
+//  - `tpg` a multiple of 32; `n_simd ≤ 8` (so `lsize ≤ 256`).
+//  - `tgs` buffer is `lsize` f32 slots; `sgs` is 9 f32 slots.
+
+// ── Inclusive product scan ───────────────────────────────────────────────
+//
+// `out[i] = v[0] * v[1] * … * v[i]`  (inclusive prefix product per row).
+// Identity element is 1.0; out-of-range loads are padded with 1.0.
+
+#[kernel]
+pub fn mt_scan_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<1>();
+    let lid = tid;
+    let ns = n_simd;
+    let row_off = row * n;
+    // sgs[ns] holds the running product across iterations; initialise to 1.
+    threadgroup_alloc("sgs", 9);
+    // tgs[lid] holds each thread's chunk scalar for sequential prefix reads.
+    threadgroup_alloc("tgs", 256);
+    if lid == 0 {
+        threadgroup_store("sgs", ns, 1.0f32);
+    }
+    threadgroup_barrier();
+    let one_f = threadgroup_load("sgs", ns);
+    let chunk = lsize * 4u32;
+    let n_iters = (n + chunk - 1u32) / chunk;
+    for _r in range(0, n_iters, 1) {
+        let base = _r * chunk + lid * 4u32;
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), one_f);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), one_f);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), one_f);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), one_f);
+        // Thread-local inclusive prefix products.
+        let p1 = v0 * v1;
+        let p2 = p1 * v2;
+        let p3 = p2 * v3;
+        // Store this thread's chunk total for the prefix-read step.
+        threadgroup_store("tgs", lid, p3);
+        threadgroup_barrier();
+        // Compute this thread's exclusive prefix product over tgs[0..lid].
+        let mut t_excl = one_f;
+        for _i in range(0u32, lid, 1u32) {
+            t_excl = t_excl * threadgroup_load("tgs", _i);
+        }
+        let cur_prefix = threadgroup_load("sgs", ns);
+        let base_prefix = cur_prefix * t_excl;
+        if base < n {
+            store(out[row_off + base], (base_prefix * v0).cast::<T>());
+        }
+        if base + 1u32 < n {
+            store(out[row_off + base + 1u32], (base_prefix * p1).cast::<T>());
+        }
+        if base + 2u32 < n {
+            store(out[row_off + base + 2u32], (base_prefix * p2).cast::<T>());
+        }
+        if base + 3u32 < n {
+            store(out[row_off + base + 3u32], (base_prefix * p3).cast::<T>());
+        }
+        threadgroup_barrier();
+        // Update the running cross-chunk prefix: last thread holds the
+        // inclusive product of the whole chunk.
+        if lid == lsize - 1 {
+            threadgroup_store("sgs", ns, base_prefix * p3);
+        }
+        threadgroup_barrier();
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "scan",
+        subop: "scan_prod",
+        kernel_name: "mt_scan_prod",
+        kernel_ir: mt_scan_prod::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}
+
+// ── Exclusive product scan ───────────────────────────────────────────────
+//
+// `out[0] = 1`,  `out[i] = v[0] * … * v[i-1]`  (exclusive prefix product).
+
+#[kernel]
+pub fn mt_scan_prod_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<1>();
+    let lid = tid;
+    let ns = n_simd;
+    let row_off = row * n;
+    threadgroup_alloc("sgs", 9);
+    threadgroup_alloc("tgs", 256);
+    if lid == 0 {
+        threadgroup_store("sgs", ns, 1.0f32);
+    }
+    threadgroup_barrier();
+    let one_f = threadgroup_load("sgs", ns);
+    let chunk = lsize * 4u32;
+    let n_iters = (n + chunk - 1u32) / chunk;
+    for _r in range(0, n_iters, 1) {
+        let base = _r * chunk + lid * 4u32;
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), one_f);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), one_f);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), one_f);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), one_f);
+        let p1 = v0 * v1;
+        let p2 = p1 * v2;
+        let p3 = p2 * v3;
+        threadgroup_store("tgs", lid, p3);
+        threadgroup_barrier();
+        let mut t_excl = one_f;
+        for _i in range(0u32, lid, 1u32) {
+            t_excl = t_excl * threadgroup_load("tgs", _i);
+        }
+        let cur_prefix = threadgroup_load("sgs", ns);
+        let base_prefix = cur_prefix * t_excl;
+        // Exclusive: element k stores prefix of everything before it.
+        if base < n {
+            store(out[row_off + base], base_prefix.cast::<T>());
+        }
+        if base + 1u32 < n {
+            store(out[row_off + base + 1u32], (base_prefix * v0).cast::<T>());
+        }
+        if base + 2u32 < n {
+            store(out[row_off + base + 2u32], (base_prefix * p1).cast::<T>());
+        }
+        if base + 3u32 < n {
+            store(out[row_off + base + 3u32], (base_prefix * p2).cast::<T>());
+        }
+        threadgroup_barrier();
+        if lid == lsize - 1 {
+            threadgroup_store("sgs", ns, base_prefix * p3);
+        }
+        threadgroup_barrier();
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "scan",
+        subop: "scan_prod_exclusive",
+        kernel_name: "mt_scan_prod_exclusive",
+        kernel_ir: mt_scan_prod_exclusive::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}
+
+// ── Inclusive max scan ───────────────────────────────────────────────────
+//
+// `out[i] = max(v[0], …, v[i])`  (running maximum per row).
+// Identity element is -∞; out-of-range loads are padded with -∞.
+
+#[kernel]
+pub fn mt_scan_max<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<1>();
+    let lid = tid;
+    let ns = n_simd;
+    let row_off = row * n;
+    threadgroup_alloc("sgs", 9);
+    threadgroup_alloc("tgs", 256);
+    if lid == 0 {
+        threadgroup_store("sgs", ns, neg_infinity());
+    }
+    threadgroup_barrier();
+    let neginf = threadgroup_load("sgs", ns);
+    let chunk = lsize * 4u32;
+    let n_iters = (n + chunk - 1u32) / chunk;
+    for _r in range(0, n_iters, 1) {
+        let base = _r * chunk + lid * 4u32;
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), neginf);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), neginf);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), neginf);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), neginf);
+        // Thread-local inclusive prefix maxima.
+        let m1 = select(v0 > v1, v0, v1);
+        let m2 = select(m1 > v2, m1, v2);
+        let m3 = select(m2 > v3, m2, v3);
+        // Store chunk max for the prefix-read step.
+        threadgroup_store("tgs", lid, m3);
+        threadgroup_barrier();
+        // Exclusive prefix max over tgs[0..lid].
+        let mut t_excl = neginf;
+        for _i in range(0u32, lid, 1u32) {
+            let v = threadgroup_load("tgs", _i);
+            t_excl = select(v > t_excl, v, t_excl);
+        }
+        let cur_prefix = threadgroup_load("sgs", ns);
+        // base_prefix = max of all elements before this thread's chunk.
+        let base_prefix = select(cur_prefix > t_excl, cur_prefix, t_excl);
+        // Inclusive: element k stores max of base_prefix and v[0..k].
+        let out0 = select(base_prefix > v0, base_prefix, v0);
+        let out1 = select(out0 > v1, out0, v1);
+        let out2 = select(out1 > v2, out1, v2);
+        let out3 = select(out2 > v3, out2, v3);
+        if base < n {
+            store(out[row_off + base], out0.cast::<T>());
+        }
+        if base + 1u32 < n {
+            store(out[row_off + base + 1u32], out1.cast::<T>());
+        }
+        if base + 2u32 < n {
+            store(out[row_off + base + 2u32], out2.cast::<T>());
+        }
+        if base + 3u32 < n {
+            store(out[row_off + base + 3u32], out3.cast::<T>());
+        }
+        threadgroup_barrier();
+        if lid == lsize - 1 {
+            threadgroup_store("sgs", ns, out3);
+        }
+        threadgroup_barrier();
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "scan",
+        subop: "scan_max",
+        kernel_name: "mt_scan_max",
+        kernel_ir: mt_scan_max::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-4,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}
+
+// ── Exclusive max scan ───────────────────────────────────────────────────
+//
+// `out[0] = -∞`,  `out[i] = max(v[0], …, v[i-1])`  (exclusive max prefix).
+
+#[kernel]
+pub fn mt_scan_max_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<1>();
+    let lid = tid;
+    let ns = n_simd;
+    let row_off = row * n;
+    threadgroup_alloc("sgs", 9);
+    threadgroup_alloc("tgs", 256);
+    if lid == 0 {
+        threadgroup_store("sgs", ns, neg_infinity());
+    }
+    threadgroup_barrier();
+    let neginf = threadgroup_load("sgs", ns);
+    let chunk = lsize * 4u32;
+    let n_iters = (n + chunk - 1u32) / chunk;
+    for _r in range(0, n_iters, 1) {
+        let base = _r * chunk + lid * 4u32;
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), neginf);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), neginf);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), neginf);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), neginf);
+        let m1 = select(v0 > v1, v0, v1);
+        let m2 = select(m1 > v2, m1, v2);
+        let m3 = select(m2 > v3, m2, v3);
+        threadgroup_store("tgs", lid, m3);
+        threadgroup_barrier();
+        let mut t_excl = neginf;
+        for _i in range(0u32, lid, 1u32) {
+            let v = threadgroup_load("tgs", _i);
+            t_excl = select(v > t_excl, v, t_excl);
+        }
+        let cur_prefix = threadgroup_load("sgs", ns);
+        let base_prefix = select(cur_prefix > t_excl, cur_prefix, t_excl);
+        // Exclusive: element k stores max of base_prefix and v[0..k-1].
+        let ep1 = select(base_prefix > v0, base_prefix, v0);
+        let ep2 = select(ep1 > v1, ep1, v1);
+        let ep3 = select(ep2 > v2, ep2, v2);
+        if base < n {
+            store(out[row_off + base], base_prefix.cast::<T>());
+        }
+        if base + 1u32 < n {
+            store(out[row_off + base + 1u32], ep1.cast::<T>());
+        }
+        if base + 2u32 < n {
+            store(out[row_off + base + 2u32], ep2.cast::<T>());
+        }
+        if base + 3u32 < n {
+            store(out[row_off + base + 3u32], ep3.cast::<T>());
+        }
+        threadgroup_barrier();
+        // Running prefix = inclusive max of the whole chunk.
+        let chunk_max = select(base_prefix > m3, base_prefix, m3);
+        if lid == lsize - 1 {
+            threadgroup_store("sgs", ns, chunk_max);
+        }
+        threadgroup_barrier();
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "scan",
+        subop: "scan_max_exclusive",
+        kernel_name: "mt_scan_max_exclusive",
+        kernel_ir: mt_scan_max_exclusive::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-4,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}
+
+// ── Inclusive min scan ───────────────────────────────────────────────────
+//
+// `out[i] = min(v[0], …, v[i])`  (running minimum per row).
+// Identity element is +∞; out-of-range loads are padded with +∞.
+
+#[kernel]
+pub fn mt_scan_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<1>();
+    let lid = tid;
+    let ns = n_simd;
+    let row_off = row * n;
+    threadgroup_alloc("sgs", 9);
+    threadgroup_alloc("tgs", 256);
+    if lid == 0 {
+        threadgroup_store("sgs", ns, infinity());
+    }
+    threadgroup_barrier();
+    let posinf = threadgroup_load("sgs", ns);
+    let chunk = lsize * 4u32;
+    let n_iters = (n + chunk - 1u32) / chunk;
+    for _r in range(0, n_iters, 1) {
+        let base = _r * chunk + lid * 4u32;
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), posinf);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), posinf);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), posinf);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), posinf);
+        // Thread-local inclusive prefix minima.
+        let m1 = select(v0 < v1, v0, v1);
+        let m2 = select(m1 < v2, m1, v2);
+        let m3 = select(m2 < v3, m2, v3);
+        threadgroup_store("tgs", lid, m3);
+        threadgroup_barrier();
+        let mut t_excl = posinf;
+        for _i in range(0u32, lid, 1u32) {
+            let v = threadgroup_load("tgs", _i);
+            t_excl = select(v < t_excl, v, t_excl);
+        }
+        let cur_prefix = threadgroup_load("sgs", ns);
+        let base_prefix = select(cur_prefix < t_excl, cur_prefix, t_excl);
+        let out0 = select(base_prefix < v0, base_prefix, v0);
+        let out1 = select(out0 < v1, out0, v1);
+        let out2 = select(out1 < v2, out1, v2);
+        let out3 = select(out2 < v3, out2, v3);
+        if base < n {
+            store(out[row_off + base], out0.cast::<T>());
+        }
+        if base + 1u32 < n {
+            store(out[row_off + base + 1u32], out1.cast::<T>());
+        }
+        if base + 2u32 < n {
+            store(out[row_off + base + 2u32], out2.cast::<T>());
+        }
+        if base + 3u32 < n {
+            store(out[row_off + base + 3u32], out3.cast::<T>());
+        }
+        threadgroup_barrier();
+        if lid == lsize - 1 {
+            threadgroup_store("sgs", ns, out3);
+        }
+        threadgroup_barrier();
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "scan",
+        subop: "scan_min",
+        kernel_name: "mt_scan_min",
+        kernel_ir: mt_scan_min::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-4,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}
+
+// ── Exclusive min scan ───────────────────────────────────────────────────
+//
+// `out[0] = +∞`,  `out[i] = min(v[0], …, v[i-1])`  (exclusive min prefix).
+
+#[kernel]
+pub fn mt_scan_min_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    let row = program_id::<1>();
+    let lid = tid;
+    let ns = n_simd;
+    let row_off = row * n;
+    threadgroup_alloc("sgs", 9);
+    threadgroup_alloc("tgs", 256);
+    if lid == 0 {
+        threadgroup_store("sgs", ns, infinity());
+    }
+    threadgroup_barrier();
+    let posinf = threadgroup_load("sgs", ns);
+    let chunk = lsize * 4u32;
+    let n_iters = (n + chunk - 1u32) / chunk;
+    for _r in range(0, n_iters, 1) {
+        let base = _r * chunk + lid * 4u32;
+        let v0 = select(base < n, load(inp[row_off + base]).cast::<f32>(), posinf);
+        let v1 = select(base + 1u32 < n, load(inp[row_off + base + 1u32]).cast::<f32>(), posinf);
+        let v2 = select(base + 2u32 < n, load(inp[row_off + base + 2u32]).cast::<f32>(), posinf);
+        let v3 = select(base + 3u32 < n, load(inp[row_off + base + 3u32]).cast::<f32>(), posinf);
+        let m1 = select(v0 < v1, v0, v1);
+        let m2 = select(m1 < v2, m1, v2);
+        let m3 = select(m2 < v3, m2, v3);
+        threadgroup_store("tgs", lid, m3);
+        threadgroup_barrier();
+        let mut t_excl = posinf;
+        for _i in range(0u32, lid, 1u32) {
+            let v = threadgroup_load("tgs", _i);
+            t_excl = select(v < t_excl, v, t_excl);
+        }
+        let cur_prefix = threadgroup_load("sgs", ns);
+        let base_prefix = select(cur_prefix < t_excl, cur_prefix, t_excl);
+        // Exclusive: element k stores min of base_prefix and v[0..k-1].
+        let ep1 = select(base_prefix < v0, base_prefix, v0);
+        let ep2 = select(ep1 < v1, ep1, v1);
+        let ep3 = select(ep2 < v2, ep2, v2);
+        if base < n {
+            store(out[row_off + base], base_prefix.cast::<T>());
+        }
+        if base + 1u32 < n {
+            store(out[row_off + base + 1u32], ep1.cast::<T>());
+        }
+        if base + 2u32 < n {
+            store(out[row_off + base + 2u32], ep2.cast::<T>());
+        }
+        if base + 3u32 < n {
+            store(out[row_off + base + 3u32], ep3.cast::<T>());
+        }
+        threadgroup_barrier();
+        let chunk_min = select(base_prefix < m3, base_prefix, m3);
+        if lid == lsize - 1 {
+            threadgroup_store("sgs", ns, chunk_min);
+        }
+        threadgroup_barrier();
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "scan",
+        subop: "scan_min_exclusive",
+        kernel_name: "mt_scan_min_exclusive",
+        kernel_ir: mt_scan_min_exclusive::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-4,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}

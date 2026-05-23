@@ -18,6 +18,11 @@
 # doing.
 
 set -e
+# Without pipefail, `make fmt-check 2>&1 | tail -20` returns tail's exit
+# status (always 0), so a failing fmt-check would never trip the `if !`
+# guard below — the hook would print the diff and then say "✓ pre-commit
+# OK". Pipefail propagates the leftmost-failing command's status.
+set -o pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"

@@ -301,3 +301,338 @@ fn mt_sdpa_vector_qwen3_decode_shape_f16() {
     // sdpa_decode_2pass f16 tests.
     assert_close_rel(&actual, &expected, 1e-2, "mt_sdpa_vector f16 Qwen3 shape vs CPU");
 }
+
+// ── New head_dim variants ─────────────────────────────────────────────────
+
+use metaltile_std::mlx::sdpa_vector::{
+    mt_sdpa_vector_d64,
+    mt_sdpa_vector_d96,
+    mt_sdpa_vector_d192,
+    mt_sdpa_vector_d256,
+};
+
+/// Generic dispatch helper for the new head_dim kernels.
+#[allow(clippy::too_many_arguments)]
+fn run_sdpa_vector_generic(
+    ctx: &Context,
+    dt: Dt,
+    kernel_ir: metaltile_core::ir::Kernel,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_q_heads: usize,
+    head_dim: usize,
+    n_kv: usize,
+    gqa_factor: usize,
+    scale: f32,
+) -> Vec<f32> {
+    use metaltile_core::ir::KernelMode;
+    let mut kernel = kernel_ir;
+    kernel.mode = KernelMode::Reduction;
+
+    let mut buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    buffers.insert("q".into(), pack_bytes(q, dt));
+    buffers.insert("k".into(), pack_bytes(k, dt));
+    buffers.insert("v".into(), pack_bytes(v, dt));
+    buffers.insert("out".into(), vec![0u8; n_q_heads * head_dim * dt.bytes()]);
+    buffers.insert("head_dim".into(), (head_dim as u32).to_le_bytes().to_vec());
+    buffers.insert("n_kv".into(), (n_kv as u32).to_le_bytes().to_vec());
+    buffers.insert("gqa_factor".into(), (gqa_factor as u32).to_le_bytes().to_vec());
+    buffers.insert("scale".into(), scale.to_le_bytes().to_vec());
+
+    let result = ctx
+        .dispatch_with_grid(&kernel, &buffers, &BTreeMap::new(), [n_q_heads, 1, 1], [1024, 1, 1])
+        .expect("dispatch_with_grid should succeed");
+    let out_bytes = result.outputs.get("out").expect("`out` buffer in dispatch result");
+    unpack_bytes(out_bytes, dt)
+}
+
+// ── d=64 ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn mt_sdpa_vector_d64_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (64usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F32,
+        mt_sdpa_vector_d64::kernel_ir_for(metaltile_core::dtype::DType::F32),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_abs(&actual, &expected, 1e-3, "mt_sdpa_vector_d64 f32 vs CPU");
+}
+
+#[test]
+fn mt_sdpa_vector_d64_matches_cpu_f16() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (64usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q_f32 = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k_f32 = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v_f32 = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let q = round_through(&q_f32, Dt::F16);
+    let k = round_through(&k_f32, Dt::F16);
+    let v = round_through(&v_f32, Dt::F16);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F16,
+        mt_sdpa_vector_d64::kernel_ir_for(metaltile_core::dtype::DType::F16),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_rel(&actual, &expected, 5e-3, "mt_sdpa_vector_d64 f16 vs CPU");
+}
+
+#[test]
+fn mt_sdpa_vector_d64_gqa_f32() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (64usize, 256usize, 8usize, 4usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F32,
+        mt_sdpa_vector_d64::kernel_ir_for(metaltile_core::dtype::DType::F32),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_abs(&actual, &expected, 1e-3, "mt_sdpa_vector_d64 f32 GQA=4 vs CPU");
+}
+
+// ── d=96 ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn mt_sdpa_vector_d96_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (96usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F32,
+        mt_sdpa_vector_d96::kernel_ir_for(metaltile_core::dtype::DType::F32),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_abs(&actual, &expected, 1e-3, "mt_sdpa_vector_d96 f32 vs CPU");
+}
+
+#[test]
+fn mt_sdpa_vector_d96_matches_cpu_f16() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (96usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q_f32 = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k_f32 = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v_f32 = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let q = round_through(&q_f32, Dt::F16);
+    let k = round_through(&k_f32, Dt::F16);
+    let v = round_through(&v_f32, Dt::F16);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F16,
+        mt_sdpa_vector_d96::kernel_ir_for(metaltile_core::dtype::DType::F16),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_rel(&actual, &expected, 5e-3, "mt_sdpa_vector_d96 f16 vs CPU");
+}
+
+// ── d=192 ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn mt_sdpa_vector_d192_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (192usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F32,
+        mt_sdpa_vector_d192::kernel_ir_for(metaltile_core::dtype::DType::F32),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_abs(&actual, &expected, 1e-3, "mt_sdpa_vector_d192 f32 vs CPU");
+}
+
+#[test]
+fn mt_sdpa_vector_d192_matches_cpu_f16() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (192usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q_f32 = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k_f32 = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v_f32 = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let q = round_through(&q_f32, Dt::F16);
+    let k = round_through(&k_f32, Dt::F16);
+    let v = round_through(&v_f32, Dt::F16);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F16,
+        mt_sdpa_vector_d192::kernel_ir_for(metaltile_core::dtype::DType::F16),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_rel(&actual, &expected, 5e-3, "mt_sdpa_vector_d192 f16 vs CPU");
+}
+
+// ── d=256 ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn mt_sdpa_vector_d256_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (256usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F32,
+        mt_sdpa_vector_d256::kernel_ir_for(metaltile_core::dtype::DType::F32),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_abs(&actual, &expected, 1e-3, "mt_sdpa_vector_d256 f32 vs CPU");
+}
+
+#[test]
+fn mt_sdpa_vector_d256_matches_cpu_f16() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (256usize, 256usize, 4usize, 1usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q_f32 = ramp(n_q_heads * head_dim, 17, 8.0);
+    let k_f32 = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v_f32 = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let q = round_through(&q_f32, Dt::F16);
+    let k = round_through(&k_f32, Dt::F16);
+    let v = round_through(&v_f32, Dt::F16);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F16,
+        mt_sdpa_vector_d256::kernel_ir_for(metaltile_core::dtype::DType::F16),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_rel(&actual, &expected, 5e-3, "mt_sdpa_vector_d256 f16 vs CPU");
+}
+
+#[test]
+fn mt_sdpa_vector_d256_gqa_f32() {
+    let _g = gpu_lock();
+    let (head_dim, n_kv, n_q_heads, gqa_factor) = (256usize, 256usize, 8usize, 4usize);
+    let n_kv_heads = n_q_heads / gqa_factor;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 11, 5.0);
+    let expected = cpu_sdpa_decode_reference(&q, &k, &v, n_q_heads, n_kv_heads, n_kv, head_dim);
+    let ctx = Context::new().expect("Context::new");
+    let actual = run_sdpa_vector_generic(
+        &ctx,
+        Dt::F32,
+        mt_sdpa_vector_d256::kernel_ir_for(metaltile_core::dtype::DType::F32),
+        &q,
+        &k,
+        &v,
+        n_q_heads,
+        head_dim,
+        n_kv,
+        gqa_factor,
+        scale,
+    );
+    assert_close_abs(&actual, &expected, 1e-3, "mt_sdpa_vector_d256 f32 GQA=4 vs CPU");
+}

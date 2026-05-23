@@ -165,3 +165,313 @@ fft_kernel!(mt_fft_n128, 128u32, 7u32, 0.007_812_5f32, "n128");
 fft_kernel!(mt_fft_n256, 256u32, 8u32, 0.003_906_25f32, "n256");
 fft_kernel!(mt_fft_n512, 512u32, 9u32, 0.001_953_125f32, "n512");
 fft_kernel!(mt_fft_n1024, 1024u32, 10u32, 0.000_976_562_5f32, "n1024");
+
+// ── Bluestein chirp-Z transform — arbitrary-length DFT ───────────────────
+//
+// Implements DFT of an arbitrary-length N signal in O(N log N) time using
+// Bluestein's algorithm. The three-step approach:
+//
+//   1. Pre-multiply (bluestein_preprocess): per-sample pointwise multiply
+//      input `x[n]` by chirp `w[n] = exp(±iπn²/N)`, zero-pad to the next
+//      power-of-two M ≥ 2N.
+//
+//   2. Convolution via radix-2 FFT: the caller dispatches the existing
+//      `mt_fft_n*` kernel on the padded M-length sequence (and on the
+//      pre-computed chirp sequence `a[n]` for the convolution filter). The
+//      element-wise product in frequency domain followed by an IFFT computes
+//      the circular convolution.
+//
+//   3. Post-multiply (bluestein_postprocess): multiply each DFT output bin
+//      `k` by `exp(∓iπk²/N)` and scale by `1/N` for the inverse transform.
+//
+// This module provides step 1 and step 3 as GPU kernels. Step 2 (the FFT
+// convolution) uses the existing `mt_fft_n1024` (M=1024 covers both
+// N=400: 2×400=800 ≤ 1024, and N=480: 2×480=960 ≤ 1024).
+//
+// Additionally, `bluestein_chirp_filter` pre-computes the frequency-domain
+// chirp filter `A[k] = FFT(a)[k]` where `a[n] = exp(-iπn²/N)` for
+// `n ∈ [0,N)`, `a[M-n] = a[n]` for `n ∈ [1,N)`, and zeros elsewhere.
+// This filter only depends on N and M so it can be pre-computed once per
+// model load.
+//
+// ## Bluestein identity
+//
+// The key identity: `nk = (n² + k² - (k-n)²) / 2`. Substituting into
+// the DFT sum:
+//
+//   X[k] = exp(iπk²/N) Σ_n x[n] exp(iπn²/N) · a[k-n]
+//
+// where `a[m] = exp(-iπm²/N)` is the convolution kernel. The chirp
+// pre-multiply turns the DFT into a linear convolution in m=(k-n), which
+// the FFT evaluates in O(N log N).
+//
+// ## Usage pattern (caller side)
+//
+//   bluestein_preprocess<T>(x_re, x_im, chirp_re, chirp_im, N, M, inv=0|1)
+//     → padded `[rows, M]` pre-multiplied sequences
+//   mt_fft_n1024<T>(filter_re, filter_im, F_re, F_im, inv=0)   // once per N
+//   mt_fft_n1024<T>(padded_re, padded_im, Y_re, Y_im, inv=0)   // per batch
+//   elementwise_cmul(Y_re, Y_im, F_re, F_im)                   // in-place
+//   mt_fft_n1024<T>(Y_re, Y_im, conv_re, conv_im, inv=1)        // IFFT
+//   bluestein_postprocess<T>(conv_re, conv_im, out_re, out_im, N, M, inv)
+//     → final DFT output `[rows, N]`
+
+/// Bluestein step 1: pre-multiply + zero-pad.
+///
+/// For each row and each sample `n ∈ [0, N)`:
+///   `pre[n] = x[n] · chirp[n]`   (complex multiply)
+///   chirp[n] = `exp(±iπn²/N)` — `+` for forward (inv=0), `−` for inverse.
+///   `pre[m] = 0` for `m ∈ [N, M)` (zero-pad to radix-2 length M).
+///
+/// Input: `in_re / in_im [rows, N]`; output: `out_re / out_im [rows, M]`.
+/// Constexprs: `n` (original length), `m` (padded power-of-two length), `inv`.
+///
+/// Grid3D: one thread per element of `[rows, M]`.
+#[kernel]
+pub fn mt_fft_bluestein_preprocess<T>(
+    in_re: Tensor<T>,
+    in_im: Tensor<T>,
+    mut out_re: Tensor<T>,
+    mut out_im: Tensor<T>,
+    #[constexpr] n_len: u32,
+    #[constexpr] m_len: u32,
+    #[constexpr] inv: u32,
+) {
+    // One thread per output element (row, col) in [rows, M].
+    let idx = program_id::<0>();
+    let col = idx % m_len;
+    let row = idx / m_len;
+
+    let pi = 3.141592653589793f32;
+    // For inv=0 (forward): chirp angle = +πn²/N (the conjugate for X[k] side).
+    // Standard Bluestein uses exp(-iπn²/N) on input and exp(-iπk²/N) on output.
+    // Forward DFT: angle_sign = -1; inverse: angle_sign = +1.
+    let angle_sign = select(inv == 0u32, -1.0f32, 1.0f32);
+
+    // Zero-pad region: col >= n_len writes zero.
+    if col >= n_len {
+        store(out_re[row * m_len + col], 0.0f32.cast::<T>());
+        store(out_im[row * m_len + col], 0.0f32.cast::<T>());
+    } else {
+        // Chirp angle: angle_sign * π * n² / N.
+        let n_f = col.cast::<f32>();
+        let n_len_f = n_len.cast::<f32>();
+        let angle = angle_sign * pi * n_f * n_f / n_len_f;
+        let wr = cos(angle);
+        let wi = sin(angle);
+
+        // Load input (complex).
+        let xr = load(in_re[row * n_len + col]).cast::<f32>();
+        let xi = load(in_im[row * n_len + col]).cast::<f32>();
+
+        // Complex multiply: (xr + xi·i)(wr + wi·i).
+        let pr = xr * wr - xi * wi;
+        let pi_v = xr * wi + xi * wr;
+
+        store(out_re[row * m_len + col], pr.cast::<T>());
+        store(out_im[row * m_len + col], pi_v.cast::<T>());
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "fft",
+        subop: "bluestein_preprocess",
+        kernel_name: "mt_fft_bluestein_preprocess",
+        kernel_ir: mt_fft_bluestein_preprocess::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Grid3D),
+    }
+}
+
+/// Bluestein step 2: build the chirp convolution filter in the time domain.
+///
+/// Computes `a[m]` for the circular convolution `filter_re / filter_im`
+/// `[1, M]` (single row, M = padded power-of-two length):
+///
+///   a[0]     = 1 + 0i   (n=0 chirp is always 1)
+///   a[n]     = exp(-i π n² / N)   for n ∈ [1, N)   (conjugate chirp)
+///   a[M-n]   = a[n]               for n ∈ [1, N)   (time-reversal for convolution)
+///   a[m]     = 0                  for m ∈ [N, M-N+1)
+///
+/// This is a single-row kernel (grid = [M, 1, 1]).
+///
+/// The caller FFTs this filter once and stores it for reuse across all
+/// rows/frames.
+#[kernel]
+pub fn mt_fft_bluestein_chirp_filter(
+    mut filter_re: Tensor<f32>,
+    mut filter_im: Tensor<f32>,
+    #[constexpr] n_len: u32,
+    #[constexpr] m_len: u32,
+) {
+    let m = program_id::<0>(); // column index in [0, M)
+
+    let pi = 3.141592653589793f32;
+
+    // n = min(m, M-m) — the "wrapped" tap index.
+    let m_minus = m_len - m;
+    let n_tap = select(m < n_len, m, select(m_minus < n_len, m_minus, n_len));
+    let in_range = (m < n_len) | ((m_minus < n_len) & (m > 0u32));
+
+    if in_range {
+        let n_f = n_tap.cast::<f32>();
+        let n_len_f = n_len.cast::<f32>();
+        // Conjugate chirp: exp(-iπn²/N).
+        let angle = -pi * n_f * n_f / n_len_f;
+        let wr = cos(angle);
+        let wi = sin(angle);
+        store(filter_re[m], wr);
+        store(filter_im[m], wi);
+    } else {
+        store(filter_re[m], 0.0f32);
+        store(filter_im[m], 0.0f32);
+    }
+}
+
+/// Wrapper satisfying the `fn(DType) -> Kernel` BenchSpec signature.
+/// The chirp filter is always f32, so the DType argument is ignored.
+fn mt_fft_bluestein_chirp_filter_ir(_: DType) -> metaltile_core::ir::Kernel {
+    mt_fft_bluestein_chirp_filter::kernel_ir_for()
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "fft",
+        subop: "bluestein_chirp_filter",
+        kernel_name: "mt_fft_bluestein_chirp_filter",
+        kernel_ir: mt_fft_bluestein_chirp_filter_ir,
+        dtypes: &[DType::F32],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Grid3D),
+    }
+}
+
+/// Bluestein convolution step: element-wise complex multiply of two `[rows, M]`
+/// frequency-domain arrays. Performed between the two FFT calls:
+///
+///   Y[k] = Y_input[k] · F_filter[k]
+///
+/// Both inputs are `[rows, M]`; `filter_re / filter_im` are `[1, M]` and
+/// broadcast across rows. Generic over `T` for the per-row input;
+/// the filter is always f32 (pre-computed once as f32).
+#[kernel]
+pub fn mt_fft_bluestein_cmul<T>(
+    y_re: Tensor<T>,
+    y_im: Tensor<T>,
+    filter_re: Tensor<f32>,
+    filter_im: Tensor<f32>,
+    mut out_re: Tensor<T>,
+    mut out_im: Tensor<T>,
+    #[constexpr] m_len: u32,
+) {
+    let idx = program_id::<0>();
+    let col = idx % m_len;
+
+    let yr = load(y_re[idx]).cast::<f32>();
+    let yi = load(y_im[idx]).cast::<f32>();
+    // Filter broadcasts across rows (index by col only).
+    let fr = load(filter_re[col]);
+    let fi = load(filter_im[col]);
+
+    // Complex multiply.
+    let pr = yr * fr - yi * fi;
+    let pi_v = yr * fi + yi * fr;
+
+    store(out_re[idx], pr.cast::<T>());
+    store(out_im[idx], pi_v.cast::<T>());
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "fft",
+        subop: "bluestein_cmul",
+        kernel_name: "mt_fft_bluestein_cmul",
+        kernel_ir: mt_fft_bluestein_cmul::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Grid3D),
+    }
+}
+
+/// Bluestein step 3: post-multiply and extract N outputs from M-length IFFT.
+///
+/// For each row and each output bin `k ∈ [0, N)`:
+///   `X[k] = conv[k] · exp(angle_sign · iπk²/N) [· scale]`
+///
+/// where:
+///   - `conv_re / conv_im [rows, M]` is the IFFT output of the circular
+///     convolution (already inverse-scaled by 1/M from the FFT kernel).
+///   - `angle_sign = -1` for forward (inv=0), `+1` for inverse (inv=1).
+///   - `scale = 1/N` for the inverse transform, `1` for forward.
+///   - Output is `[rows, N]` (truncated to the first N bins).
+///
+/// Grid3D: one thread per element of `[rows, N]`.
+#[kernel]
+pub fn mt_fft_bluestein_postprocess<T>(
+    conv_re: Tensor<T>,
+    conv_im: Tensor<T>,
+    mut out_re: Tensor<T>,
+    mut out_im: Tensor<T>,
+    #[constexpr] n_len: u32,
+    #[constexpr] m_len: u32,
+    #[constexpr] inv: u32,
+) {
+    let idx = program_id::<0>();
+    let k = idx % n_len;
+    let row = idx / n_len;
+
+    let pi = 3.141592653589793f32;
+    // Post-multiply chirp: same sign convention as pre-multiply.
+    let angle_sign = select(inv == 0u32, -1.0f32, 1.0f32);
+
+    let k_f = k.cast::<f32>();
+    let n_len_f = n_len.cast::<f32>();
+    let angle = angle_sign * pi * k_f * k_f / n_len_f;
+    let wr = cos(angle);
+    let wi = sin(angle);
+
+    // Load from the IFFT output at position (row, k). The circular
+    // convolution result is in [rows, M]; we only need the first N values.
+    let cr = load(conv_re[row * m_len + k]).cast::<f32>();
+    let ci = load(conv_im[row * m_len + k]).cast::<f32>();
+
+    // Complex multiply.
+    let pr = cr * wr - ci * wi;
+    let pi_v = cr * wi + ci * wr;
+
+    // Inverse scale: 1/N for the inverse DFT, 1 for forward.
+    let scale = select(inv == 0u32, 1.0f32, 1.0f32 / n_len_f);
+
+    store(out_re[idx], (pr * scale).cast::<T>());
+    store(out_im[idx], (pi_v * scale).cast::<T>());
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "fft",
+        subop: "bluestein_postprocess",
+        kernel_name: "mt_fft_bluestein_postprocess",
+        kernel_ir: mt_fft_bluestein_postprocess::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Grid3D),
+    }
+}

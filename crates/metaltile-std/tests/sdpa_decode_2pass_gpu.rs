@@ -484,3 +484,275 @@ fn sdpa_decode_2pass_capture() {
     stop_gpu_trace();
     println!("captured to {path} — open in Xcode for counters");
 }
+
+// ── Additional head_dim correctness tests: d={64,96,256} ─────────────────────
+
+use metaltile_std::ffai::sdpa_decode_2pass::{
+    sdpa_decode_2pass_pass1_d64,
+    sdpa_decode_2pass_pass1_d96,
+    sdpa_decode_2pass_pass1_d256,
+    sdpa_decode_2pass_pass2_d64,
+    sdpa_decode_2pass_pass2_d96,
+    sdpa_decode_2pass_pass2_d256,
+};
+
+/// Dispatch the d-specific pass1+pass2 pair and compare to the naive
+/// SDPA reference at the given `head_dim`.
+#[allow(clippy::too_many_arguments)]
+fn run_2pass_generic(
+    ctx: &Context,
+    dt: Dt,
+    head_dim: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    n_kv: usize,
+    blocks: usize,
+    scale: f32,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+) -> Vec<f32> {
+    assert_eq!(blocks % 32, 0, "blocks must be a multiple of 32");
+    let gqa_factor = n_q_heads / n_kv_heads;
+    let dtype = dt.to_dtype();
+    let partial_o_len = n_q_heads * blocks * head_dim;
+    let partial_ml_len = n_q_heads * blocks;
+    let kv_stride = n_kv;
+
+    // Pick the right pass1/pass2 kernel pair by head_dim.
+    let (mut p1_kernel, mut p2_kernel) = match head_dim {
+        64 => (
+            sdpa_decode_2pass_pass1_d64::kernel_ir_for(dtype),
+            sdpa_decode_2pass_pass2_d64::kernel_ir_for(dtype),
+        ),
+        96 => (
+            sdpa_decode_2pass_pass1_d96::kernel_ir_for(dtype),
+            sdpa_decode_2pass_pass2_d96::kernel_ir_for(dtype),
+        ),
+        256 => (
+            sdpa_decode_2pass_pass1_d256::kernel_ir_for(dtype),
+            sdpa_decode_2pass_pass2_d256::kernel_ir_for(dtype),
+        ),
+        _ => panic!("unsupported head_dim {head_dim} in run_2pass_generic"),
+    };
+    p1_kernel.mode = KernelMode::Reduction;
+    p2_kernel.mode = KernelMode::Reduction;
+
+    let mut p1_bufs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    p1_bufs.insert("q".into(), pack_bytes(q, dt));
+    p1_bufs.insert("k".into(), pack_bytes(k, dt));
+    p1_bufs.insert("v".into(), pack_bytes(v, dt));
+    p1_bufs.insert("partial_o".into(), vec![0u8; partial_o_len * dt.bytes()]);
+    p1_bufs.insert("partial_m".into(), vec![0u8; partial_ml_len * 4]);
+    p1_bufs.insert("partial_l".into(), vec![0u8; partial_ml_len * 4]);
+    p1_bufs.insert("head_dim".into(), (head_dim as u32).to_le_bytes().to_vec());
+    p1_bufs.insert("n_kv".into(), (n_kv as u32).to_le_bytes().to_vec());
+    p1_bufs.insert("kv_stride".into(), (kv_stride as u32).to_le_bytes().to_vec());
+    p1_bufs.insert("gqa_factor".into(), (gqa_factor as u32).to_le_bytes().to_vec());
+    p1_bufs.insert("blocks".into(), (blocks as u32).to_le_bytes().to_vec());
+    p1_bufs.insert("scale".into(), scale.to_le_bytes().to_vec());
+
+    let empty: BTreeMap<String, u32> = BTreeMap::new();
+    let p1_result = ctx
+        .dispatch_with_grid(&p1_kernel, &p1_bufs, &empty, [n_kv_heads, blocks, 1], [
+            32, gqa_factor, 1,
+        ])
+        .expect("pass1");
+
+    let mut p2_bufs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    p2_bufs
+        .insert("partial_o".into(), p1_result.outputs.get("partial_o").expect("partial_o").clone());
+    p2_bufs
+        .insert("partial_m".into(), p1_result.outputs.get("partial_m").expect("partial_m").clone());
+    p2_bufs
+        .insert("partial_l".into(), p1_result.outputs.get("partial_l").expect("partial_l").clone());
+    p2_bufs.insert("out".into(), vec![0u8; n_q_heads * head_dim * dt.bytes()]);
+    p2_bufs.insert("head_dim".into(), (head_dim as u32).to_le_bytes().to_vec());
+    p2_bufs.insert("blocks".into(), (blocks as u32).to_le_bytes().to_vec());
+
+    let p2_result = ctx
+        .dispatch_with_grid(&p2_kernel, &p2_bufs, &empty, [n_q_heads, 1, 1], [1024, 1, 1])
+        .expect("pass2");
+
+    unpack_bytes(p2_result.outputs.get("out").expect("out"), dt)
+}
+
+// d=64
+
+#[test]
+fn sdpa_decode_2pass_d64_matches_cpu_f32() {
+    let _lock = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim, n_kv, blocks) =
+        (4usize, 1usize, 64usize, 64usize, 32usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 23, 11.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 29, 14.0);
+    let expected =
+        naive_sdpa_f32(&q, &k, &v, &SdpaShape { n_q_heads, n_kv_heads, head_dim, n_kv, scale });
+    let ctx = Context::new().expect("Context");
+    let actual = run_2pass_generic(
+        &ctx,
+        Dt::F32,
+        head_dim,
+        n_q_heads,
+        n_kv_heads,
+        n_kv,
+        blocks,
+        scale,
+        &q,
+        &k,
+        &v,
+    );
+    let diff = max_abs_diff(&expected, &actual);
+    assert!(diff < 1e-4, "d64 f32 small: max |diff| = {diff:.2e}");
+}
+
+#[test]
+fn sdpa_decode_2pass_d64_gqa_matches_cpu_f32() {
+    let _lock = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim, n_kv, blocks) =
+        (32usize, 8usize, 64usize, 256usize, 64usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 23, 11.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 29, 14.0);
+    let expected =
+        naive_sdpa_f32(&q, &k, &v, &SdpaShape { n_q_heads, n_kv_heads, head_dim, n_kv, scale });
+    let ctx = Context::new().expect("Context");
+    let actual = run_2pass_generic(
+        &ctx,
+        Dt::F32,
+        head_dim,
+        n_q_heads,
+        n_kv_heads,
+        n_kv,
+        blocks,
+        scale,
+        &q,
+        &k,
+        &v,
+    );
+    let diff = max_abs_diff(&expected, &actual);
+    assert!(diff < 1e-4, "d64 f32 gqa: max |diff| = {diff:.2e}");
+}
+
+// d=96
+
+#[test]
+fn sdpa_decode_2pass_d96_matches_cpu_f32() {
+    let _lock = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim, n_kv, blocks) =
+        (4usize, 1usize, 96usize, 64usize, 32usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 23, 11.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 29, 14.0);
+    let expected =
+        naive_sdpa_f32(&q, &k, &v, &SdpaShape { n_q_heads, n_kv_heads, head_dim, n_kv, scale });
+    let ctx = Context::new().expect("Context");
+    let actual = run_2pass_generic(
+        &ctx,
+        Dt::F32,
+        head_dim,
+        n_q_heads,
+        n_kv_heads,
+        n_kv,
+        blocks,
+        scale,
+        &q,
+        &k,
+        &v,
+    );
+    let diff = max_abs_diff(&expected, &actual);
+    assert!(diff < 1e-4, "d96 f32 small: max |diff| = {diff:.2e}");
+}
+
+#[test]
+fn sdpa_decode_2pass_d96_gqa_matches_cpu_f32() {
+    let _lock = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim, n_kv, blocks) =
+        (32usize, 8usize, 96usize, 256usize, 64usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 23, 11.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 29, 14.0);
+    let expected =
+        naive_sdpa_f32(&q, &k, &v, &SdpaShape { n_q_heads, n_kv_heads, head_dim, n_kv, scale });
+    let ctx = Context::new().expect("Context");
+    let actual = run_2pass_generic(
+        &ctx,
+        Dt::F32,
+        head_dim,
+        n_q_heads,
+        n_kv_heads,
+        n_kv,
+        blocks,
+        scale,
+        &q,
+        &k,
+        &v,
+    );
+    let diff = max_abs_diff(&expected, &actual);
+    assert!(diff < 1e-4, "d96 f32 gqa: max |diff| = {diff:.2e}");
+}
+
+// d=256
+
+#[test]
+fn sdpa_decode_2pass_d256_matches_cpu_f32() {
+    let _lock = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim, n_kv, blocks) =
+        (4usize, 1usize, 256usize, 64usize, 32usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 23, 11.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 29, 14.0);
+    let expected =
+        naive_sdpa_f32(&q, &k, &v, &SdpaShape { n_q_heads, n_kv_heads, head_dim, n_kv, scale });
+    let ctx = Context::new().expect("Context");
+    let actual = run_2pass_generic(
+        &ctx,
+        Dt::F32,
+        head_dim,
+        n_q_heads,
+        n_kv_heads,
+        n_kv,
+        blocks,
+        scale,
+        &q,
+        &k,
+        &v,
+    );
+    let diff = max_abs_diff(&expected, &actual);
+    assert!(diff < 1e-4, "d256 f32 small: max |diff| = {diff:.2e}");
+}
+
+#[test]
+fn sdpa_decode_2pass_d256_gqa_matches_cpu_f32() {
+    let _lock = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim, n_kv, blocks) =
+        (32usize, 8usize, 256usize, 256usize, 64usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let q = ramp(n_q_heads * head_dim, 19, 9.0);
+    let k = ramp(n_kv_heads * n_kv * head_dim, 23, 11.0);
+    let v = ramp(n_kv_heads * n_kv * head_dim, 29, 14.0);
+    let expected =
+        naive_sdpa_f32(&q, &k, &v, &SdpaShape { n_q_heads, n_kv_heads, head_dim, n_kv, scale });
+    let ctx = Context::new().expect("Context");
+    let actual = run_2pass_generic(
+        &ctx,
+        Dt::F32,
+        head_dim,
+        n_q_heads,
+        n_kv_heads,
+        n_kv,
+        blocks,
+        scale,
+        &q,
+        &k,
+        &v,
+    );
+    let diff = max_abs_diff(&expected, &actual);
+    assert!(diff < 1e-4, "d256 f32 gqa: max |diff| = {diff:.2e}");
+}

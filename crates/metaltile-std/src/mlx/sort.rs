@@ -254,3 +254,120 @@ inventory::submit! {
         kernel_mode: Some(KernelMode::Grid3D),
     }
 }
+
+// ── Per-row (segmented) sort ─────────────────────────────────────────────
+//
+// `mt_sort_segmented<T>` sorts each row of a `[batch, n]` matrix
+// independently. One threadgroup per row; each threadgroup uses a
+// single-block bitonic sort identical to `mt_sort`, covering rows of up
+// to `n = TPG * 4 = 1024` elements.
+//
+// For the typical top-k logits-processing shape (vocab chunks ≤ 1024),
+// one dispatch suffices. Rows larger than 1024 are a follow-up (they
+// require the per-row multi-block + merge path).
+//
+// ## DISPATCH INVARIANTS
+//
+// - **TPG: 256 threads** (each thread processes 4 elements → 1024/row).
+// - **n ≤ 1024**: the bitonic sort covers exactly `n` elements per row;
+//   for `n < 1024` each thread bounds-guards its loads and treats
+//   out-of-range slots with a `+∞` sentinel (they sink to the tail).
+// - **Grid: `[batch, 1, 1]`** — one threadgroup per row.
+// - Output is a sorted copy (not in-place). Caller manages buffers.
+//
+// ## Stability
+//
+// The bitonic sort network is NOT stable by construction — elements with
+// equal values may appear in any relative order. For top-k masking this
+// is acceptable (we only need the threshold value, not tie-breaking).
+// Stability is documented as a non-guarantee.
+
+#[kernel]
+pub fn mt_sort_segmented<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
+    // `tgid_x` = row index; `tid` = thread-local ID within the TG.
+    let row = tgid_x;
+    let t = tid;
+
+    // 1024-slot shared memory for the bitonic network.
+    threadgroup_alloc("shared", 1024, T);
+
+    let row_base = row * n;
+
+    // Load 4 elements per thread. Out-of-range slots get `+∞` so they
+    // sink to the tail and the in-range result is correct for any n ≤ 1024.
+    let i0 = t * 4u32;
+    let i1 = i0 + 1u32;
+    let i2 = i0 + 2u32;
+    let i3 = i0 + 3u32;
+
+    let inf_f = infinity();
+    let v0 = select(i0 < n, load(inp[row_base + i0]).cast::<f32>(), inf_f);
+    let v1 = select(i1 < n, load(inp[row_base + i1]).cast::<f32>(), inf_f);
+    let v2 = select(i2 < n, load(inp[row_base + i2]).cast::<f32>(), inf_f);
+    let v3 = select(i3 < n, load(inp[row_base + i3]).cast::<f32>(), inf_f);
+
+    threadgroup_store("shared", i0, v0.cast::<T>());
+    threadgroup_store("shared", i1, v1.cast::<T>());
+    threadgroup_store("shared", i2, v2.cast::<T>());
+    threadgroup_store("shared", i3, v3.cast::<T>());
+    threadgroup_barrier();
+
+    // Bitonic sort network — identical structure to `mt_sort`.
+    // Outer loop `_k` grows the sorted sub-sequence length (2^_k).
+    // Inner loop `_jb` walks the merge stages from `_k-1` down to 0.
+    for _k in range(1u32, 11u32, 1u32) {
+        for _jb in range(0u32, _k, 1u32) {
+            let flip = _k - _jb - 1u32;
+            // `flip >= 7` means the partner may be in a different bank
+            // group — barrier is needed to keep the sort coherent.
+            if flip >= 7u32 {
+                threadgroup_barrier();
+            }
+            for _e in range(0u32, 4u32, 1u32) {
+                let gi = t * 4u32 + _e;
+                let partner = gi ^ (1u32 << flip);
+                if gi < partner {
+                    let a = threadgroup_load("shared", gi);
+                    let b = threadgroup_load("shared", partner);
+                    let dir = (gi >> _k) & 1u32;
+                    let a_f = a.cast::<f32>();
+                    let b_f = b.cast::<f32>();
+                    let want_swap = select(dir == 0u32, a_f > b_f, a_f < b_f);
+                    threadgroup_store("shared", gi, select(want_swap, b, a));
+                    threadgroup_store("shared", partner, select(want_swap, a, b));
+                }
+            }
+        }
+    }
+    threadgroup_barrier();
+
+    // Write sorted result back, skipping out-of-range sentinel slots.
+    if i0 < n {
+        store(out[row_base + i0], threadgroup_load("shared", i0));
+    }
+    if i1 < n {
+        store(out[row_base + i1], threadgroup_load("shared", i1));
+    }
+    if i2 < n {
+        store(out[row_base + i2], threadgroup_load("shared", i2));
+    }
+    if i3 < n {
+        store(out[row_base + i3], threadgroup_load("shared", i3));
+    }
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "sort",
+        subop: "sort_segmented",
+        kernel_name: "mt_sort_segmented",
+        kernel_ir: mt_sort_segmented::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 0.0,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Reduction),
+    }
+}

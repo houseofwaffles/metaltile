@@ -208,3 +208,220 @@ quantize_kv_kernel!(quantize_kv_int4, 4u32, "quantize_int4");
 quantize_kv_kernel!(quantize_kv_int8, 8u32, "quantize_int8");
 bulk_dequant_kv_kernel!(bulk_dequant_kv_int4, 4u32, "bulk_dequant_int4");
 bulk_dequant_kv_kernel!(bulk_dequant_kv_int8, 8u32, "bulk_dequant_int8");
+
+// ─── fp8 KV cache (E4M3 + E5M2) ─────────────────────────────────────────────
+//
+// Extends the KV-cache quantize + bulk-dequant pipeline to fp8.
+//
+// Layout: fp8 packs 1 code per byte → 4 codes per u32, matching the int8
+// bit-width (8 bits/code), so the same `32/8 = 4` vals-per-pack as int8.
+// The key difference from affine int8 is how scale is derived (group amax)
+// and how codes are decoded (fp8 format rather than uniform linear).
+//
+// The macro takes `$mant_f` (float, e.g. `3.0f32`) for arithmetic in the
+// quant/dequant inner loops AND `$mant_i` (integer, e.g. `3u32`) for the
+// bit-shift positions. They can't be unified into one literal — Rust's
+// `as` cast isn't expressible in the DSL (the body parser only handles
+// `.cast::<T>()` method calls on Tensor/Value, not literal `as` casts),
+// so `let mant_bits = $mant as u32;` lowers to garbage and the codegen
+// emits `auto v_mant_bits = vN` with no `vN` declared. Splitting the
+// literal into two parameters sidesteps the lowering gap entirely.
+
+macro_rules! quantize_kv_fp8 {
+    ($name:ident, $subop:literal, $mant_f:literal, $mant_i:literal, $emin:literal, $emax:literal, $fp8max:literal) => {
+        /// fp8 KV-cache quantize — one thread per group. Stores the group amax
+        /// as scale and packs fp8-quantized codes (4 per u32, 8 bits each).
+        #[kernel]
+        pub fn $name<T>(
+            src: Tensor<T>,
+            mut out_w: Tensor<u32>,
+            mut out_s: Tensor<T>,
+            #[constexpr] head_dim: u32,
+            #[constexpr] max_seq: u32,
+            #[constexpr] group_size: u32,
+            #[constexpr] position: u32,
+        ) {
+            // fp8: 8 bits/code → 4 codes per u32.
+            let vals_per_pack = 4u32;
+
+            let g_global = program_id::<0>();
+            let groups_per_head = head_dim / group_size;
+            let h = g_global / groups_per_head;
+            let g_in_h = g_global - h * groups_per_head;
+            let d_start = g_in_h * group_size;
+            let src_base = h * head_dim;
+
+            // Find group amax for the per-group scale.
+            let mut mx = 0.0f32;
+            for i in range(0u32, group_size, 1u32) {
+                let v = abs(load(src[src_base + d_start + i]).cast::<f32>());
+                mx = select(v > mx, v, mx);
+            }
+            // inv_scale maps amax → fp8_max; scale (stored for dequant) is its
+            // inverse. Both guard against amax=0 (degenerate group).
+            let inv_scale = select(mx > 0.0f32, $fp8max / mx, 0.0f32);
+            let scale = select(mx > 0.0f32, mx / $fp8max, 0.0f32);
+
+            let dst_s_idx = (h * max_seq + position) * groups_per_head + g_in_h;
+            store(out_s[dst_s_idx], scale.cast::<T>());
+
+            let dst_w_base =
+                (h * max_seq + position) * (head_dim / vals_per_pack) + d_start / vals_per_pack;
+            for p in range(0u32, group_size / vals_per_pack, 1u32) {
+                let mut packed = 0u32;
+                for i in range(0u32, vals_per_pack, 1u32) {
+                    let v = load(src[src_base + d_start + p * vals_per_pack + i]).cast::<f32>();
+                    let sign = select(v < 0.0f32, 1u32, 0u32);
+                    let ax = abs(v);
+                    // Quantize magnitude to fp8 grid: exponent clamped to
+                    // [$emin, $emax]; mantissa snapped to the format's grid.
+                    let norm = ax * inv_scale;
+                    let raw_e = floor(log2(norm));
+                    let e_lo = select(raw_e < $emin, $emin, raw_e);
+                    let e = select(e_lo > $emax, $emax, e_lo);
+                    let quantum = exp2(e - $mant_f);
+                    let q_snapped = select(norm > 0.0f32, round(norm / quantum), 0.0f32);
+                    // Clamp to max representable mantissa at this exponent.
+                    let max_m = exp2($mant_f) - 1.0f32;
+                    let q_m = select(q_snapped > max_m, max_m, q_snapped);
+                    // Encode as fp8 bit pattern (7 magnitude bits + 1 sign).
+                    // exponent biased to unsigned: e_int = e + emax (= bias - 1)
+                    // shifted left by the mantissa count.
+                    let e_int = (e + $emax).cast::<u32>();
+                    let m_int = q_m.cast::<u32>();
+                    let code7 = (e_int << $mant_i) | m_int;
+                    let code = (sign << 7u32) | (code7 & 127u32);
+                    packed = packed | (code << (i * 8u32));
+                }
+                store(out_w[dst_w_base + p], packed);
+            }
+        }
+
+        inventory::submit! {
+            BenchSpec {
+                op: "kv_cache",
+                subop: $subop,
+                kernel_name: stringify!($name),
+                kernel_ir: $name::kernel_ir_for,
+                dtypes: &[DType::F32, DType::F16, DType::BF16],
+                tol: 0.0,
+                mlx_src: None,
+                mlx_pattern: None,
+                shapes: &[],
+                dispatch: BenchDispatch::Generic,
+                kernel_mode: Some(KernelMode::Grid3D),
+            }
+        }
+    };
+}
+
+macro_rules! bulk_dequant_kv_fp8 {
+    ($name:ident, $subop:literal, $mant_f:literal, $mant_i:literal, $emin:literal, $fp8max:literal) => {
+        /// fp8 KV-cache bulk dequant — one thread per output element.
+        #[kernel]
+        pub fn $name<T>(
+            in_w: Tensor<u32>,
+            in_s: Tensor<T>,
+            mut out: Tensor<T>,
+            #[constexpr] head_dim: u32,
+            #[constexpr] max_seq: u32,
+            #[constexpr] group_size: u32,
+            #[constexpr] n_positions: u32,
+        ) {
+            // fp8: 4 codes per u32.
+            let vals_per_pack = 4u32;
+
+            let idx = program_id::<0>();
+            let total_per_head = n_positions * head_dim;
+            let h = idx / total_per_head;
+            let rest = idx - h * total_per_head;
+            let pos = rest / head_dim;
+            let d = rest - pos * head_dim;
+
+            let groups_per_head = head_dim / group_size;
+            let g = d / group_size;
+            let scale = load(in_s[(h * max_seq + pos) * groups_per_head + g]).cast::<f32>();
+
+            let pack_idx = (h * max_seq + pos) * (head_dim / vals_per_pack) + d / vals_per_pack;
+            let lane = d & (vals_per_pack - 1u32);
+            let packed = load(in_w[pack_idx]);
+            let code = (packed >> (lane * 8u32)) & 255u32;
+
+            // Decode fp8 bit pattern. Sign bit + 7 magnitude bits (e_raw
+            // + m_raw, where e_raw occupies the high `7 - mant_i` bits).
+            let sign = 1.0f32 - 2.0f32 * (code >> 7u32).cast::<f32>();
+            let code7 = code & 127u32;
+            let e_raw = code7 >> $mant_i;
+            let m_mask = (1u32 << $mant_i) - 1u32;
+            let m_raw = code7 & m_mask;
+            let is_normal = select(e_raw > 0u32, 1u32, 0u32);
+            // Bias: 7-bit code with `mant_i` mantissa bits → bias = (1 << (7 - mant_i)) - 1.
+            // E4M3 → 7; E5M2 → 15.
+            let exp_bits = 7u32 - $mant_i;
+            let bias = (1u32 << exp_bits) - 1u32;
+            let e_f = e_raw.cast::<f32>() - bias.cast::<f32>();
+            // Normal: 2^(e_raw - bias) * (1 + m_raw / 2^mant).
+            let norm_mag = exp2(e_f) * (1.0f32 + m_raw.cast::<f32>() * exp2(-($mant_f)));
+            // Subnormal: 2^emin * m_raw / 2^mant.
+            let sub_mag = exp2($emin) * m_raw.cast::<f32>() * exp2(-($mant_f));
+            let mag = select(is_normal == 1u32, norm_mag, sub_mag);
+            let w_real = scale * sign * mag;
+
+            let dst_idx = h * max_seq * head_dim + pos * head_dim + d;
+            store(out[dst_idx], w_real.cast::<T>());
+        }
+
+        inventory::submit! {
+            BenchSpec {
+                op: "kv_cache",
+                subop: $subop,
+                kernel_name: stringify!($name),
+                kernel_ir: $name::kernel_ir_for,
+                dtypes: &[DType::F32, DType::F16, DType::BF16],
+                tol: 0.0,
+                mlx_src: None,
+                mlx_pattern: None,
+                shapes: &[],
+                dispatch: BenchDispatch::Generic,
+                kernel_mode: Some(KernelMode::Grid3D),
+            }
+        }
+    };
+}
+
+// E4M3: 3 mantissa bits, exponent range [-6, 8] (bias 7), max 448.
+quantize_kv_fp8!(
+    quantize_kv_fp8_e4m3,
+    "quantize_fp8_e4m3",
+    3.0f32,
+    3u32,
+    -6.0f32,
+    8.0f32,
+    448.0f32
+);
+// E5M2: 2 mantissa bits, exponent range [-14, 15] (bias 15), max 57344.
+quantize_kv_fp8!(
+    quantize_kv_fp8_e5m2,
+    "quantize_fp8_e5m2",
+    2.0f32,
+    2u32,
+    -14.0f32,
+    15.0f32,
+    57344.0f32
+);
+bulk_dequant_kv_fp8!(
+    bulk_dequant_kv_fp8_e4m3,
+    "bulk_dequant_fp8_e4m3",
+    3.0f32,
+    3u32,
+    -6.0f32,
+    448.0f32
+);
+bulk_dequant_kv_fp8!(
+    bulk_dequant_kv_fp8_e5m2,
+    "bulk_dequant_fp8_e5m2",
+    2.0f32,
+    2u32,
+    -14.0f32,
+    57344.0f32
+);

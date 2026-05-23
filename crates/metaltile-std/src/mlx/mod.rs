@@ -19,6 +19,7 @@ pub mod binary_two;
 pub mod copy;
 pub mod fft;
 pub mod fp_quantized;
+pub mod fp_quantized_mma;
 #[cfg(feature = "nax")]
 pub mod fp_quantized_nax;
 pub mod fused_gate_activation;

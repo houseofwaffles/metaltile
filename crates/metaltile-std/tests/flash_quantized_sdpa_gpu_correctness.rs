@@ -20,8 +20,12 @@ use metaltile_core::{
 };
 use metaltile_runtime::Context;
 use metaltile_std::ffai::flash_quantized_sdpa::{
+    flash_quantized_sdpa_b4_d96,
     flash_quantized_sdpa_b4_d128,
+    flash_quantized_sdpa_b4_d512,
+    flash_quantized_sdpa_b8_d96,
     flash_quantized_sdpa_b8_d128,
+    flash_quantized_sdpa_b8_d512,
 };
 
 /// Affine per-group quantize of a `[rows, dim]` tensor. Returns packed
@@ -179,17 +183,21 @@ fn source(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         .collect()
 }
 
-fn check(
+fn check_dim(
     kernel_ir: fn(DType) -> Kernel,
     bits: u32,
     dt: Dt,
     has_sinks: bool,
     window: usize,
+    dim: usize,
     tol: f32,
 ) {
     let _g = gpu_lock();
-    let (q_heads, kv_heads, tokens, dim, group_size) = (2usize, 1usize, 8usize, 128usize, 64usize);
-    let attn_scale = 0.125_f32;
+    let (q_heads, kv_heads, tokens) = (2usize, 1usize, 8usize);
+    // group_size must divide dim; use 32 for d=96 (96 % 32 == 0) and
+    // d=512 (512 % 32 == 0), 64 for the original d=128 / d=256.
+    let group_size = if dim.is_multiple_of(64) { 64usize } else { 32usize };
+    let attn_scale = 1.0_f32 / (dim as f32).sqrt();
     let q: Vec<f32> = source(q_heads * dim, 0x51, 2.0).iter().map(|&v| dt.round(v)).collect();
     let k_raw = source(kv_heads * tokens * dim, 0x62, 3.0);
     let v_raw = source(kv_heads * tokens * dim, 0x73, 3.0);
@@ -243,6 +251,18 @@ fn check(
     );
 }
 
+/// Convenience wrapper: run `check_dim` with the original d=128.
+fn check(
+    kernel_ir: fn(DType) -> Kernel,
+    bits: u32,
+    dt: Dt,
+    has_sinks: bool,
+    window: usize,
+    tol: f32,
+) {
+    check_dim(kernel_ir, bits, dt, has_sinks, window, 128, tol);
+}
+
 #[test]
 fn flash_quantized_sdpa_b4_plain_f32() {
     check(flash_quantized_sdpa_b4_d128::kernel_ir_for, 4, Dt::F32, false, 0, 1e-4);
@@ -271,4 +291,61 @@ fn flash_quantized_sdpa_b4_plain_bf16() {
 #[test]
 fn flash_quantized_sdpa_b8_sinks_bf16() {
     check(flash_quantized_sdpa_b8_d128::kernel_ir_for, 8, Dt::Bf16, true, 0, 5e-2);
+}
+
+// ── d=96 (GPT-NeoX) ────────────────────────────────────────────────────────
+
+#[test]
+fn flash_quantized_sdpa_b4_d96_plain_f32() {
+    check_dim(flash_quantized_sdpa_b4_d96::kernel_ir_for, 4, Dt::F32, false, 0, 96, 1e-4);
+}
+
+#[test]
+fn flash_quantized_sdpa_b4_d96_sinks_f32() {
+    check_dim(flash_quantized_sdpa_b4_d96::kernel_ir_for, 4, Dt::F32, true, 0, 96, 1e-4);
+}
+
+#[test]
+fn flash_quantized_sdpa_b8_d96_plain_f32() {
+    check_dim(flash_quantized_sdpa_b8_d96::kernel_ir_for, 8, Dt::F32, false, 0, 96, 1e-4);
+}
+
+#[test]
+fn flash_quantized_sdpa_b4_d96_plain_f16() {
+    check_dim(flash_quantized_sdpa_b4_d96::kernel_ir_for, 4, Dt::F16, false, 0, 96, 5e-3);
+}
+
+#[test]
+fn flash_quantized_sdpa_b8_d96_plain_bf16() {
+    check_dim(flash_quantized_sdpa_b8_d96::kernel_ir_for, 8, Dt::Bf16, false, 0, 96, 5e-2);
+}
+
+// ── d=512 (Gemma 4 global attention) ─────────────────────────────────────────
+// Dispatch uses 256 threads/TG (see kernel comments). The grid shape is the
+// same as d=64/d=128 — [1, q_heads, 1] — but tg=[32,1,1]. The `run` helper
+// handles this correctly since it uses `[32, 1, 1]` threads_per_group.
+
+#[test]
+fn flash_quantized_sdpa_b4_d512_plain_f32() {
+    check_dim(flash_quantized_sdpa_b4_d512::kernel_ir_for, 4, Dt::F32, false, 0, 512, 1e-4);
+}
+
+#[test]
+fn flash_quantized_sdpa_b4_d512_sinks_f32() {
+    check_dim(flash_quantized_sdpa_b4_d512::kernel_ir_for, 4, Dt::F32, true, 0, 512, 1e-4);
+}
+
+#[test]
+fn flash_quantized_sdpa_b8_d512_plain_f32() {
+    check_dim(flash_quantized_sdpa_b8_d512::kernel_ir_for, 8, Dt::F32, false, 0, 512, 1e-4);
+}
+
+#[test]
+fn flash_quantized_sdpa_b4_d512_plain_f16() {
+    check_dim(flash_quantized_sdpa_b4_d512::kernel_ir_for, 4, Dt::F16, false, 0, 512, 5e-3);
+}
+
+#[test]
+fn flash_quantized_sdpa_b8_d512_plain_bf16() {
+    check_dim(flash_quantized_sdpa_b8_d512::kernel_ir_for, 8, Dt::Bf16, false, 0, 512, 5e-2);
 }

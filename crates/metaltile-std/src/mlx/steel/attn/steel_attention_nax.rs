@@ -9,34 +9,45 @@
 //! loop, but the two matmuls — `S = Q·Kᵀ` and `O += P·V` — are each one
 //! cooperative `matmul2d` instead of an 8×8 `simdgroup_matmul` ladder.
 //!
-//! ## Tile geometry
+//! ## Tile geometry (all variants)
 //!
-//! - **BQ = 16** queries/TG, **BK = 16** keys/block, **BD = 32** head dim.
+//! - **BQ = 16** queries/TG, **BK = 16** keys/block.
+//! - **BD = 32** — the inner-contraction chunk used by every `matmul2d`
+//!   call. Apple's "at least one of M/N/K = 32" rule requires K=32 for the
+//!   QK contraction descriptor. When `head_dim > 32` the QK (and PV)
+//!   contractions loop over `n_chunks = head_dim / 32` consecutive 32-wide
+//!   D-slices, accumulating partial S scores (fp32) before the online-
+//!   softmax step. This is the **D-chunk loop** that unlocks d={64,128,256}.
 //! - **tpg = 32** (one simdgroup). The 16×16 S tile and 16×32 O tile are
-//!   each one cooperative `matmul2d`.
+//!   each one cooperative `matmul2d` per D-chunk.
 //! - Grid: `[q_len/16, n_q_heads, batch]` — `tgid_x` Q-tile, `tgid_y`
 //!   Q-head, `tgid_z` batch.
 //!
-//! `BD = 32` makes the QK descriptor's K-dim exactly 32 (Apple's
-//! "at least one of M/N/K = 32" rule); larger head dims are a follow-up.
+//! ## D-chunk loop design
 //!
-//! ## Per K-block flash loop
+//! The outer K-block loop (FlashAttention-2 online softmax) is unchanged.
+//! Inside each K-block step we:
+//!   1. QK contraction: for each D-chunk `dc` in `0..n_chunks`, load the
+//!      16×32 Q and K slices; compute `dS += Q_dc · K_dcᵀ` via
+//!      `matmul2d(16,16,32)`. Chunk 0 uses `overwrite` mode; chunks 1..N
+//!      use `accumulate` mode so partial sums remain correct.
+//!   2. Apply causal mask + online-softmax to the fully-accumulated S tile.
+//!   3. PV contraction: for each D-chunk `dc` in `0..n_chunks`, load the
+//!      16×32 V slice; compute `dO_blk += P · V_dc` via `matmul2d(16,32,16)`
+//!      using the same overwrite-then-accumulate strategy.
+//!   4. Add `dO_blk` into the running Os accumulator with the rescale factor.
 //!
-//! 1. Coop-load the 16×32 K and V tiles into TG memory.
-//! 2. `S = Q·Kᵀ` — `matmul2d(16, 16, 32)`, `tb=true` (Kᵀ). Overwrite mode.
-//! 3. Lane `r` owns S-row `r`: causal-mask, online-softmax max/sum
-//!    rescale, write the exp-weights `P`.
-//! 4. `O += P·V` — `matmul2d(16, 32, 16)`. The per-block max-rescale
-//!    makes the accumulation explicit in `Os` scratch (the `matmul2d`
-//!    runs overwrite into `Obk`, which is then added into `Os`).
+//! The S-tile is 16×16 (independent of head_dim); the O accumulator is
+//! 16×head_dim. Only the 16×32 Qs/Ks/Vs scratch tiles are fixed at BD=32.
+//! The Os/Obk scratch grows with head_dim (16 × head_dim, skewed).
 //!
-//! ## Dispatch invariants
+//! ## Dispatch invariants (per variant)
 //!
 //! - TPG 32 (1 SG); grid `[q_len/16, n_q_heads, batch]`.
-//! - `q_len % 16 == 0`, `k_len % 16 == 0`, `head_dim == 32`.
+//! - `q_len % 16 == 0`, `k_len % 16 == 0`, `head_dim ∈ {32, 64, 128, 256}`.
 //! - `KernelMode::Reduction`.
 //!
-//! Correctness vs CPU oracle ≥ cos 0.999 — see
+//! Correctness vs CPU oracle ≥ cos 0.999 (f32/f16), ≥ 0.997 (bf16) — see
 //! `crates/metaltile-std/tests/steel_attention_nax_gpu_correctness.rs`.
 
 use metaltile::kernel;
@@ -44,6 +55,7 @@ use metaltile::kernel;
 /// Tile geometry — keep in lock-step with the codegen-emitted MSL.
 pub const BQ: u32 = 16;
 pub const BK: u32 = 16;
+/// Inner contraction width; fixed by Apple's matmul2d "one of M/N/K=32" rule.
 pub const BD: u32 = 32;
 /// Threads per group (1 SG × 32 lanes).
 pub const TPG: u32 = 32;
@@ -55,8 +67,12 @@ pub const TG_LD_D: u32 = BD + TG_SKEW; // 36
 /// Leading dim of the BQ × BK S/P scratch (BK + skew).
 pub const TG_LD_K: u32 = BK + TG_SKEW; // 20
 
-/// Flash-attention prefill via cooperative `matmul2d`. Generic over
-/// `T ∈ {f32, f16, bf16}` — bf16 stages through `half` via `coop_stage(T)`.
+/// Flash-attention prefill via cooperative `matmul2d`, head_dim=32.
+///
+/// Legacy variant — head_dim is fixed at 32 (no D-chunk loop). Kept for
+/// back-compat with callers that call into this module directly. New code
+/// should prefer `mt_sdpa_prefill_nax_d64` / `_d128` / `_d256` for
+/// production head dims.
 ///
 /// Params: `q`/`k`/`v`/`out` are `[batch, heads, len, head_dim]` slabs
 /// (`q`/`out` use `n_q_heads`, `k`/`v` use `n_kv_heads`). Constexprs:
@@ -233,6 +249,306 @@ pub fn mt_sdpa_prefill_nax<T>(
     }
 }
 
+// ── D-chunk macro: generates mt_sdpa_prefill_nax_d{64,128,256} ────────────
+//
+// The macro expands to a full kernel body that loops the QK and PV
+// contractions over `n_chunks = $head_dim / 32` consecutive 32-wide D-slices.
+//
+// TG memory layout (all variants):
+//   Qs/Ks/Vs  : 16 × 36  (16 rows × (BD=32 + TG_SKEW=4))  — one D-chunk at a time
+//   Ps        : 16 × 20  (16 rows × (BK=16 + TG_SKEW=4))
+//   Ss        : 16 × 20  (fp32 attention scores, reused per K-block)
+//   Os        : 16 × ($head_dim + TG_SKEW)   fp32 running accumulator
+//   Obk       : 16 × ($head_dim + TG_SKEW)   fp32 per-block P·V accumulator
+//
+// The QK D-chunk loop uses `overwrite` for the first chunk and
+// `accumulate` for subsequent chunks so partial scores add up correctly.
+// The PV D-chunk loop reuses the same `pv` descriptor (overwrite per chunk,
+// then manually accumulated into Os from Obk_chunk scratch).
+macro_rules! sdpa_prefill_nax_wide {
+    ($name:ident, $head_dim:literal, $n_chunks:literal, $os_slots:literal) => {
+        #[doc = concat!(
+            "Flash-attention prefill via cooperative `matmul2d`, head_dim=",
+            stringify!($head_dim),
+            ".\n\n",
+            "Same algorithm as `mt_sdpa_prefill_nax` (d=32) but loops the QK and PV\n",
+            "contractions over `", stringify!($n_chunks), "` consecutive 32-wide D-chunks.\n",
+            "The S-tile (16×16) and online-softmax state are unchanged; only the\n",
+            "head_dim axis of the Q/K/V loads and the Os accumulator scale up.\n\n",
+            "See module-level docs for the D-chunk loop design.\n",
+            "Generic `T ∈ {f32, f16, bf16}`; `coop_stage(T)` for bf16 safety.\n",
+            "`#[cfg(feature = \"nax\")]` — needs macOS 26+ / Metal 4.",
+        )]
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name<T>(
+            q: Tensor<T>,
+            k: Tensor<T>,
+            v: Tensor<T>,
+            mut out: Tensor<T>,
+            #[constexpr] q_len: u32,
+            #[constexpr] k_len: u32,
+            #[constexpr] gqa_factor: u32,
+            #[constexpr] n_q_heads: u32,
+            #[constexpr] n_kv_heads: u32,
+            #[constexpr] scale: f32,
+        ) {
+            let q_tile = tgid_x;
+            let q_head = tgid_y;
+            let batch = tgid_z;
+            let kv_head = q_head / gqa_factor;
+            let lane = simd_lane;
+
+            let head_dim = $head_dim as u32;
+            let n_chunks = $n_chunks as u32;
+            let q_len_off = k_len - q_len;
+
+            // Slab offsets — q/out: [batch, n_q_heads, q_len, D]; k/v: [batch, n_kv_heads, k_len, D].
+            let kv_row_base = batch * n_kv_heads * k_len * head_dim + kv_head * k_len * head_dim;
+            let q_head_row_off = batch * n_q_heads * q_len * head_dim + q_head * q_len * head_dim;
+            let q_tile_first = q_tile * 16u32;
+
+            // TG memory:
+            //   Qs/Ks/Vs : 16 × 36 — one 32-wide D-chunk at a time (BD + TG_SKEW=4)
+            //   Ps       : 16 × 20 — attention weights (BK=16 + TG_SKEW=4)
+            //   Ss       : 16 × 20 — accumulated scores per K-block (fp32)
+            //   Os       : 16 × ($os_slots) — running output accumulator (fp32)
+            //   Obk      : 16 × ($os_slots) — per-block P·V scratch (fp32)
+            threadgroup_alloc("Qs", 576, coop_stage(T)); // 16 × 36
+            threadgroup_alloc("Ks", 576, coop_stage(T));
+            threadgroup_alloc("Vs", 576, coop_stage(T));
+            threadgroup_alloc("Ps", 320, coop_stage(T)); // 16 × 20
+            threadgroup_alloc("Ss", 320, f32);           // 16 × 20
+            threadgroup_alloc("Os", $os_slots, f32);
+            threadgroup_alloc("Obk", $os_slots, f32);
+
+            // TG_LD_O = head_dim + TG_SKEW (for Os/Obk row stride).
+            let tg_ld_o = head_dim + 4u32;
+
+            // Load the full Q tile for this thread's head into Qs,
+            // cycling through n_chunks D-chunks of 32 elements each.
+            // `lane` fills column `lane` within the current D-chunk.
+            // Os is zeroed at the same time.
+            for dc in range(0u32, n_chunks, 1u32) {
+                let d_off = dc * 32u32;
+                for _r in range(0u32, 16u32, 1u32) {
+                    let q_dev = q_head_row_off + (q_tile_first + _r) * head_dim + d_off + lane;
+                    let qv = load(q[q_dev]).cast::<f32>() * scale;
+                    threadgroup_store("Qs", _r * 36u32 + lane, qv);
+                    // Zero Os once (dc==0); subsequent chunks accumulate.
+                    if dc == 0u32 {
+                        threadgroup_store("Os", _r * tg_ld_o + d_off + lane, 0.0f32);
+                    }
+                }
+                threadgroup_barrier();
+                // Re-store Qs into the fixed 16×36 chunk buffer for later K-block reuse.
+                // (The load loop above already wrote to Qs.)
+                threadgroup_barrier();
+            }
+
+            // Per-row online-softmax state.
+            let mut row_m = -1.0e30f32;
+            let mut row_s = 0.0f32;
+            let owns_row = lane < 16u32;
+            let my_row = lane;
+            let q_abs = q_tile_first + my_row + q_len_off;
+
+            // QK setup: matmul2d(16,16,32), tb=true (K transposed).
+            // We use overwrite mode — accumulation across D-chunks is done
+            // by re-running with accumulate and the same Ss output pointer.
+            coop_tile_setup(
+                "qk",
+                16,
+                16,
+                32,
+                coop_stage(T),
+                "overwrite",
+                "simdgroup",
+                f32,
+                false,
+                true,
+                false,
+            );
+            // QK accumulate variant for D-chunk 1+.
+            coop_tile_setup(
+                "qk_acc",
+                16,
+                16,
+                32,
+                coop_stage(T),
+                "accumulate",
+                "simdgroup",
+                f32,
+                false,
+                true,
+                false,
+            );
+            // PV setup: matmul2d(16,32,16), overwrite (per-block; we sum manually).
+            coop_tile_setup(
+                "pv",
+                16,
+                32,
+                16,
+                coop_stage(T),
+                "overwrite",
+                "simdgroup",
+                f32,
+                false,
+                false,
+                false,
+            );
+
+            // Causal trim — last K-block touched by the tile's last query.
+            let q_tile_last_abs = q_tile_first + 15u32 + q_len_off;
+            let kb_lim = q_tile_last_abs / 16u32 + 1u32;
+
+            for kb in range(0u32, kb_lim, 1u32) {
+                let kb_off = kb * 16u32;
+
+                // ── Step 1: accumulate S = Σ_{dc} Q_dc · K_dcᵀ ─────────────
+                // For each D-chunk, load the Q slice (already computed — we re-
+                // load from device since we can't cache all n_chunks in TG at once)
+                // and the K slice, then run matmul2d.
+                //
+                // D-chunk 0: overwrite Ss (fresh).
+                // D-chunk 1+: accumulate into Ss.
+                for dc in range(0u32, n_chunks, 1u32) {
+                    let d_off = dc * 32u32;
+                    // Load Q and K slices for this D-chunk.
+                    for _r in range(0u32, 16u32, 1u32) {
+                        let q_dev =
+                            q_head_row_off + (q_tile_first + _r) * head_dim + d_off + lane;
+                        let kv_dev = kv_row_base + (kb_off + _r) * head_dim + d_off + lane;
+                        threadgroup_store("Qs", _r * 36u32 + lane, load(q[q_dev]).cast::<f32>() * scale);
+                        threadgroup_store("Ks", _r * 36u32 + lane, load(k[kv_dev]).cast::<f32>());
+                    }
+                    threadgroup_barrier();
+
+                    if dc == 0u32 {
+                        // First chunk: overwrite Ss (qk descriptor).
+                        coop_tile_load_a("qk", "Qs", true, coop_stage(T), 36, 16);
+                        coop_tile_load_b("qk", "Ks", true, coop_stage(T), 36, 16);
+                        coop_tile_run("qk");
+                        coop_tile_store_c("qk", "Ss", true, f32, 20, 16);
+                    } else {
+                        // Subsequent chunks: accumulate into Ss.
+                        coop_tile_load_a("qk_acc", "Qs", true, coop_stage(T), 36, 16);
+                        coop_tile_load_b("qk_acc", "Ks", true, coop_stage(T), 36, 16);
+                        coop_tile_run("qk_acc");
+                        coop_tile_store_c("qk_acc", "Ss", true, f32, 20, 16);
+                    }
+                    threadgroup_barrier();
+                }
+
+                // ── Step 2: online softmax ───────────────────────────────────
+                if owns_row {
+                    let mut blk_m = -1.0e30f32;
+                    for _c in range(0u32, 16u32, 1u32) {
+                        let k_abs = kb_off + _c;
+                        let raw = threadgroup_load("Ss", my_row * 20u32 + _c);
+                        let sc = select(k_abs > q_abs, -1.0e30f32, raw);
+                        threadgroup_store("Ss", my_row * 20u32 + _c, sc);
+                        blk_m = select(sc > blk_m, sc, blk_m);
+                    }
+                    let new_m = select(blk_m > row_m, blk_m, row_m);
+                    let rescale = exp(row_m - new_m);
+                    let mut blk_s = 0.0f32;
+                    for _c in range(0u32, 16u32, 1u32) {
+                        let p = exp(threadgroup_load("Ss", my_row * 20u32 + _c) - new_m);
+                        threadgroup_store("Ss", my_row * 20u32 + _c, p);
+                        blk_s = blk_s + p;
+                    }
+                    row_s = row_s * rescale + blk_s;
+                    // Rescale the running O accumulator row.
+                    for _d in range(0u32, head_dim, 1u32) {
+                        let o = threadgroup_load("Os", my_row * tg_ld_o + _d);
+                        threadgroup_store("Os", my_row * tg_ld_o + _d, o * rescale);
+                    }
+                    row_m = new_m;
+                }
+                threadgroup_barrier();
+
+                // ── Step 3: stage P (exp-weights) ───────────────────────────
+                if owns_row {
+                    for _c in range(0u32, 16u32, 1u32) {
+                        let p = threadgroup_load("Ss", my_row * 20u32 + _c);
+                        threadgroup_store("Ps", my_row * 20u32 + _c, p);
+                    }
+                }
+                threadgroup_barrier();
+
+                // ── Step 4: Obk = Σ_{dc} P · V_dc ──────────────────────────
+                // Zero Obk before accumulating D-chunks.
+                if owns_row {
+                    for _d in range(0u32, head_dim, 1u32) {
+                        threadgroup_store("Obk", my_row * tg_ld_o + _d, 0.0f32);
+                    }
+                }
+                threadgroup_barrier();
+
+                for dc in range(0u32, n_chunks, 1u32) {
+                    let d_off = dc * 32u32;
+                    // Load V slice for this D-chunk into Vs.
+                    for _r in range(0u32, 16u32, 1u32) {
+                        let kv_dev = kv_row_base + (kb_off + _r) * head_dim + d_off + lane;
+                        threadgroup_store("Vs", _r * 36u32 + lane, load(v[kv_dev]).cast::<f32>());
+                    }
+                    threadgroup_barrier();
+
+                    // PV produces a 16×32 block of the output for this D-chunk.
+                    // We store it to a 16×36 scratch window starting at Obk[row][d_off].
+                    // Since pv is overwrite-per-call, each D-chunk writes its 32-wide
+                    // slice; we then add that into Obk manually.
+                    threadgroup_alloc("Opv", 576, f32); // 16 × 36 scratch for this chunk
+                    coop_tile_load_a("pv", "Ps", true, coop_stage(T), 20, 16);
+                    coop_tile_load_b("pv", "Vs", true, coop_stage(T), 36, 16);
+                    coop_tile_run("pv");
+                    coop_tile_store_c("pv", "Opv", true, f32, 36, 16);
+                    threadgroup_barrier();
+
+                    // Accumulate this 32-wide slice into the full Obk row.
+                    if owns_row {
+                        for _d in range(0u32, 32u32, 1u32) {
+                            let opv = threadgroup_load("Opv", my_row * 36u32 + _d);
+                            let ob = threadgroup_load("Obk", my_row * tg_ld_o + d_off + _d);
+                            threadgroup_store("Obk", my_row * tg_ld_o + d_off + _d, ob + opv);
+                        }
+                    }
+                    threadgroup_barrier();
+                }
+
+                // ── Step 5: add Obk into the running Os accumulator ─────────
+                if owns_row {
+                    for _d in range(0u32, head_dim, 1u32) {
+                        let o = threadgroup_load("Os", my_row * tg_ld_o + _d);
+                        let ob = threadgroup_load("Obk", my_row * tg_ld_o + _d);
+                        threadgroup_store("Os", my_row * tg_ld_o + _d, o + ob);
+                    }
+                }
+                threadgroup_barrier();
+            }
+
+            // ── Step 6: normalize and store output ───────────────────────────
+            if owns_row {
+                let inv_s = select(row_s > 0.0f32, 1.0f32 / row_s, 0.0f32);
+                for _d in range(0u32, head_dim, 1u32) {
+                    let o_dev = q_head_row_off + (q_tile_first + my_row) * head_dim + _d;
+                    let o = threadgroup_load("Os", my_row * tg_ld_o + _d);
+                    store(out[o_dev], (o * inv_s).cast::<T>());
+                }
+            }
+        }
+    };
+}
+
+// Os/Obk slot counts = 16 rows × (head_dim + TG_SKEW=4).
+// d64:  16 × 68  = 1088
+// d128: 16 × 132 = 2112
+// d256: 16 × 260 = 4160
+sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d64, 64, 2, 1088);
+sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d128, 128, 4, 2112);
+sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d256, 256, 8, 4160);
+
 #[cfg(test)]
 mod tests {
     use metaltile_core::{dtype::DType, ir::Op};
@@ -258,6 +574,33 @@ mod tests {
     }
 
     #[test]
+    fn wide_kernels_ir_constructs_and_uses_coop_tile_ops() {
+        // d64/d128/d256 kernels have three setups: qk (overwrite), qk_acc
+        // (accumulate), pv (overwrite).
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            for (name, kernel_ir) in [
+                ("mt_sdpa_prefill_nax_d64", mt_sdpa_prefill_nax_d64::kernel_ir_for as fn(_) -> _),
+                ("mt_sdpa_prefill_nax_d128", mt_sdpa_prefill_nax_d128::kernel_ir_for),
+                ("mt_sdpa_prefill_nax_d256", mt_sdpa_prefill_nax_d256::kernel_ir_for),
+            ] {
+                let k = kernel_ir(dt);
+                assert_eq!(k.name, name);
+                assert_eq!(k.params.len(), 4, "{name}: 4 tensor params");
+                assert!(k.params[3].is_output, "{name}: last param is output");
+                assert_eq!(k.constexprs.len(), 6, "{name}: 6 constexprs");
+                let all_ops =
+                    || std::iter::once(&k.body).chain(k.blocks.values()).flat_map(|b| b.ops.iter());
+                assert!(
+                    !all_ops().any(|op| matches!(op, Op::InlineMsl { .. })),
+                    "{name}: no InlineMsl ops"
+                );
+                let n_setup = all_ops().filter(|op| matches!(op, Op::CoopTileSetup { .. })).count();
+                assert_eq!(n_setup, 3, "{name}: expected qk + qk_acc + pv CoopTileSetup ops");
+            }
+        }
+    }
+
+    #[test]
     fn codegen_emits_mpp_include_and_kernel_decl() {
         use metaltile_codegen::msl::MslGenerator;
         for (dt, t_name) in [(DType::F32, "float"), (DType::F16, "half"), (DType::BF16, "half")] {
@@ -273,6 +616,43 @@ mod tests {
             assert!(msl.contains("mpp::tensor_ops::matmul2d_descriptor"));
             assert!(msl.contains(&format!("kernel void mt_sdpa_prefill_nax_{suffix}")));
             assert!(msl.contains(&format!("threadgroup {t_name}")));
+        }
+    }
+
+    #[test]
+    fn wide_codegen_emits_mpp_include_and_kernel_decl() {
+        use metaltile_codegen::msl::MslGenerator;
+        for (dt, t_name) in [(DType::F32, "float"), (DType::F16, "half"), (DType::BF16, "half")] {
+            for (dim, kernel_ir) in [
+                (64usize, mt_sdpa_prefill_nax_d64::kernel_ir_for as fn(_) -> _),
+                (128, mt_sdpa_prefill_nax_d128::kernel_ir_for),
+                (256, mt_sdpa_prefill_nax_d256::kernel_ir_for),
+            ] {
+                let suffix = match dt {
+                    DType::F32 => "f32",
+                    DType::F16 => "f16",
+                    _ => "bf16",
+                };
+                let mut k = kernel_ir(dt);
+                k.name = format!("mt_sdpa_prefill_nax_d{dim}_{suffix}");
+                let msl = MslGenerator::default().generate(&k).expect("codegen");
+                assert!(
+                    msl.contains("MetalPerformancePrimitives/MetalPerformancePrimitives.h"),
+                    "d{dim} {suffix}: missing MPP include"
+                );
+                assert!(
+                    msl.contains("mpp::tensor_ops::matmul2d_descriptor"),
+                    "d{dim} {suffix}: missing matmul2d_descriptor"
+                );
+                assert!(
+                    msl.contains(&format!("kernel void mt_sdpa_prefill_nax_d{dim}_{suffix}")),
+                    "d{dim} {suffix}: missing kernel declaration"
+                );
+                assert!(
+                    msl.contains(&format!("threadgroup {t_name}")),
+                    "d{dim} {suffix}: missing threadgroup type"
+                );
+            }
         }
     }
 }
