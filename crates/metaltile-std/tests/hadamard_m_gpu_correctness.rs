@@ -124,6 +124,22 @@ fn hadamard_m12_matches_oracle_f16() {
 }
 
 #[test]
+fn hadamard_m12_matches_oracle_bf16() {
+    let _g = gpu_lock();
+    let m = 12usize;
+    let n_rows = 8;
+    let scale = 1.0f32;
+    // Round through bf16 so oracle uses same load precision.
+    let data: Vec<f32> =
+        (0..n_rows * m).map(|i| Dt::Bf16.round(((i % 17) as f32 - 8.0) * 0.25)).collect();
+    let expected = oracle_hadamard_m(&data, m, &H12_SIGNS, scale);
+    let actual = run_hadamard_m(&data, Dt::Bf16, m as u32, scale);
+    let diff = max_abs_diff(&actual, &expected);
+    // bf16 7-bit mantissa: looser tolerance than f16.
+    assert!(diff < 1e-1, "hadamard_m12 bf16: max |diff| = {diff:.2e} > 1e-1");
+}
+
+#[test]
 fn hadamard_m12_identity_vector_f32() {
     let _g = gpu_lock();
     // H_M applied twice with scale = 1/M gives the identity:

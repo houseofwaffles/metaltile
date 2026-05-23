@@ -21,7 +21,7 @@ mod common;
 use common::gpu_lock;
 use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_runtime::Context;
-use metaltile_std::mlx::steel::gemm::steel_gemm_gather_nax;
+use metaltile_std::mlx::steel::gemm::steel_gemm_gather_nax::mt_steel_gemm_gather_nax;
 
 /// Gather-GEMM oracle. `a` is `[n_a_rows, k]`, `b` is the stacked
 /// `[n_b_mats, k, n]`. `out[mr, nc] = Σ_k a[lhs[mr], k] · b[rhs[nc/32], k, nc]`.
@@ -74,7 +74,7 @@ fn run_gather_nax(
     buffers.insert("k".into(), (k as u32).to_le_bytes().to_vec());
     buffers.insert("n".into(), (n as u32).to_le_bytes().to_vec());
 
-    let mut kernel = steel_gemm_gather_nax::kernel_ir_for(dtype);
+    let mut kernel = mt_steel_gemm_gather_nax::kernel_ir_for(dtype);
     kernel.mode = KernelMode::Reduction;
 
     let result = ctx
@@ -86,6 +86,9 @@ fn run_gather_nax(
 fn f32_bytes(vals: &[f32]) -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() }
 fn f16_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect()
+}
+fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
+    vals.iter().flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes()).collect()
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -113,51 +116,72 @@ fn build_inputs(n_a_rows: usize, n_b_mats: usize, n: usize, k: usize) -> (Vec<f3
     (a, b)
 }
 
-fn run_case(dtype: DType, label: &str) {
+fn run_case(dtype: DType, label: &str, cos_min: f32) {
     let (m, n, k) = (64usize, 64usize, 128usize);
     let (n_a_rows, n_b_mats) = (96usize, 3usize);
     let (lhs, rhs) = build_indices(m, n, n_a_rows, n_b_mats);
     let (a_f32, b_f32) = build_inputs(n_a_rows, n_b_mats, n, k);
 
     // Round inputs to the kernel dtype so the oracle and GPU agree.
-    let (a, b, abytes, bbytes, obpe): (Vec<f32>, Vec<f32>, Vec<u8>, Vec<u8>, usize) =
-        if dtype == DType::F16 {
+    let (a, b, abytes, bbytes, obpe): (Vec<f32>, Vec<f32>, Vec<u8>, Vec<u8>, usize) = match dtype {
+        DType::F16 => {
             let r = |v: f32| half::f16::from_f32(v).to_f32();
             let a: Vec<f32> = a_f32.iter().map(|&v| r(v)).collect();
             let b: Vec<f32> = b_f32.iter().map(|&v| r(v)).collect();
             let (ab, bb) = (f16_bytes(&a), f16_bytes(&b));
             (a, b, ab, bb, 2)
-        } else {
+        },
+        DType::BF16 => {
+            let r = |v: f32| half::bf16::from_f32(v).to_f32();
+            let a: Vec<f32> = a_f32.iter().map(|&v| r(v)).collect();
+            let b: Vec<f32> = b_f32.iter().map(|&v| r(v)).collect();
+            let (ab, bb) = (bf16_bytes(&a), bf16_bytes(&b));
+            (a, b, ab, bb, 2)
+        },
+        _ => {
             let (ab, bb) = (f32_bytes(&a_f32), f32_bytes(&b_f32));
             (a_f32, b_f32, ab, bb, 4)
-        };
+        },
+    };
 
     let expected = cpu_gather_gemm_reference(&a, &b, &lhs, &rhs, m, n, k);
 
     let _g = gpu_lock();
     let ctx = Context::new().expect("Context::new");
     let out_bytes = run_gather_nax(&ctx, dtype, &abytes, &bbytes, &lhs, &rhs, m, n, k, obpe);
-    let actual: Vec<f32> = if obpe == 2 {
-        out_bytes
+    let actual: Vec<f32> = match dtype {
+        DType::F16 => out_bytes
             .chunks_exact(2)
             .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect()
-    } else {
-        out_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            .collect(),
+        DType::BF16 => out_bytes
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect(),
+        _ => out_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
     };
     assert_eq!(actual.len(), expected.len());
 
     let cos = cosine(&expected, &actual);
     println!("[{label}] cos={cos:.6}");
-    assert!(cos >= 0.999, "cosine {cos:.6} < 0.999 ({label})");
+    assert!(cos >= cos_min, "cosine {cos:.6} < {cos_min} ({label})");
 }
 
 #[test]
 fn mt_steel_gemm_gather_nax_matches_cpu_reference_f32() {
-    run_case(DType::F32, "gather f32 multi-tile");
+    run_case(DType::F32, "gather f32 multi-tile", 0.999);
 }
 
 #[test]
 fn mt_steel_gemm_gather_nax_matches_cpu_reference_f16() {
-    run_case(DType::F16, "gather f16 multi-tile");
+    run_case(DType::F16, "gather f16 multi-tile", 0.999);
+}
+
+#[test]
+fn mt_steel_gemm_gather_nax_matches_cpu_reference_bf16() {
+    // bf16 staged through `half` via `coop_stage(T)`. 7-bit mantissa → 0.997 bar.
+    run_case(DType::BF16, "gather bf16 multi-tile", 0.997);
 }

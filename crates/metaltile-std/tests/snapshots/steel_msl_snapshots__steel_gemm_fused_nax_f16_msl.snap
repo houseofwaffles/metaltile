@@ -23,6 +23,7 @@ kernel void mt_steel_gemm_fused_nax(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 400
     uint tid    = _tid3.x;
     uint tgid_x = _tgid3.x;
     uint tgid_y = _tgid3.y;
@@ -32,40 +33,22 @@ kernel void mt_steel_gemm_fused_nax(
     threadgroup half Ws[1152];
     threadgroup float OutScratch[1024];
 
-    uint v0 = tgid_y;
-    uint v1 = tgid_x;
-    auto v2 = simd_group;
-    auto v3 = simd_lane;
-    uint v4 = 0u;
-    uint v5 = 1u;
-    uint v6 = 2u;
-    uint v7 = 3u;
-    uint v8 = 4u;
-    uint v9 = 8u;
-    uint v10 = 16u;
-    uint v11 = 32u;
-    uint v12 = 36u;
-    uint v13 = 256u;
-    auto v14 = k;
-    auto v15 = n;
-    auto v17 = ((v2 * v11) + v3);
-    auto v20 = ((v2 / v6) * v10);
-    auto v21 = ((v2 & v5) * v10);
-    auto v22 = v20 * v12;
-    auto v23 = v21 * v12;
-    auto v24 = v17 / v8;
-    auto v25 = (v17 & v7);
-    auto v26 = v25 * v9;
-    auto v27 = v0 * v11;
-    auto v28 = v1 * v11;
-    auto v29 = v28 + v24;
-    auto v30 = v24 * v12;
-    auto v31 = v30 + v26;
-    auto v33 = v28 + v21;
-    auto v34 = v2 * v13;
-    auto v35 = v3 / v6;
-    auto v36 = (v3 & v5);
-    auto v37 = v36 * v9;
+    auto v_lane = simd_lane;
+    uint v_sg = simd_group;
+    uint v2 = 32u;
+    auto v_lane_in_tg = ((v_sg * v2) + v_lane);
+    uint v5 = 2u;
+    uint v7 = 1u;
+    uint v9 = 16u;
+    auto v_sg_m_base = ((v_sg / v5) * v9);
+    uint v11 = 16u;
+    auto v_sg_n_base = ((v_sg & v7) * v11);
+    auto v13 = tgid_y;
+    uint v14 = 32u;
+    auto v_x_m_base = v13 * v14;
+    auto v16 = tgid_x;
+    uint v17 = 32u;
+    auto v_w_n_base = v16 * v17;
     // --- CoopTileSetup: gemm (16×16×32) ---
     constexpr auto gemm_desc = mpp::tensor_ops::matmul2d_descriptor(
         /*M=*/16, /*N=*/16, /*K=*/32,
@@ -76,110 +59,86 @@ kernel void mt_steel_gemm_fused_nax(
     auto gemm_ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
     auto gemm_ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(gemm_ct_a), decltype(gemm_ct_b), float>();
     for (uint16_t _i = 0; _i < gemm_ct_c.get_capacity(); ++_i) gemm_ct_c[_i] = {};
-    auto v38 = v27 + v24;
-    auto v39 = v38 * v14;
+    uint v19 = 4u;
+    auto v_x_m_row = v_lane_in_tg / v19;
+    uint v21 = 3u;
+    auto v_x_k_quad = (v_lane_in_tg & v21);
+    uint v23 = 8u;
+    auto v_x_k_base = v_x_k_quad * v23;
+    uint v25 = 36u;
+    auto v26 = v_x_m_row * v25;
+    auto v_x_ws_base = v26 + v_x_k_base;
+    uint v28 = 36u;
+    auto v_xs_sg_off = v_sg_m_base * v28;
+    uint v30 = 36u;
+    auto v_ws_sg_off = v_sg_n_base * v30;
+    uint v32 = 256u;
+    auto v_sg_scratch_off = v_sg * v32;
+    auto v_b_n = v_w_n_base + v_x_m_row;
+    uint v35 = 0u;
+    auto v36 = k;
+    uint v37 = 32u;
+    auto v38 = v_x_m_base + v_x_m_row;
+    auto v39 = v38 * v36;
     uint v42 = 0u;
-    uint v46 = 1u;
-    auto v49 = v31 + v46;
-    uint v50 = 2u;
-    auto v53 = v31 + v50;
-    uint v54 = 3u;
-    auto v57 = v31 + v54;
-    uint v58 = 4u;
-    auto v61 = v31 + v58;
-    uint v62 = 5u;
-    auto v65 = v31 + v62;
-    uint v66 = 6u;
-    auto v69 = v31 + v66;
-    uint v70 = 7u;
-    auto v73 = v31 + v70;
-    uint v75 = 0u;
-    uint v81 = 1u;
-    auto v86 = v31 + v81;
-    uint v87 = 2u;
-    auto v92 = v31 + v87;
-    uint v93 = 3u;
-    auto v98 = v31 + v93;
-    uint v99 = 4u;
-    auto v104 = v31 + v99;
-    uint v105 = 5u;
-    auto v110 = v31 + v105;
-    uint v111 = 6u;
-    auto v116 = v31 + v111;
-    uint v117 = 7u;
-    auto v122 = v31 + v117;
-    for (uint i_0 = v4; i_0 < v14; i_0 += v11) {
-        auto v41 = ((v39 + i_0) + v26);
-        half4 v2000 = *((device half4*)((device half*)a + v41));
-        auto v2001 = v2000[0];
-        Xs[v31] = v2001;
-        auto v47 = v41 + v46;
-        auto v2002 = v2000[1];
-        Xs[v49] = v2002;
-        auto v51 = v41 + v50;
-        auto v2003 = v2000[2];
-        Xs[v53] = v2003;
-        auto v55 = v41 + v54;
-        half4 v2004 = *((device half4*)((device half*)a + v55));
-        auto v2005 = v2004[0];
-        Xs[v57] = v2005;
-        auto v59 = v41 + v58;
-        auto v2006 = v2004[1];
-        Xs[v61] = v2006;
-        auto v63 = v41 + v62;
-        auto v2007 = v2004[2];
-        Xs[v65] = v2007;
-        auto v67 = v41 + v66;
-        half2 v2008 = *((device half2*)((device half*)a + v67));
-        auto v2009 = v2008[0];
-        Xs[v69] = v2009;
-        auto v71 = v41 + v70;
-        auto v2010 = v2008[1];
-        Xs[v73] = v2010;
-        auto v74 = i_0 + v26;
-        auto v78 = ((v74 * v15) + v29);
-        auto v79 = b[v78];
-        Ws[v31] = v79;
-        auto v84 = (((v74 + v81) * v15) + v29);
-        auto v85 = b[v84];
-        Ws[v86] = v85;
-        auto v90 = (((v74 + v87) * v15) + v29);
-        auto v91 = b[v90];
-        Ws[v92] = v91;
-        auto v96 = (((v74 + v93) * v15) + v29);
-        auto v97 = b[v96];
-        Ws[v98] = v97;
-        auto v102 = (((v74 + v99) * v15) + v29);
-        auto v103 = b[v102];
-        Ws[v104] = v103;
-        auto v108 = (((v74 + v105) * v15) + v29);
-        auto v109 = b[v108];
-        Ws[v110] = v109;
-        auto v114 = (((v74 + v111) * v15) + v29);
-        auto v115 = b[v114];
-        Ws[v116] = v115;
-        auto v120 = (((v74 + v117) * v15) + v29);
-        auto v121 = b[v120];
-        Ws[v122] = v121;
+    uint v43 = 8u;
+    uint v44 = 1u;
+    uint v50 = 0u;
+    uint v51 = 8u;
+    uint v52 = 1u;
+    for (uint i_0 = v35; i_0 < v36; i_0 += v37) {
+        auto v40 = v39 + i_0;
+        auto v_a_row_dev_base = v40 + v_x_k_base;
+        for (uint i_1 = v42; i_1 < v43; i_1 += v44) {
+            auto v45 = v_a_row_dev_base + i_1;
+            auto v46 = a[v45];
+            auto v48 = v_x_ws_base + i_1;
+            float v_av = static_cast<float>(v46);
+            Xs[v48] = v_av;
+        }
+        auto v_b_k_base = i_0 + v_x_k_base;
+        for (uint i_2 = v50; i_2 < v51; i_2 += v52) {
+            auto v54 = n;
+            auto v56 = (((v_b_k_base + i_2) * v54) + v_b_n);
+            auto v57 = b[v56];
+            auto v59 = v_x_ws_base + i_2;
+            float v_bv = static_cast<float>(v57);
+            Ws[v59] = v_bv;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        metal::tensor<threadgroup half, metal::extents<int, 36, 16>, metal::tensor_inline> gemm_tA(Xs + v22, metal::extents<int, 36, 16>{}); gemm_ct_a.load(gemm_tA);
-        metal::tensor<threadgroup half, metal::extents<int, 36, 16>, metal::tensor_inline> gemm_tB(Ws + v23, metal::extents<int, 36, 16>{}); gemm_ct_b.load(gemm_tB);
+        metal::tensor<threadgroup half, metal::extents<int, 36, 16>, metal::tensor_inline> gemm_tA(Xs + v_xs_sg_off, metal::extents<int, 36, 16>{}); gemm_ct_a.load(gemm_tA);
+        metal::tensor<threadgroup half, metal::extents<int, 36, 16>, metal::tensor_inline> gemm_tB(Ws + v_ws_sg_off, metal::extents<int, 36, 16>{}); gemm_ct_b.load(gemm_tB);
         gemm_op.run(gemm_ct_a, gemm_ct_b, gemm_ct_c);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    metal::tensor<threadgroup float, metal::extents<int, 16, 16>, metal::tensor_inline> gemm_tC(OutScratch + v34, metal::extents<int, 16, 16>{}); gemm_ct_c.store(gemm_tC);
+    metal::tensor<threadgroup float, metal::extents<int, 16, 16>, metal::tensor_inline> gemm_tC(OutScratch + v_sg_scratch_off, metal::extents<int, 16, 16>{}); gemm_ct_c.store(gemm_tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    auto v124 = v35 * v10;
-    auto v129 = ((v27 + v20) + v35);
-    auto v131 = v129 * v15;
-    for (uint i_1 = v4; i_1 < v9; i_1 += v5) {
-        auto v123 = v37 + i_1;
-        auto v125 = v124 + v123;
-        auto v126 = v34 + v125;
-        auto v127 = OutScratch[v126];
-        auto v130 = v33 + v123;
-        auto v132 = v131 + v130;
-        half v128 = static_cast<half>(v127);
-        out[v132] = v128;
+    auto v_out_n_base = v_w_n_base + v_sg_n_base;
+    uint v62 = 2u;
+    auto v_o_row = v_lane / v62;
+    uint v64 = 1u;
+    auto v65 = (v_lane & v64);
+    uint v66 = 8u;
+    auto v_o_col_base = v65 * v66;
+    uint v68 = 0u;
+    uint v69 = 8u;
+    uint v70 = 1u;
+    uint v72 = 16u;
+    auto v73 = v_o_row * v72;
+    auto v74 = v_sg_scratch_off + v73;
+    auto v_out_m_base = v_x_m_base + v_sg_m_base;
+    auto v77 = v_out_m_base + v_o_row;
+    for (uint i_3 = v68; i_3 < v69; i_3 += v70) {
+        auto v_col = v_o_col_base + i_3;
+        auto v75 = v74 + v_col;
+        auto v_v = OutScratch[v75];
+        auto v78 = n;
+        auto v80 = v_out_n_base + v_col;
+        half v82 = static_cast<half>(v_v);
+        auto v81 = ((v77 * v78) + v80);
+        out[v81] = v82;
     }
+#else
+    // Pre-Metal-4 stub: mpp::tensor_ops is unavailable.
+#endif
 }

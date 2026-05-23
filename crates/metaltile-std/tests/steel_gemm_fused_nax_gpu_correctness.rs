@@ -25,7 +25,7 @@ mod common;
 use common::gpu_lock;
 use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_runtime::Context;
-use metaltile_std::mlx::steel::gemm::steel_gemm_fused_nax;
+use metaltile_std::mlx::steel::gemm::steel_gemm_fused_nax::mt_steel_gemm_fused_nax;
 
 /// Naive triple-loop GEMM oracle — `A[M,K] · B[K,N] = C[M,N]`, all
 /// row-major. fp32 accumulation, matching the kernel's `AccumType=float`.
@@ -65,7 +65,7 @@ fn run_gemm_fused_nax(
     buffers.insert("k".into(), (k as u32).to_le_bytes().to_vec());
     buffers.insert("n".into(), (n as u32).to_le_bytes().to_vec());
 
-    let mut kernel = steel_gemm_fused_nax::kernel_ir_for(dtype);
+    let mut kernel = mt_steel_gemm_fused_nax::kernel_ir_for(dtype);
     kernel.mode = KernelMode::Reduction;
 
     let result = ctx
@@ -77,6 +77,10 @@ fn run_gemm_fused_nax(
 
 fn f32_to_f16_bytes(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect()
+}
+
+fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
+    vals.iter().flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes()).collect()
 }
 
 fn f32_to_f32_bytes(vals: &[f32]) -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() }
@@ -220,4 +224,41 @@ fn mt_steel_gemm_fused_nax_matches_cpu_reference_f16_multi_tile() {
     let cos = cosine(&expected, &actual);
     println!("[f16 multi-tile m={m} n={n}] cos={cos:.6}");
     assert!(cos >= 0.999, "cosine {cos:.6} < 0.999 (f16 multi-tile)");
+}
+
+// ── Shape 5 : bf16 multi-tile ──────────────────────────────────────────────
+//
+// bf16 activations stage through `half` via the DSL `coop_stage(T)` form
+// (Apple `matmul2d` mishandles `bfloat` cooperative tensors). bf16 has
+// only 7 mantissa bits, so the cosine bar is slightly relaxed (≥ 0.997).
+
+#[test]
+fn mt_steel_gemm_fused_nax_matches_cpu_reference_bf16_multi_tile() {
+    let (m, n, k) = (64usize, 64usize, 128usize);
+    let (a_f32, b_f32) = build_gemm_inputs(m, n, k);
+    let round_bf16 = |v: f32| -> f32 { half::bf16::from_f32(v).to_f32() };
+    let a: Vec<f32> = a_f32.iter().map(|&v| round_bf16(v)).collect();
+    let b: Vec<f32> = b_f32.iter().map(|&v| round_bf16(v)).collect();
+    let expected = cpu_gemm_reference(&a, &b, m, n, k);
+
+    let _g = gpu_lock();
+    let ctx = Context::new().expect("Context::new");
+    let out_bytes = run_gemm_fused_nax(
+        &ctx,
+        DType::BF16,
+        &f32_to_bf16_bytes(&a),
+        &f32_to_bf16_bytes(&b),
+        m,
+        n,
+        k,
+        2,
+    );
+    let actual: Vec<f32> = out_bytes
+        .chunks_exact(2)
+        .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect();
+
+    let cos = cosine(&expected, &actual);
+    println!("[bf16 multi-tile m={m} n={n}] cos={cos:.6}");
+    assert!(cos >= 0.997, "cosine {cos:.6} < 0.997 (bf16 multi-tile)");
 }

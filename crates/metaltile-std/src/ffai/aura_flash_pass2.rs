@@ -37,19 +37,22 @@ use metaltile::kernel;
 use metaltile_core::ir::KernelMode;
 
 use crate::{
-    bench_types::DType,
+    bench_types::{DType, FLOAT_DTYPES},
     spec::{BenchDispatch, BenchSpec},
 };
 
-const BF16_ONLY: &[DType] = &[DType::BF16];
+// Keep `DType` referenced — the bf16-only shortlist was a legacy default;
+// now that the partials and output are all `Tensor<T>` the kernel handles
+// fp32/fp16/bf16.
+const _: DType = DType::F32;
 
 macro_rules! aura_flash_pass2_kernel {
     ($name:ident, $dims_per_lane:literal, $subop:literal) => {
         #[kernel]
         pub fn $name<T>(
-            o_partials: Tensor<f32>,
-            m_partials: Tensor<f32>,
-            l_partials: Tensor<f32>,
+            o_partials: Tensor<T>,
+            m_partials: Tensor<T>,
+            l_partials: Tensor<T>,
             mut output: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] num_blocks: u32,
@@ -69,11 +72,13 @@ macro_rules! aura_flash_pass2_kernel {
             let mut l_acc = 0.0f32;
 
             // Replay every block; rescale on each step using the
-            // standard online-softmax max-shift identity.
+            // standard online-softmax max-shift identity. Partials are
+            // promoted to f32 for the merge — keeps numerical stability
+            // independent of the storage dtype.
             for b in range(0u32, num_blocks, 1u32) {
                 let ml_idx = q_idx * num_blocks + b;
-                let block_m = load(m_partials[ml_idx]);
-                let block_l = load(l_partials[ml_idx]);
+                let block_m = load(m_partials[ml_idx]).cast::<f32>();
+                let block_l = load(l_partials[ml_idx]).cast::<f32>();
                 // Skip empty blocks (causal masking can leave some
                 // blocks with l=0).
                 if block_l != 0.0f32 {
@@ -86,7 +91,7 @@ macro_rules! aura_flash_pass2_kernel {
                         let d = lane + i * 32u32;
                         if d < dim {
                             let prev = stack_load("o", i);
-                            let part = load(o_partials[partial_base + d]);
+                            let part = load(o_partials[partial_base + d]).cast::<f32>();
                             let scaled = prev * exp_old + part * exp_block;
                             stack_store("o", i, scaled);
                         }
@@ -113,7 +118,7 @@ macro_rules! aura_flash_pass2_kernel {
                 subop: $subop,
                 kernel_name: stringify!($name),
                 kernel_ir: $name::kernel_ir_for,
-                dtypes: BF16_ONLY,
+                dtypes: FLOAT_DTYPES,
                 tol: 0.0,
                 mlx_src: None,
                 mlx_pattern: None,

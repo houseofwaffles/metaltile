@@ -14,25 +14,23 @@ kernel void mt_steel_gemm_splitk_accum_nax(
     constant uint &n_splits [[buffer(4)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
-    float acc[1];
-
-    uint v0 = gid.x;
+    auto v_idx = tgid_x;
     auto v1 = m;
     auto v2 = n;
-    auto v3 = n_splits;
-    auto v4 = v1 * v2;
-    uint v5 = 0u;
-    auto v6 = partials[v0];
-    acc[v5] = v6;
+    auto v_total = v1 * v2;
+    auto v4 = partials[v_idx];
+    auto __ml_acc = v4;
+    uint v5 = 1u;
+    auto v6 = n_splits;
     uint v7 = 1u;
-    for (uint i_0 = v7; i_0 < v3; i_0 += v7) {
-        auto v11 = ((i_0 * v4) + v0);
-        auto v12 = partials[v11];
-        auto v13 = acc[v5];
-        auto v14 = v13 + v12;
-        acc[v5] = v14;
+    for (uint i_0 = v5; i_0 < v6; i_0 += v7) {
+        auto v8 = __ml_acc;
+        auto v10 = ((i_0 * v_total) + v_idx);
+        auto v11 = partials[v10];
+        auto v12 = v8 + v11;
+        __ml_acc = v12;
     }
-    auto v8 = acc[v5];
-    float v9 = static_cast<float>(v8);
-    out[v0] = v9;
+    auto v13 = __ml_acc;
+    float v14 = static_cast<float>(v13);
+    out[v_idx] = v14;
 }

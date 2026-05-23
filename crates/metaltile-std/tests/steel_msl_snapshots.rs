@@ -55,7 +55,10 @@ fn steel_msl(kernel_ir: metaltile_core::ir::Kernel, mode: KernelMode) -> String 
 
 #[test]
 fn steel_gemm_fused_nax_f16_msl() {
-    let msl = steel_msl(steel_gemm_fused_nax::kernel_ir_for(DType::F16), KernelMode::Reduction);
+    let msl = steel_msl(
+        steel_gemm_fused_nax::mt_steel_gemm_fused_nax::kernel_ir_for(DType::F16),
+        KernelMode::Reduction,
+    );
     assert_snapshot!(msl);
 }
 
@@ -66,7 +69,10 @@ fn steel_gemm_fused_nax_f16_msl() {
 
 #[test]
 fn steel_gemm_gather_nax_f16_msl() {
-    let msl = steel_msl(steel_gemm_gather_nax::kernel_ir_for(DType::F16), KernelMode::Reduction);
+    let msl = steel_msl(
+        steel_gemm_gather_nax::mt_steel_gemm_gather_nax::kernel_ir_for(DType::F16),
+        KernelMode::Reduction,
+    );
     assert_snapshot!(msl);
 }
 
@@ -78,13 +84,19 @@ fn steel_gemm_gather_nax_f16_msl() {
 
 #[test]
 fn steel_gemm_splitk_nax_f16_msl() {
-    let msl = steel_msl(steel_gemm_splitk_nax::kernel_ir_for(DType::F16), KernelMode::Reduction);
+    let msl = steel_msl(
+        steel_gemm_splitk_nax::mt_steel_gemm_splitk_nax::kernel_ir_for(DType::F16),
+        KernelMode::Reduction,
+    );
     assert_snapshot!(msl);
 }
 
 #[test]
 fn steel_gemm_splitk_nax_accum_f32_msl() {
-    let msl = steel_msl(steel_gemm_splitk_nax::accum_kernel_ir_for(DType::F32), KernelMode::Grid3D);
+    let msl = steel_msl(
+        steel_gemm_splitk_nax::mt_steel_gemm_splitk_accum_nax::kernel_ir_for(DType::F32),
+        KernelMode::Grid3D,
+    );
     assert_snapshot!(msl);
 }
 
@@ -95,7 +107,8 @@ fn steel_gemm_splitk_nax_accum_f32_msl() {
 
 #[test]
 fn quantized_nax_f16_msl() {
-    let msl = steel_msl(quantized_nax::kernel_ir_for(DType::F16), KernelMode::Reduction);
+    let msl =
+        steel_msl(quantized_nax::mt_qmm_nax::kernel_ir_for(DType::F16), KernelMode::Reduction);
     assert_snapshot!(msl);
 }
 
@@ -107,7 +120,10 @@ fn quantized_nax_f16_msl() {
 
 #[test]
 fn fp_quantized_nax_f16_msl() {
-    let msl = steel_msl(fp_quantized_nax::kernel_ir_for(DType::F16), KernelMode::Reduction);
+    let msl = steel_msl(
+        fp_quantized_nax::mt_fp_qmm_nax::kernel_ir_for(DType::F16),
+        KernelMode::Reduction,
+    );
     assert_snapshot!(msl);
 }
 
@@ -119,6 +135,7 @@ fn fp_quantized_nax_f16_msl() {
 
 #[test]
 fn hadamard_m_m20_f32_msl() {
-    let msl = steel_msl(hadamard_m::kernel_ir_for(20, DType::F32), KernelMode::Reduction);
+    let msl =
+        steel_msl(hadamard_m::mt_hadamard_m20::kernel_ir_for(DType::F32), KernelMode::Reduction);
     assert_snapshot!(msl);
 }

@@ -7,9 +7,9 @@ expression: msl
 using namespace metal;
 
 kernel void aura_flash_pass2_d128(
-    const device float *o_partials [[buffer(0)]],
-    const device float *m_partials [[buffer(1)]],
-    const device float *l_partials [[buffer(2)]],
+    const device bfloat *o_partials [[buffer(0)]],
+    const device bfloat *m_partials [[buffer(1)]],
+    const device bfloat *l_partials [[buffer(2)]],
     device bfloat *output [[buffer(3)]],
     constant uint &dim [[buffer(4)]],
     constant uint &num_blocks [[buffer(5)]],
@@ -49,95 +49,97 @@ kernel void aura_flash_pass2_d128(
     auto v11 = v_q_idx * v9;
     for (uint i_1 = v8; i_1 < v9; i_1 += v10) {
         auto v_ml_idx = v11 + i_1;
-        auto v_block_m = m_partials[v_ml_idx];
-        auto v_block_l = l_partials[v_ml_idx];
-        auto v15 = 0.0f;
-        auto v16 = v_block_l != v15;
-        if (v16) {
-            auto v17 = __ml_m_acc;
+        auto v13 = m_partials[v_ml_idx];
+        float v_block_m = static_cast<float>(v13);
+        auto v15 = l_partials[v_ml_idx];
+        float v_block_l = static_cast<float>(v15);
+        auto v17 = 0.0f;
+        auto v18 = v_block_l != v17;
+        if (v18) {
             auto v19 = __ml_m_acc;
-            auto v_new_m = select(v_block_m, v19, bool((v17 > v_block_m)));
             auto v21 = __ml_m_acc;
-            auto v22 = v21 - v_new_m;
-            auto v_exp_old = exp(v22);
-            auto v24 = v_block_m - v_new_m;
-            auto v_exp_block = exp(v24);
-            auto v28 = dim;
-            auto v27 = ((v_q_idx * v9) + i_1);
-            auto v_partial_base = v27 * v28;
-            uint v33 = 32u;
-            uint v30 = 0u;
-            uint v31 = 4u;
-            uint v32 = 1u;
+            auto v_new_m = select(v_block_m, v21, bool((v19 > v_block_m)));
+            auto v23 = __ml_m_acc;
+            auto v24 = v23 - v_new_m;
+            auto v_exp_old = exp(v24);
+            auto v26 = v_block_m - v_new_m;
+            auto v_exp_block = exp(v26);
+            auto v30 = dim;
+            auto v29 = ((v_q_idx * v9) + i_1);
+            auto v_partial_base = v29 * v30;
+            uint v35 = 32u;
+            uint v32 = 0u;
+            uint v33 = 4u;
+            uint v34 = 1u;
             uint v1073741868 = 0u;
-            auto v1073741869 = v1073741868 * v33;
+            auto v1073741869 = v1073741868 * v35;
             auto v1073741870 = v_lane + v1073741869;
-            auto v1073741871 = v28 > v1073741870;
+            auto v1073741871 = v30 > v1073741870;
             if (v1073741871) {
                 auto v1073741872 = o[v1073741868];
                 auto v1073741873 = v_partial_base + v1073741870;
                 auto v1073741874 = o_partials[v1073741873];
-                auto v1073741875 = v1073741874 * v_exp_block;
+                auto v1073741875 = (static_cast<float>(v1073741874) * v_exp_block);
                 auto v1073741876 = ((v1073741872 * v_exp_old) + v1073741875);
                 o[v1073741868] = v1073741876;
             }
             uint v1073741877 = 1u;
-            auto v1073741878 = v1073741877 * v33;
+            auto v1073741878 = v1073741877 * v35;
             auto v1073741879 = v_lane + v1073741878;
-            auto v1073741880 = v28 > v1073741879;
+            auto v1073741880 = v30 > v1073741879;
             if (v1073741880) {
                 auto v1073741881 = o[v1073741877];
                 auto v1073741882 = v_partial_base + v1073741879;
                 auto v1073741883 = o_partials[v1073741882];
-                auto v1073741884 = v1073741883 * v_exp_block;
+                auto v1073741884 = (static_cast<float>(v1073741883) * v_exp_block);
                 auto v1073741885 = ((v1073741881 * v_exp_old) + v1073741884);
                 o[v1073741877] = v1073741885;
             }
             uint v1073741886 = 2u;
-            auto v1073741887 = v1073741886 * v33;
+            auto v1073741887 = v1073741886 * v35;
             auto v1073741888 = v_lane + v1073741887;
-            auto v1073741889 = v28 > v1073741888;
+            auto v1073741889 = v30 > v1073741888;
             if (v1073741889) {
                 auto v1073741890 = o[v1073741886];
                 auto v1073741891 = v_partial_base + v1073741888;
                 auto v1073741892 = o_partials[v1073741891];
-                auto v1073741893 = v1073741892 * v_exp_block;
+                auto v1073741893 = (static_cast<float>(v1073741892) * v_exp_block);
                 auto v1073741894 = ((v1073741890 * v_exp_old) + v1073741893);
                 o[v1073741886] = v1073741894;
             }
             uint v1073741895 = 3u;
-            auto v1073741896 = v1073741895 * v33;
+            auto v1073741896 = v1073741895 * v35;
             auto v1073741897 = v_lane + v1073741896;
-            auto v1073741898 = v28 > v1073741897;
+            auto v1073741898 = v30 > v1073741897;
             if (v1073741898) {
                 auto v1073741899 = o[v1073741895];
                 auto v1073741900 = v_partial_base + v1073741897;
                 auto v1073741901 = o_partials[v1073741900];
-                auto v1073741902 = v1073741901 * v_exp_block;
+                auto v1073741902 = (static_cast<float>(v1073741901) * v_exp_block);
                 auto v1073741903 = ((v1073741899 * v_exp_old) + v1073741902);
                 o[v1073741895] = v1073741903;
             }
-            auto v43 = __ml_l_acc;
-            auto v45 = v_block_l * v_exp_block;
-            auto v46 = ((v43 * v_exp_old) + v45);
-            __ml_l_acc = v46;
+            auto v46 = __ml_l_acc;
+            auto v48 = v_block_l * v_exp_block;
+            auto v49 = ((v46 * v_exp_old) + v48);
+            __ml_l_acc = v49;
             __ml_m_acc = v_new_m;
         }
     }
-    auto v47 = __ml_l_acc;
-    auto v48 = 0.0f;
-    auto v49 = v47 > v48;
-    auto v50 = 1.0f;
-    auto v51 = __ml_l_acc;
-    auto v52 = v50 / v51;
-    auto v53 = 0.0f;
-    auto v_inv_l = bool(v49) ? v52 : v53;
-    uint v55 = 0u;
-    uint v56 = 4u;
-    uint v57 = 1u;
-    uint v58 = 32u;
+    auto v50 = __ml_l_acc;
+    auto v51 = 0.0f;
+    auto v52 = v50 > v51;
+    auto v53 = 1.0f;
+    auto v54 = __ml_l_acc;
+    auto v55 = v53 / v54;
+    auto v56 = 0.0f;
+    auto v_inv_l = bool(v52) ? v55 : v56;
+    uint v58 = 0u;
+    uint v59 = 4u;
+    uint v60 = 1u;
+    uint v61 = 32u;
     uint v1073741836 = 0u;
-    auto v1073741837 = v1073741836 * v58;
+    auto v1073741837 = v1073741836 * v61;
     auto v1073741838 = v_lane + v1073741837;
     auto v1073741839 = dim;
     auto v1073741840 = v1073741839 > v1073741838;
@@ -148,7 +150,7 @@ kernel void aura_flash_pass2_d128(
         output[v1073741843] = bfloat(v1073741842);
     }
     uint v1073741844 = 1u;
-    auto v1073741845 = v1073741844 * v58;
+    auto v1073741845 = v1073741844 * v61;
     auto v1073741846 = v_lane + v1073741845;
     auto v1073741847 = dim;
     auto v1073741848 = v1073741847 > v1073741846;
@@ -159,7 +161,7 @@ kernel void aura_flash_pass2_d128(
         output[v1073741851] = bfloat(v1073741850);
     }
     uint v1073741852 = 2u;
-    auto v1073741853 = v1073741852 * v58;
+    auto v1073741853 = v1073741852 * v61;
     auto v1073741854 = v_lane + v1073741853;
     auto v1073741855 = dim;
     auto v1073741856 = v1073741855 > v1073741854;
@@ -170,7 +172,7 @@ kernel void aura_flash_pass2_d128(
         output[v1073741859] = bfloat(v1073741858);
     }
     uint v1073741860 = 3u;
-    auto v1073741861 = v1073741860 * v58;
+    auto v1073741861 = v1073741860 * v61;
     auto v1073741862 = v_lane + v1073741861;
     auto v1073741863 = dim;
     auto v1073741864 = v1073741863 > v1073741862;

@@ -27,7 +27,7 @@ mod common;
 use common::gpu_lock;
 use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_runtime::Context;
-use metaltile_std::mlx::quantized_mpp;
+use metaltile_std::mlx::quantized_mpp::mt_qmm_mma_mpp;
 
 /// MPP `tensor_ops::matmul2d` requires Apple10 (gen-17) + macOS 26.2+.
 /// On older silicon or virtualised CI runners the kernel hits its
@@ -115,7 +115,7 @@ fn run_qmm_mma_mpp(
     buffers.insert("n".into(), (n as u32).to_le_bytes().to_vec());
     buffers.insert("gs_per_row".into(), (gs_per_row as u32).to_le_bytes().to_vec());
 
-    let mut kernel = quantized_mpp::kernel_ir_for(dtype);
+    let mut kernel = mt_qmm_mma_mpp::kernel_ir_for(dtype);
     kernel.mode = KernelMode::Reduction;
 
     let result = ctx

@@ -20,9 +20,6 @@ use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_runtime::Context;
 use metaltile_std::ffai::aura_score::aura_score_int4;
 
-fn f32_slice_to_bytes(vals: &[f32]) -> Vec<u8> { pack_bytes(vals, Dt::F32) }
-fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> { unpack_bytes(bytes, Dt::F32) }
-
 fn pack_int4_indices(indices: &[u32], kv_heads: usize, tokens: usize, dim: usize) -> Vec<u32> {
     let bits = 4;
     let packed_width = (dim * bits).div_ceil(32);
@@ -70,8 +67,7 @@ fn naive_aura_score(
     scores
 }
 
-#[test]
-fn aura_score_int4_matches_naive_reference_f32() {
+fn run_aura_score_dtype(dt: Dt, tol: f32, label: &str) {
     let dim = 128usize;
     let bits = 4usize;
     let packed_width = (dim * bits).div_ceil(32);
@@ -88,22 +84,29 @@ fn aura_score_int4_matches_naive_reference_f32() {
     let q_rot: Vec<f32> =
         (0..q_heads * dim).map(|i| (((i * 13) % 21) as f32 - 10.0) * 0.02).collect();
 
+    // Round inputs through the kernel dtype so the CPU oracle matches the
+    // load-cast quantisation the kernel applies.
+    let round_in = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| dt.round(x)).collect() };
+    let codebook_r = round_in(&codebook);
+    let norms_r = round_in(&norms);
+    let q_rot_r = round_in(&q_rot);
+
     let expected =
-        naive_aura_score(&q_rot, &indices, &norms, &codebook, q_heads, kv_heads, tokens, dim);
+        naive_aura_score(&q_rot_r, &indices, &norms_r, &codebook_r, q_heads, kv_heads, tokens, dim);
 
     let mut buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    buffers.insert("q_rot".into(), f32_slice_to_bytes(&q_rot));
+    buffers.insert("q_rot".into(), pack_bytes(&q_rot_r, dt));
     buffers.insert("packed".into(), pack_u32_bytes(&packed));
-    buffers.insert("norms".into(), f32_slice_to_bytes(&norms));
-    buffers.insert("codebook".into(), f32_slice_to_bytes(&codebook));
-    buffers.insert("scores".into(), vec![0u8; q_heads * tokens * 4]);
+    buffers.insert("norms".into(), pack_bytes(&norms_r, dt));
+    buffers.insert("codebook".into(), pack_bytes(&codebook_r, dt));
+    buffers.insert("scores".into(), pack_bytes(&vec![0.0_f32; q_heads * tokens], dt));
     buffers.insert("dim".into(), (dim as u32).to_le_bytes().to_vec());
     buffers.insert("packed_width".into(), (packed_width as u32).to_le_bytes().to_vec());
     buffers.insert("tokens".into(), (tokens as u32).to_le_bytes().to_vec());
     buffers.insert("repeat_count".into(), (repeat as u32).to_le_bytes().to_vec());
 
     let ctx = Context::new().expect("Context::new should succeed on macOS");
-    let mut kernel = aura_score_int4::kernel_ir_for(DType::F32);
+    let mut kernel = aura_score_int4::kernel_ir_for(dt.to_dtype());
     kernel.mode = KernelMode::Reduction;
 
     // One TG per (q_head, k_token) pair, 32 threads per TG.
@@ -112,9 +115,21 @@ fn aura_score_int4_matches_naive_reference_f32() {
         .expect("dispatch_with_grid should succeed");
 
     let out_bytes = result.outputs.get("scores").expect("`scores` buffer");
-    let actual = bytes_to_f32_vec(out_bytes);
+    let actual = unpack_bytes(out_bytes, dt);
     let diff = max_abs_diff(&expected, &actual);
-    // simd_sum + per-lane stride-32 partials → modest reordering noise
-    // relative to the sequential CPU sum.
-    assert!(diff < 1e-3, "aura_score int4: max |diff| = {diff:.2e}");
+    assert!(diff < tol, "aura_score int4 {label}: max |diff| = {diff:.2e} > {tol:.0e}");
 }
+
+#[test]
+fn aura_score_int4_matches_naive_reference_f32() { run_aura_score_dtype(Dt::F32, 1e-3, "f32"); }
+
+#[test]
+fn aura_score_int4_matches_naive_reference_f16() { run_aura_score_dtype(Dt::F16, 1e-2, "f16"); }
+
+#[test]
+fn aura_score_int4_matches_naive_reference_bf16() { run_aura_score_dtype(Dt::Bf16, 5e-2, "bf16"); }
+
+// Unused after the parameterized rewrite — kept so the `metaltile-core::ir`
+// path stays in the `use` list if a future test needs it directly.
+#[allow(dead_code)]
+fn _unused_dtype() -> DType { DType::F32 }

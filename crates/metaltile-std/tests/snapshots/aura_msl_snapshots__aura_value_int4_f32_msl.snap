@@ -50,40 +50,44 @@ kernel void aura_value_int4(
     auto v27 = v_head_idx * v25;
     for (uint i_0 = v24; i_0 < v25; i_0 += v26) {
         auto v28 = v27 + i_0;
-        auto v_w = weights[v28];
-        auto v30 = sparse_threshold;
-        auto v31 = v_w >= v30;
-        if (v31) {
-            auto v32 = v_kv_head * v25;
-            auto v33 = v32 + i_0;
-            auto v_norm_val = norms[v33];
-            auto v37 = packed_width;
-            auto v_packed_row = ((v32 + i_0) * v37);
-            auto v39 = v_packed_row + v_word_idx;
-            auto v_w0 = packed[v39];
-            uint v41 = 0u;
-            uint v43 = 1u;
-            auto v44 = v_word_idx + v43;
-            auto v_w1_idx = select(v_word_idx, v44, bool((v_spill > v41)));
-            auto v46 = v_packed_row + v_w1_idx;
-            auto v_w1 = packed[v46];
-            uint v49 = 1u;
+        auto v29 = weights[v28];
+        float v_w = static_cast<float>(v29);
+        auto v31 = sparse_threshold;
+        auto v32 = v_w >= v31;
+        if (v32) {
+            auto v33 = v_kv_head * v25;
+            auto v34 = v33 + i_0;
+            auto v35 = norms[v34];
+            auto v39 = packed_width;
+            auto v_packed_row = ((v33 + i_0) * v39);
+            auto v41 = v_packed_row + v_word_idx;
+            auto v_w0 = packed[v41];
+            uint v43 = 0u;
+            uint v45 = 1u;
+            auto v46 = v_word_idx + v45;
+            auto v_w1_idx = select(v_word_idx, v46, bool((v_spill > v43)));
+            auto v48 = v_packed_row + v_w1_idx;
+            auto v_w1 = packed[v48];
             uint v51 = 1u;
-            auto v52 = ((v49 << v_lo_bits) - v51);
-            uint v54 = 1u;
+            uint v53 = 1u;
+            auto v54 = ((v51 << v_lo_bits) - v53);
             uint v56 = 1u;
-            auto v57 = ((v54 << v_spill) - v56);
-            auto v_hi = ((v_w1 & v57) << v_lo_bits);
-            auto v_value = ((((v_w0 >> v_shift) & v52) | v_hi) & v_mask);
-            auto v_centroid = codebook[v_value];
-            auto v63 = __ml_acc;
-            auto v65 = ((v_w * v_norm_val) * v_centroid);
-            auto v66 = v63 + v65;
-            __ml_acc = v66;
+            uint v58 = 1u;
+            auto v59 = ((v56 << v_spill) - v58);
+            auto v_hi = ((v_w1 & v59) << v_lo_bits);
+            auto v_value = ((((v_w0 >> v_shift) & v54) | v_hi) & v_mask);
+            auto v64 = codebook[v_value];
+            auto v66 = __ml_acc;
+            float v_norm_val = static_cast<float>(v35);
+            float v_centroid = static_cast<float>(v64);
+            auto v68 = ((v_w * v_norm_val) * v_centroid);
+            auto v69 = v66 + v68;
+            __ml_acc = v69;
         }
     }
-    auto v67 = dim;
-    auto v69 = ((v_head_idx * v67) + v_d);
-    auto v70 = __ml_acc;
-    output[v69] = v70;
+    auto v70 = dim;
+    auto v72 = ((v_head_idx * v70) + v_d);
+    auto v73 = __ml_acc;
+    float v74 = static_cast<float>(v73);
+    output[v72] = v74;
 }

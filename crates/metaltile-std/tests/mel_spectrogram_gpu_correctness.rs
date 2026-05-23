@@ -174,6 +174,24 @@ fn mel_spectrogram_triangular_filterbank_matches_naive_f32() {
 }
 
 #[test]
+fn mel_spectrogram_matches_naive_bf16() {
+    let _g = gpu_lock();
+    let s = MelShape { n_samples: 96, n_fft: 16, n_mels: 8, hop_length: 8, log_eps: 1e-4 };
+    let audio: Vec<f32> = (0..s.n_samples).map(|i| (i as f32 * 0.27).sin() * 0.4).collect();
+    let window = hann(s.n_fft);
+    let mel_weight = triangular_filterbank(s.n_mels, s.n_freq());
+    let round = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| Dt::Bf16.round(x)).collect() };
+    let expected = naive_mel(&round(&audio), &round(&window), &round(&mel_weight), &s);
+    let actual = run_mel(&audio, &window, &mel_weight, Dt::Bf16, &s);
+    // bf16 has 7 bits of mantissa (vs f16's 10) — looser relative bound.
+    let mut max_rel = 0.0f32;
+    for (a, e) in actual.iter().zip(expected.iter()) {
+        max_rel = max_rel.max((a - e).abs() / e.abs().max(1.0));
+    }
+    assert!(max_rel < 1e-1, "mel bf16: max rel = {max_rel:.2e}");
+}
+
+#[test]
 fn mel_spectrogram_matches_naive_f16() {
     let _g = gpu_lock();
     let s = MelShape { n_samples: 96, n_fft: 16, n_mels: 8, hop_length: 8, log_eps: 1e-4 };

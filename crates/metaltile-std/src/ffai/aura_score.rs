@@ -47,21 +47,24 @@ use metaltile::kernel;
 use metaltile_core::ir::KernelMode;
 
 use crate::{
-    bench_types::DType,
+    bench_types::{DType, FLOAT_DTYPES},
     spec::{BenchDispatch, BenchSpec},
 };
 
-const F32_ONLY: &[DType] = &[DType::F32];
+// Keep `DType` referenced for the inventory submit; `FLOAT_DTYPES`
+// supersedes the old `F32_ONLY` shortlist now that the kernel is generic
+// over `T` (fp32/fp16/bf16) for its I/O dtype.
+const _: DType = DType::F32;
 
 macro_rules! aura_score_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
         #[kernel]
         pub fn $name<T>(
-            q_rot: Tensor<f32>,
+            q_rot: Tensor<T>,
             packed: Tensor<u32>,
-            norms: Tensor<f32>,
-            codebook: Tensor<f32>,
-            mut scores: Tensor<f32>,
+            norms: Tensor<T>,
+            codebook: Tensor<T>,
+            mut scores: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] packed_width: u32,
             #[constexpr] tokens: u32,
@@ -75,7 +78,7 @@ macro_rules! aura_score_kernel {
             let mask = (1u32 << $bits) - 1u32;
             let q_off = q_idx * dim;
             let packed_row = (kv_idx * tokens + k_idx) * packed_width;
-            let norm_val = load(norms[kv_idx * tokens + k_idx]);
+            let norm_val = load(norms[kv_idx * tokens + k_idx]).cast::<f32>();
 
             // Lane-strided accumulation over dim.  Each lane handles
             // dims `[lane, lane + 32, lane + 64, …)` so the threadgroup
@@ -104,8 +107,8 @@ macro_rules! aura_score_kernel {
                     let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
                     let value = (lo | hi) & mask;
 
-                    let centroid = load(codebook[value]);
-                    let qv = load(q_rot[q_off + d]);
+                    let centroid = load(codebook[value]).cast::<f32>();
+                    let qv = load(q_rot[q_off + d]).cast::<f32>();
                     acc = acc + qv * centroid;
                 }
             }
@@ -114,7 +117,7 @@ macro_rules! aura_score_kernel {
             // result back, scaled by the per-position norm correction.
             let total = simd_sum(acc);
             if lane == 0u32 {
-                store(scores[q_idx * tokens + k_idx], total * norm_val);
+                store(scores[q_idx * tokens + k_idx], (total * norm_val).cast::<T>());
             }
         }
 
@@ -124,7 +127,7 @@ macro_rules! aura_score_kernel {
                 subop: $subop,
                 kernel_name: stringify!($name),
                 kernel_ir: $name::kernel_ir_for,
-                dtypes: F32_ONLY,
+                dtypes: FLOAT_DTYPES,
                 tol: 0.0,
                 mlx_src: None,
                 mlx_pattern: None,

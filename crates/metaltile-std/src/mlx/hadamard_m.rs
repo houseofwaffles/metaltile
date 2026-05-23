@@ -3,8 +3,12 @@
 //! This is the second stage in MLX's `hadamard_mn_contiguous` pipeline, which
 //! computes `y = H_{M·N} · x` by factoring it as `(H_M ⊗ I_N) · (I_M ⊗ H_N)`.
 //! The metaltile-std version ships a **standalone** kernel for the pure M-element
-//! Hadamard of any batch of M-vectors, suitable for testing and for use when the
-//! batch structure has already been prepared by the power-of-2 first stage.
+//! Hadamard of any batch of M-vectors.
+//!
+//! Expressed in the `#[kernel]` DSL — no `Op::InlineMsl`. The three M values
+//! get their own monomorphized DSL function (`mt_hadamard_m12`, `_m20`, `_m28`)
+//! because each has its own compile-time sign table. The Rust-level wrapper
+//! `kernel_ir_for(m, dt)` dispatches to the right inner function.
 //!
 //! ## Algorithm
 //!
@@ -13,12 +17,8 @@
 //! 2. Each thread `t` accumulates `out[t] = Σ_j H_M[t][j] · buf[j]`.
 //! 3. The ±1 entries of each row are encoded as a compile-time bitmask
 //!    constant: bit j set = H[t][j] = +1, bit j clear = H[t][j] = −1.
+//!    These are seeded into a per-thread `stack_alloc` signs table.
 //! 4. Result is scaled by `scale` and stored.
-//!
-//! Expressed via DSL IR ops — no `Op::InlineMsl`. The per-thread sign table
-//! is a `StackAlloc` u32 array seeded with the M compile-time row masks; the
-//! thread reads its own row with a dynamic `StackLoad(signs, t)`. The
-//! M-element accumulation is fully unrolled (M ≤ 28).
 //!
 //! ## DISPATCH INVARIANTS
 //!
@@ -36,48 +36,30 @@
 //! From Sloane's table (<http://neilsloane.com/hadamard/>), mirroring
 //! `mlx/backend/common/hadamard.h`. Each entry `signs[t]` is a 32-bit
 //! integer where bit j = 1 means H_M[t][j] = +1 (otherwise −1).
-//!
 //! Verified for orthogonality: H · H^T = M · I.
 
-use metaltile_core::{
-    constexpr::ConstExpr,
-    dtype::DType,
-    ir::{
-        BinOpKind,
-        Block,
-        BlockId,
-        ConstExprDecl,
-        IndexExpr,
-        Kernel,
-        KernelMode,
-        Op,
-        Param,
-        ParamKind,
-        ValueId,
-    },
-    shape::{Dim, Shape},
-};
+use metaltile::kernel;
+use metaltile_core::{dtype::DType, ir::Kernel};
 
-// ── H_12 sign-bit encoding ─────────────────────────────────────────────────
+use crate::bench_types::DType as BenchDType;
+
+// ── H_M sign-bit encodings ─────────────────────────────────────────────────
 //
-// Derived from `mlx/backend/common/hadamard.h` `h12` string.
-// Verified: H_12 · H_12^T = 12 · I.
-// Encoding: bit j of signs[t] = 1  ⟺  H_12[t][j] = +1.
+// Derived from `mlx/backend/common/hadamard.h`. Each entry `signs[t]` is a
+// 32-bit integer where bit j = 1 means H_M[t][j] = +1.  These are only used
+// to verify H · H^T = M · I in tests; the kernel inlines the same constants
+// as `stack_store` arguments (the DSL has no compile-time loop over Rust
+// arrays, so each M gets its own monomorphized `#[kernel]` fn).
+#[cfg(test)]
 const H12_SIGNS: [u32; 12] = [4093, 1364, 3127, 1681, 223, 2629, 883, 2329, 3523, 1129, 1807, 421];
 
-// ── H_20 sign-bit encoding ─────────────────────────────────────────────────
-//
-// Derived from `mlx/backend/common/hadamard.h` `h20` string.
-// Verified: H_20 · H_20^T = 20 · I.
+#[cfg(test)]
 const H20_SIGNS: [u32; 20] = [
     445473, 859202, 702596, 389384, 747024, 641086, 234589, 469147, 938263, 828943, 984492, 953176,
     889521, 762211, 508614, 34194, 68357, 135722, 270452, 540873,
 ];
 
-// ── H_28 sign-bit encoding ─────────────────────────────────────────────────
-//
-// Derived from `mlx/backend/common/hadamard.h` `h28` string.
-// Verified: H_28 · H_28^T = 28 · I.
+#[cfg(test)]
 const H28_SIGNS: [u32; 28] = [
     53043585, 106070914, 210061060, 153783816, 41229328, 80377888, 160739520, 79265980, 156451192,
     44483185, 88966243, 177932359, 87445519, 172810270, 125848794, 251697461, 237056618, 207758549,
@@ -85,184 +67,181 @@ const H28_SIGNS: [u32; 28] = [
     135812787,
 ];
 
+// One #[kernel] per M — each has its own compile-time sign table seed.
+// The 12/20/28 unrolled `stack_store("signs", j, sign[j])` calls are the
+// reason we can't share a single DSL function: there's no compile-time
+// loop over Rust constants in the DSL.
+
+/// M=12 specialization. Sign table = `H12_SIGNS`.
+#[kernel]
+pub fn mt_hadamard_m12<T>(inp: Tensor<T>, mut out: Tensor<T>, #[constexpr] scale: f32) {
+    threadgroup_alloc("buf", 12u32, f32);
+    stack_alloc("signs", 12u32, "u32");
+    stack_store("signs", 0u32, 4093u32);
+    stack_store("signs", 1u32, 1364u32);
+    stack_store("signs", 2u32, 3127u32);
+    stack_store("signs", 3u32, 1681u32);
+    stack_store("signs", 4u32, 223u32);
+    stack_store("signs", 5u32, 2629u32);
+    stack_store("signs", 6u32, 883u32);
+    stack_store("signs", 7u32, 2329u32);
+    stack_store("signs", 8u32, 3523u32);
+    stack_store("signs", 9u32, 1129u32);
+    stack_store("signs", 10u32, 1807u32);
+    stack_store("signs", 11u32, 421u32);
+
+    let t = simd_lane;
+    let row = tgid_x;
+    let base = row * 12u32;
+    let tg = base + t;
+
+    let inp_f = load(inp[tg]).cast::<f32>();
+    threadgroup_store("buf", t, inp_f);
+    threadgroup_barrier();
+
+    let signs_t = stack_load("signs", t);
+    let mut acc = 0.0f32;
+    for j in range(0u32, 12u32, 1u32) {
+        let bit = ((signs_t >> j) & 1u32).cast::<f32>();
+        let sign = 2.0f32 * bit - 1.0f32; // ∈ {−1, +1}
+        let buf_j = threadgroup_load("buf", j);
+        acc = acc + sign * buf_j;
+    }
+
+    let scaled = acc * scale;
+    store(out[tg], scaled.cast::<T>());
+}
+
+/// M=20 specialization. Sign table = `H20_SIGNS`.
+#[kernel]
+pub fn mt_hadamard_m20<T>(inp: Tensor<T>, mut out: Tensor<T>, #[constexpr] scale: f32) {
+    threadgroup_alloc("buf", 20u32, f32);
+    stack_alloc("signs", 20u32, "u32");
+    stack_store("signs", 0u32, 445473u32);
+    stack_store("signs", 1u32, 859202u32);
+    stack_store("signs", 2u32, 702596u32);
+    stack_store("signs", 3u32, 389384u32);
+    stack_store("signs", 4u32, 747024u32);
+    stack_store("signs", 5u32, 641086u32);
+    stack_store("signs", 6u32, 234589u32);
+    stack_store("signs", 7u32, 469147u32);
+    stack_store("signs", 8u32, 938263u32);
+    stack_store("signs", 9u32, 828943u32);
+    stack_store("signs", 10u32, 984492u32);
+    stack_store("signs", 11u32, 953176u32);
+    stack_store("signs", 12u32, 889521u32);
+    stack_store("signs", 13u32, 762211u32);
+    stack_store("signs", 14u32, 508614u32);
+    stack_store("signs", 15u32, 34194u32);
+    stack_store("signs", 16u32, 68357u32);
+    stack_store("signs", 17u32, 135722u32);
+    stack_store("signs", 18u32, 270452u32);
+    stack_store("signs", 19u32, 540873u32);
+
+    let t = simd_lane;
+    let row = tgid_x;
+    let base = row * 20u32;
+    let tg = base + t;
+
+    let inp_f = load(inp[tg]).cast::<f32>();
+    threadgroup_store("buf", t, inp_f);
+    threadgroup_barrier();
+
+    let signs_t = stack_load("signs", t);
+    let mut acc = 0.0f32;
+    for j in range(0u32, 20u32, 1u32) {
+        let bit = ((signs_t >> j) & 1u32).cast::<f32>();
+        let sign = 2.0f32 * bit - 1.0f32;
+        let buf_j = threadgroup_load("buf", j);
+        acc = acc + sign * buf_j;
+    }
+
+    let scaled = acc * scale;
+    store(out[tg], scaled.cast::<T>());
+}
+
+/// M=28 specialization. Sign table = `H28_SIGNS`.
+#[kernel]
+pub fn mt_hadamard_m28<T>(inp: Tensor<T>, mut out: Tensor<T>, #[constexpr] scale: f32) {
+    threadgroup_alloc("buf", 28u32, f32);
+    stack_alloc("signs", 28u32, "u32");
+    stack_store("signs", 0u32, 53043585u32);
+    stack_store("signs", 1u32, 106070914u32);
+    stack_store("signs", 2u32, 210061060u32);
+    stack_store("signs", 3u32, 153783816u32);
+    stack_store("signs", 4u32, 41229328u32);
+    stack_store("signs", 5u32, 80377888u32);
+    stack_store("signs", 6u32, 160739520u32);
+    stack_store("signs", 7u32, 79265980u32);
+    stack_store("signs", 8u32, 156451192u32);
+    stack_store("signs", 9u32, 44483185u32);
+    stack_store("signs", 10u32, 88966243u32);
+    stack_store("signs", 11u32, 177932359u32);
+    stack_store("signs", 12u32, 87445519u32);
+    stack_store("signs", 13u32, 172810270u32);
+    stack_store("signs", 14u32, 125848794u32);
+    stack_store("signs", 15u32, 251697461u32);
+    stack_store("signs", 16u32, 237056618u32);
+    stack_store("signs", 17u32, 207758549u32);
+    stack_store("signs", 18u32, 149162411u32);
+    stack_store("signs", 19u32, 31986518u32);
+    stack_store("signs", 20u32, 63972909u32);
+    stack_store("signs", 21u32, 3206502u32);
+    stack_store("signs", 22u32, 4315853u32);
+    stack_store("signs", 23u32, 8631579u32);
+    stack_store("signs", 24u32, 17246902u32);
+    stack_store("signs", 25u32, 34477548u32);
+    stack_store("signs", 26u32, 68954969u32);
+    stack_store("signs", 27u32, 135812787u32);
+
+    let t = simd_lane;
+    let row = tgid_x;
+    let base = row * 28u32;
+    let tg = base + t;
+
+    let inp_f = load(inp[tg]).cast::<f32>();
+    threadgroup_store("buf", t, inp_f);
+    threadgroup_barrier();
+
+    let signs_t = stack_load("signs", t);
+    let mut acc = 0.0f32;
+    for j in range(0u32, 28u32, 1u32) {
+        let bit = ((signs_t >> j) & 1u32).cast::<f32>();
+        let sign = 2.0f32 * bit - 1.0f32;
+        let buf_j = threadgroup_load("buf", j);
+        acc = acc + sign * buf_j;
+    }
+
+    let scaled = acc * scale;
+    store(out[tg], scaled.cast::<T>());
+}
+
 /// Build the kernel IR for `mt_hadamard_m{M}` with M ∈ {12, 20, 28}.
-///
-/// The caller selects M at build time. Dispatch:
-///   `grid = [n_rows, 1, 1]`, `tpg = [M, 1, 1]`, `KernelMode::Reduction`.
-/// where `n_rows = total_elements / M`.
-///
-/// Constexpr `scale: f32` is passed as a 4-byte LE buffer under key `"scale"`.
-#[allow(unused_assignments)] // final nv!() bumps vid past last read — by design
+/// Dispatches to the appropriate monomorphized DSL function.
 pub fn kernel_ir_for(m: u32, dt: DType) -> Kernel {
     assert!(matches!(m, 12 | 20 | 28), "mt_hadamard_m only supports M ∈ {{12, 20, 28}}, got {m}");
     assert!(
         matches!(dt, DType::F32 | DType::F16 | DType::BF16),
         "mt_hadamard_m only supports F32/F16/BF16, got {dt:?}"
     );
-
-    let signs: &[u32] = match m {
-        12 => &H12_SIGNS,
-        20 => &H20_SIGNS,
-        28 => &H28_SIGNS,
+    match m {
+        12 => mt_hadamard_m12::kernel_ir_for(dt),
+        20 => mt_hadamard_m20::kernel_ir_for(dt),
+        28 => mt_hadamard_m28::kernel_ir_for(dt),
         _ => unreachable!(),
-    };
-
-    let name = format!("mt_hadamard_m{m}");
-    let mut k = Kernel::new(&name);
-    k.mode = KernelMode::Reduction;
-
-    // inp: read-only M-element vectors (batch × M).
-    k.params.push(Param {
-        name: "inp".into(),
-        dtype: dt,
-        shape: Shape::new([Dim::Any]),
-        is_output: false,
-        kind: ParamKind::Tensor,
-    });
-    // out: write-only, same shape.
-    k.params.push(Param {
-        name: "out".into(),
-        dtype: dt,
-        shape: Shape::new([Dim::Any]),
-        is_output: true,
-        kind: ParamKind::Tensor,
-    });
-
-    // scale: f32 constexpr.
-    k.constexprs.push(ConstExprDecl {
-        name: ConstExpr::new("scale"),
-        dtype: DType::F32,
-        value: None,
-    });
-
-    k.return_shapes.push(Shape::new([Dim::Any]));
-
-    let mut vid: u32 = 0;
-    macro_rules! nv {
-        () => {{
-            let id = ValueId::new(vid);
-            vid += 1;
-            id
-        }};
     }
-    macro_rules! bop {
-        ($op:ident, $l:expr, $r:expr) => {
-            Op::BinOp { op: BinOpKind::$op, lhs: $l, rhs: $r }
-        };
-    }
-
-    let mut b = Block::new(BlockId::new(0));
-
-    // Thread-private sign table + threadgroup staging buffer.
-    b.push_op_no_result(Op::StackAlloc { dtype: DType::U32, size: m, name: "signs".into() });
-    b.push_op_no_result(Op::ThreadgroupAlloc { dtype: DType::F32, size: m, name: "buf".into() });
-
-    let c1 = nv!();
-    b.push_op(Op::Const { value: 1 }, c1);
-    let v_one_f = nv!();
-    b.push_op(Op::Cast { value: c1, dtype: DType::F32 }, v_one_f);
-
-    // Per-index constants j ∈ 0..M — reused for the shift amount, the buf
-    // index, and the signs-table slot.
-    let mut cj: Vec<ValueId> = Vec::with_capacity(m as usize);
-    for j in 0..m {
-        let c = nv!();
-        b.push_op(Op::Const { value: j as i64 }, c);
-        cj.push(c);
-    }
-
-    // Seed the per-thread sign table with the M compile-time row masks.
-    for (j, &c) in cj.iter().enumerate() {
-        let cs = nv!();
-        b.push_op(Op::Const { value: signs[j] as i64 }, cs);
-        b.push_op_no_result(Op::StackStore { name: "signs".into(), index: c, value: cs });
-    }
-
-    // row = tgid_x, t = thread-in-threadgroup (== simd_lane for M < 32).
-    let v_row = nv!();
-    b.push_op(Op::ProgramId { axis: 0 }, v_row);
-    let v_t = nv!();
-    b.push_op(Op::Load { src: "simd_lane".into(), indices: vec![], mask: None, other: None }, v_t);
-
-    // base = row * M, global element index = base + t.
-    let v_m = nv!();
-    b.push_op(Op::Const { value: m as i64 }, v_m);
-    let v_base = nv!();
-    b.push_op(bop!(Mul, v_row, v_m), v_base);
-    let v_tg = nv!();
-    b.push_op(bop!(Add, v_base, v_t), v_tg);
-
-    // Phase 1: load this thread's element into the TG buffer (promote to f32).
-    let v_inp = nv!();
-    b.push_op(
-        Op::Load {
-            src: "inp".into(),
-            indices: vec![IndexExpr::Value(v_tg)],
-            mask: None,
-            other: None,
-        },
-        v_inp,
-    );
-    let v_inp_f = nv!();
-    b.push_op(Op::Cast { value: v_inp, dtype: DType::F32 }, v_inp_f);
-    b.push_op_no_result(Op::ThreadgroupStore { name: "buf".into(), index: v_t, value: v_inp_f });
-    b.push_op_no_result(Op::Barrier);
-
-    // Phase 2: acc = Σ_j H_M[t][j] · buf[j], fully unrolled (M ≤ 28).
-    // sign(t,j) = ((signs[t] >> j) & 1) ? +1 : -1 = 2·bit − 1 in f32.
-    let v_signs_t = nv!();
-    b.push_op(Op::StackLoad { name: "signs".into(), index: v_t }, v_signs_t);
-
-    let mut acc: Option<ValueId> = None;
-    for &c in &cj {
-        let v_shifted = nv!();
-        b.push_op(bop!(Shr, v_signs_t, c), v_shifted);
-        let v_bit = nv!();
-        b.push_op(bop!(BitAnd, v_shifted, c1), v_bit);
-        let v_bitf = nv!();
-        b.push_op(Op::Cast { value: v_bit, dtype: DType::F32 }, v_bitf);
-        // sign = bitf + bitf − 1.0  (∈ {−1, +1}).
-        let v_two_bitf = nv!();
-        b.push_op(bop!(Add, v_bitf, v_bitf), v_two_bitf);
-        let v_sign = nv!();
-        b.push_op(bop!(Sub, v_two_bitf, v_one_f), v_sign);
-        let v_bufj = nv!();
-        b.push_op(Op::ThreadgroupLoad { name: "buf".into(), index: c }, v_bufj);
-        let v_term = nv!();
-        b.push_op(bop!(Mul, v_sign, v_bufj), v_term);
-        acc = Some(match acc {
-            None => v_term,
-            Some(prev) => {
-                let v_acc = nv!();
-                b.push_op(bop!(Add, prev, v_term), v_acc);
-                v_acc
-            },
-        });
-    }
-    let v_acc = acc.expect("M >= 1");
-
-    // Phase 3: scale and store.
-    let v_scale = nv!();
-    b.push_op(Op::Load { src: "scale".into(), indices: vec![], mask: None, other: None }, v_scale);
-    let v_scaled = nv!();
-    b.push_op(bop!(Mul, v_acc, v_scale), v_scaled);
-    let v_out = nv!();
-    b.push_op(Op::Cast { value: v_scaled, dtype: dt }, v_out);
-    b.push_op_no_result(Op::Store {
-        dst: "out".into(),
-        indices: vec![IndexExpr::Value(v_tg)],
-        value: v_out,
-        mask: None,
-    });
-
-    k.body = b;
-    k.sync_entry_block();
-    k
 }
+
+// Keep `BenchDType` referenced so the `use` survives even when no
+// inventory submit needs it (the inventory is registered per-M below).
+const _: &[BenchDType] = &[BenchDType::F32, BenchDType::F16, BenchDType::BF16];
 
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)] // index loops mirror the H_m matrix math
 mod tests {
+    use metaltile_codegen::msl::MslGenerator;
+    use metaltile_core::ir::Op;
+
     use super::*;
 
     #[test]
@@ -278,11 +257,11 @@ mod tests {
                 assert!(k.params[1].is_output);
                 assert_eq!(k.constexprs.len(), 1);
                 assert_eq!(k.constexprs[0].name.name(), "scale");
-                // Body is DSL IR — no InlineMsl — with the sign table as a
-                // StackAlloc seeded by StackStore.
-                assert!(!k.body.ops.iter().any(|op| matches!(op, Op::InlineMsl { .. })));
-                assert!(k.body.ops.iter().any(|op| matches!(op, Op::StackAlloc { .. })));
-                assert!(k.body.ops.iter().any(|op| matches!(op, Op::StackLoad { .. })));
+                let all_ops =
+                    || std::iter::once(&k.body).chain(k.blocks.values()).flat_map(|b| b.ops.iter());
+                assert!(!all_ops().any(|op| matches!(op, Op::InlineMsl { .. })));
+                assert!(all_ops().any(|op| matches!(op, Op::StackAlloc { .. })));
+                assert!(all_ops().any(|op| matches!(op, Op::StackLoad { .. })));
             }
         }
     }
@@ -294,13 +273,20 @@ mod tests {
     /// Codegen sanity — the generated MSL builds and carries the sign table.
     #[test]
     fn codegen_emits_kernel_decl() {
-        use metaltile_codegen::msl::MslGenerator;
         for m in [12u32, 20, 28] {
-            let mut k = kernel_ir_for(m, DType::F32);
-            k.name = format!("mt_hadamard_m{m}_f32");
-            let msl = MslGenerator::default().generate(&k).expect("codegen");
-            assert!(msl.contains(&format!("kernel void mt_hadamard_m{m}_f32")));
-            assert!(!msl.contains("InlineMsl"));
+            for dt in [DType::F32, DType::F16, DType::BF16] {
+                let mut k = kernel_ir_for(m, dt);
+                let suffix = match dt {
+                    DType::F32 => "f32",
+                    DType::F16 => "f16",
+                    DType::BF16 => "bf16",
+                    _ => unreachable!(),
+                };
+                k.name = format!("mt_hadamard_m{m}_{suffix}");
+                let msl = MslGenerator::default().generate(&k).expect("codegen");
+                assert!(msl.contains(&format!("kernel void mt_hadamard_m{m}_{suffix}")));
+                assert!(!msl.contains("InlineMsl"));
+            }
         }
     }
 

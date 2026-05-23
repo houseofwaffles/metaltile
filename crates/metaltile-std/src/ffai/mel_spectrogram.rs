@@ -44,9 +44,13 @@ use metaltile::kernel;
 use metaltile_core::ir::KernelMode;
 
 use crate::{
-    bench_types::DType,
+    bench_types::{DType, FLOAT_DTYPES},
     spec::{BenchDispatch, BenchSpec},
 };
+
+// Keep `DType` referenced so the import survives — the inventory submits
+// use `FLOAT_DTYPES` directly now that all three kernels carry bf16.
+const _: DType = DType::F32;
 
 #[kernel]
 pub fn mel_spectrogram<T>(
@@ -104,7 +108,7 @@ inventory::submit! {
         subop: "mel_spectrogram",
         kernel_name: "mel_spectrogram",
         kernel_ir: mel_spectrogram::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16],
+        dtypes: FLOAT_DTYPES,
         tol: 1e-3,
         mlx_src: None,
         mlx_pattern: None,
@@ -160,7 +164,7 @@ inventory::submit! {
         subop: "stft_window",
         kernel_name: "mel_stft_window",
         kernel_ir: mel_stft_window::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16],
+        dtypes: FLOAT_DTYPES,
         tol: 1e-3,
         mlx_src: None,
         mlx_pattern: None,
@@ -212,7 +216,7 @@ inventory::submit! {
         subop: "filterbank",
         kernel_name: "mel_filterbank",
         kernel_ir: mel_filterbank::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16],
+        dtypes: FLOAT_DTYPES,
         tol: 1e-3,
         mlx_src: None,
         mlx_pattern: None,

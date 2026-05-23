@@ -26,6 +26,10 @@ use metaltile_std::ffai::{
 
 fn f32_slice_to_bytes(vals: &[f32]) -> Vec<u8> { pack_bytes(vals, Dt::F32) }
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> { unpack_bytes(bytes, Dt::F32) }
+// `bytes_to_bf16_vec` was used by the old f32-partials / bf16-output
+// path; the kernels are generic over `T` now, so the pair test runs
+// f32 end-to-end (the bf16 narrow-write is exercised by aura_flash_sdpa).
+#[allow(dead_code)]
 fn bytes_to_bf16_vec(bytes: &[u8]) -> Vec<f32> { unpack_bytes(bytes, Dt::Bf16) }
 
 fn pack_int_indices(
@@ -201,16 +205,20 @@ fn aura_flash_pair_matches_naive_reference_kb4_vb2_d128() {
     let _m_p = bytes_to_f32_vec(m_partials_bytes);
     let _l_p = bytes_to_f32_vec(l_partials_bytes);
 
-    // ── Pass 2: merge partials, normalise, write bf16 output ──────
+    // ── Pass 2: merge partials, normalise, write f32 output ──────
+    // Both p1 and pass2 are generic over T; for this end-to-end
+    // numerical-stability check we keep T = F32 throughout. The bf16
+    // narrow-write path is exercised separately by the typed
+    // `aura_flash_sdpa` correctness test.
     let mut p2_buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     p2_buffers.insert("o_partials".into(), o_partials_bytes.clone());
     p2_buffers.insert("m_partials".into(), m_partials_bytes.clone());
     p2_buffers.insert("l_partials".into(), l_partials_bytes.clone());
-    p2_buffers.insert("output".into(), vec![0u8; q_heads * dim * 2]); // bf16
+    p2_buffers.insert("output".into(), vec![0u8; q_heads * dim * 4]); // f32
     p2_buffers.insert("dim".into(), (dim as u32).to_le_bytes().to_vec());
     p2_buffers.insert("num_blocks".into(), (num_blocks as u32).to_le_bytes().to_vec());
 
-    let mut p2_kernel = aura_flash_pass2_d128::kernel_ir_for(DType::BF16);
+    let mut p2_kernel = aura_flash_pass2_d128::kernel_ir_for(DType::F32);
     p2_kernel.mode = KernelMode::Reduction;
 
     // One TG per q_idx, 32 threads/TG (1 simdgroup).
@@ -219,12 +227,10 @@ fn aura_flash_pair_matches_naive_reference_kb4_vb2_d128() {
         .expect("flash_pass2 dispatch should succeed");
 
     let output_bytes = p2_result.outputs.get("output").expect("`output` buffer");
-    let actual = bytes_to_bf16_vec(output_bytes);
+    let actual = bytes_to_f32_vec(output_bytes);
 
-    // bf16 has 7 bits of mantissa → relative error ~1/256 ≈ 4e-3.
-    // We also accumulate over `tokens=8` softmax weights so the
-    // absolute tolerance has to be generous; 5e-2 is comfortable but
-    // catches any real shape bug.
+    // f32 output: tight tolerance (the only rounding is from the
+    // compressed-domain dequant + per-token softmax accumulation).
     let diff = max_abs_diff(&expected, &actual);
-    assert!(diff < 5e-2, "aura_flash kb4 vb2 d128: max |diff| = {diff:.2e} (expected < 5e-2)",);
+    assert!(diff < 1e-4, "aura_flash kb4 vb2 d128: max |diff| = {diff:.2e} (expected < 1e-4)",);
 }

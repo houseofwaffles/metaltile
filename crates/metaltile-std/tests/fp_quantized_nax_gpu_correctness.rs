@@ -27,7 +27,7 @@ mod common;
 use common::gpu_lock;
 use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_runtime::Context;
-use metaltile_std::mlx::fp_quantized_nax;
+use metaltile_std::mlx::fp_quantized_nax::mt_fp_qmm_nax;
 
 /// fp4 quantization group size — must match `GROUP_SIZE` in the kernel.
 const GROUP_SIZE: usize = 32;
@@ -97,7 +97,7 @@ fn run_fp_qmm_nax(
     buffers.insert("n".into(), (n as u32).to_le_bytes().to_vec());
     buffers.insert("gs_per_row".into(), (gs_per_row as u32).to_le_bytes().to_vec());
 
-    let mut kernel = fp_quantized_nax::kernel_ir_for(dtype);
+    let mut kernel = mt_fp_qmm_nax::kernel_ir_for(dtype);
     kernel.mode = KernelMode::Reduction;
 
     let result = ctx

@@ -66,11 +66,14 @@ use metaltile::kernel;
 use metaltile_core::ir::KernelMode;
 
 use crate::{
-    bench_types::DType,
+    bench_types::{DType, FLOAT_DTYPES},
     spec::{BenchDispatch, BenchSpec},
 };
 
-const F32_ONLY: &[DType] = &[DType::F32];
+// Keep `DType` referenced for the inventory submit; `FLOAT_DTYPES`
+// supersedes the old `F32_ONLY` shortlist now that the kernel handles
+// fp32/fp16/bf16 via the generic `T` I/O dtype.
+const _: DType = DType::F32;
 
 macro_rules! aura_flash_p1_kernel {
     (
@@ -85,16 +88,16 @@ macro_rules! aura_flash_p1_kernel {
     ) => {
         #[kernel]
         pub fn $name<T>(
-            q_rot: Tensor<f32>,
+            q_rot: Tensor<T>,
             key_packed: Tensor<u32>,
-            key_norms: Tensor<f32>,
-            key_codebook: Tensor<f32>,
+            key_norms: Tensor<T>,
+            key_codebook: Tensor<T>,
             val_packed: Tensor<u32>,
-            val_norms: Tensor<f32>,
-            val_codebook: Tensor<f32>,
-            mut o_partials: Tensor<f32>,
-            mut m_partials: Tensor<f32>,
-            mut l_partials: Tensor<f32>,
+            val_norms: Tensor<T>,
+            val_codebook: Tensor<T>,
+            mut o_partials: Tensor<T>,
+            mut m_partials: Tensor<T>,
+            mut l_partials: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] key_packed_width: u32,
             #[constexpr] value_packed_width: u32,
@@ -132,21 +135,21 @@ macro_rules! aura_flash_p1_kernel {
             // across the inner per-token loop.
             stack_alloc("key_cb", $key_levels, "f32");
             for i in range(0u32, $key_levels, 1u32) {
-                stack_store("key_cb", i, load(key_codebook[i]));
+                stack_store("key_cb", i, load(key_codebook[i]).cast::<f32>());
             }
             stack_alloc("val_cb", $value_levels, "f32");
             for i in range(0u32, $value_levels, 1u32) {
-                stack_store("val_cb", i, load(val_codebook[i]));
+                stack_store("val_cb", i, load(val_codebook[i]).cast::<f32>());
             }
 
             // ── Per-lane slice of the rotated query vector — held in
             // stack registers, loaded once.  Trailing lanes whose
             // `d >= dim` get zero so the dot product treats them as a
-            // no-op.
+            // no-op. Loaded as T and promoted to f32 for compute.
             stack_alloc("q_vals", $dims_per_lane, "f32");
             for i in range(0u32, $dims_per_lane, 1u32) {
                 let d = lane + i * 32u32;
-                let v = select(d < dim, load(q_rot[q_idx * dim + d]), 0.0f32);
+                let v = select(d < dim, load(q_rot[q_idx * dim + d]).cast::<f32>(), 0.0f32);
                 stack_store("q_vals", i, v);
             }
 
@@ -163,7 +166,7 @@ macro_rules! aura_flash_p1_kernel {
             // ── Per-token inner loop ───────────────────────────────────
             for t in range(t_start, t_end, 1u32) {
                 let k_packed_row = (kv_idx * tokens + t) * key_packed_width;
-                let k_norm = load(key_norms[kv_idx * tokens + t]);
+                let k_norm = load(key_norms[kv_idx * tokens + t]).cast::<f32>();
 
                 // Q · K via compressed-domain dot — bit-extract per dim,
                 // lookup centroid in cached key_cb, accumulate against the
@@ -203,7 +206,7 @@ macro_rules! aura_flash_p1_kernel {
                 // the running output via the standard online-softmax
                 // rescale-then-add.
                 let v_packed_row = (kv_idx * tokens + t) * value_packed_width;
-                let v_norm = load(val_norms[kv_idx * tokens + t]);
+                let v_norm = load(val_norms[kv_idx * tokens + t]).cast::<f32>();
 
                 for i in range(0u32, $dims_per_lane, 1u32) {
                     let d = lane + i * 32u32;
@@ -233,18 +236,18 @@ macro_rules! aura_flash_p1_kernel {
                 m_acc = new_m;
             }
 
-            // ── Write per-block partials ───────────────────────────────
+            // ── Write per-block partials (cast f32 → T on store) ───────
             let partial_base = (q_idx * num_blocks + block_idx) * dim;
             for i in range(0u32, $dims_per_lane, 1u32) {
                 let d = lane + i * 32u32;
                 if d < dim {
-                    store(o_partials[partial_base + d], stack_load("o", i));
+                    store(o_partials[partial_base + d], stack_load("o", i).cast::<T>());
                 }
             }
             if lane == 0u32 {
                 let ml_idx = q_idx * num_blocks + block_idx;
-                store(m_partials[ml_idx], m_acc);
-                store(l_partials[ml_idx], l_acc);
+                store(m_partials[ml_idx], m_acc.cast::<T>());
+                store(l_partials[ml_idx], l_acc.cast::<T>());
             }
         }
 
@@ -254,7 +257,7 @@ macro_rules! aura_flash_p1_kernel {
                 subop: $subop,
                 kernel_name: stringify!($name),
                 kernel_ir: $name::kernel_ir_for,
-                dtypes: F32_ONLY,
+                dtypes: FLOAT_DTYPES,
                 tol: 0.0,
                 mlx_src: None,
                 mlx_pattern: None,

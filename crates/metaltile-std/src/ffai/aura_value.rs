@@ -31,21 +31,23 @@ use metaltile::kernel;
 use metaltile_core::ir::KernelMode;
 
 use crate::{
-    bench_types::DType,
+    bench_types::{DType, FLOAT_DTYPES},
     spec::{BenchDispatch, BenchSpec},
 };
 
-const F32_ONLY: &[DType] = &[DType::F32];
+// Keep `DType` referenced — `FLOAT_DTYPES` is the production shortlist now
+// that the kernel is generic over `T` (fp32/fp16/bf16) for its I/O dtype.
+const _: DType = DType::F32;
 
 macro_rules! aura_value_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
         #[kernel]
         pub fn $name<T>(
-            weights: Tensor<f32>,
+            weights: Tensor<T>,
             packed: Tensor<u32>,
-            norms: Tensor<f32>,
-            codebook: Tensor<f32>,
-            mut output: Tensor<f32>,
+            norms: Tensor<T>,
+            codebook: Tensor<T>,
+            mut output: Tensor<T>,
             #[constexpr] dim: u32,
             #[constexpr] packed_width: u32,
             #[constexpr] tokens: u32,
@@ -69,9 +71,9 @@ macro_rules! aura_value_kernel {
 
             let mut acc = 0.0f32;
             for t in range(0u32, tokens, 1u32) {
-                let w = load(weights[head_idx * tokens + t]);
+                let w = load(weights[head_idx * tokens + t]).cast::<f32>();
                 if w >= sparse_threshold {
-                    let norm_val = load(norms[kv_head * tokens + t]);
+                    let norm_val = load(norms[kv_head * tokens + t]).cast::<f32>();
                     let packed_row = (kv_head * tokens + t) * packed_width;
 
                     let w0 = load(packed[packed_row + word_idx]);
@@ -81,12 +83,12 @@ macro_rules! aura_value_kernel {
                     let hi = (w1 & ((1u32 << spill) - 1u32)) << lo_bits;
                     let value = (lo | hi) & mask;
 
-                    let centroid = load(codebook[value]);
+                    let centroid = load(codebook[value]).cast::<f32>();
                     acc = acc + w * norm_val * centroid;
                 }
             }
 
-            store(output[head_idx * dim + d], acc);
+            store(output[head_idx * dim + d], acc.cast::<T>());
         }
 
         inventory::submit! {
@@ -95,7 +97,7 @@ macro_rules! aura_value_kernel {
                 subop: $subop,
                 kernel_name: stringify!($name),
                 kernel_ir: $name::kernel_ir_for,
-                dtypes: F32_ONLY,
+                dtypes: FLOAT_DTYPES,
                 tol: 0.0,
                 mlx_src: None,
                 mlx_pattern: None,

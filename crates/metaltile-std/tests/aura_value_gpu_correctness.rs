@@ -26,8 +26,10 @@ use metaltile_core::{dtype::DType, ir::KernelMode};
 use metaltile_runtime::Context;
 use metaltile_std::ffai::aura_value::aura_value_int4;
 
-fn f32_slice_to_bytes(vals: &[f32]) -> Vec<u8> { pack_bytes(vals, Dt::F32) }
-fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> { unpack_bytes(bytes, Dt::F32) }
+// Kept for the const-DType reference in `_unused_dtype` below; the
+// dispatch path uses `dt.to_dtype()` directly.
+#[allow(dead_code)]
+fn _unused_dtype() -> DType { DType::F32 }
 
 /// Bit-pack a flat `[kv_heads, tokens, dim]` int4 index array into
 /// `[kv_heads, tokens, packed_width]` u32 words. Mirrors what
@@ -87,12 +89,14 @@ fn naive_aura_value(
 }
 
 /// Run the kernel for one configuration and assert it matches the
-/// naive CPU reference within fp32 tolerance.
+/// naive CPU reference within the per-dtype tolerance.
 fn run_aura_value_case(
     q_heads: usize,
     kv_heads: usize,
     tokens: usize,
     sparse_threshold: f32,
+    dt: Dt,
+    tol: f32,
     label: &str,
 ) {
     let bits = 4usize;
@@ -122,11 +126,17 @@ fn run_aura_value_case(
         })
         .collect();
 
+    // Round inputs through the kernel dtype so the CPU oracle matches.
+    let round_in = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| dt.round(x)).collect() };
+    let codebook_r = round_in(&codebook);
+    let norms_r = round_in(&norms);
+    let weights_r = round_in(&weights);
+
     let expected = naive_aura_value(
-        &weights,
+        &weights_r,
         &indices,
-        &norms,
-        &codebook,
+        &norms_r,
+        &codebook_r,
         q_heads,
         kv_heads,
         tokens,
@@ -135,11 +145,11 @@ fn run_aura_value_case(
     );
 
     let mut buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    buffers.insert("weights".into(), f32_slice_to_bytes(&weights));
+    buffers.insert("weights".into(), pack_bytes(&weights_r, dt));
     buffers.insert("packed".into(), pack_u32_bytes(&packed));
-    buffers.insert("norms".into(), f32_slice_to_bytes(&norms));
-    buffers.insert("codebook".into(), f32_slice_to_bytes(&codebook));
-    buffers.insert("output".into(), vec![0u8; q_heads * dim * 4]);
+    buffers.insert("norms".into(), pack_bytes(&norms_r, dt));
+    buffers.insert("codebook".into(), pack_bytes(&codebook_r, dt));
+    buffers.insert("output".into(), pack_bytes(&vec![0.0_f32; q_heads * dim], dt));
     buffers.insert("dim".into(), (dim as u32).to_le_bytes().to_vec());
     buffers.insert("packed_width".into(), (packed_width as u32).to_le_bytes().to_vec());
     buffers.insert("tokens".into(), (tokens as u32).to_le_bytes().to_vec());
@@ -147,7 +157,7 @@ fn run_aura_value_case(
     buffers.insert("sparse_threshold".into(), sparse_threshold.to_le_bytes().to_vec());
 
     let ctx = Context::new().expect("Context::new should succeed on macOS");
-    let mut kernel = aura_value_int4::kernel_ir_for(DType::F32);
+    let mut kernel = aura_value_int4::kernel_ir_for(dt.to_dtype());
     kernel.mode = KernelMode::Grid3D;
 
     // Grid3D: gid.x = d, gid.y = q_head. One thread per output element;
@@ -157,26 +167,24 @@ fn run_aura_value_case(
         .expect("dispatch_with_grid should succeed");
 
     let out_bytes = result.outputs.get("output").expect("`output` buffer in dispatch result");
-    let actual = bytes_to_f32_vec(out_bytes);
+    let actual = unpack_bytes(out_bytes, dt);
 
     let diff = max_abs_diff(&expected, &actual);
-    // Sequential per-thread token accumulation in both kernel and
-    // reference — only fp32 rounding drift, no simd-reorder noise.
-    assert!(diff < 1e-5, "aura_value int4 [{label}]: max |diff| = {diff:.2e}");
+    assert!(diff < tol, "aura_value int4 [{label}]: max |diff| = {diff:.2e} > {tol:.0e}");
 }
 
 #[test]
 fn aura_value_int4_mha_matches_naive_reference_f32() {
     // MHA: repeat_count = 1, no GQA fan-out. sparse_threshold = 0 so
     // every token contributes (covers the dense aggregation path).
-    run_aura_value_case(4, 4, 8, 0.0, "mha dense");
+    run_aura_value_case(4, 4, 8, 0.0, Dt::F32, 1e-5, "mha dense f32");
 }
 
 #[test]
 fn aura_value_int4_gqa_matches_naive_reference_f32() {
     // GQA: 8 q_heads over 2 kv_heads → repeat_count = 4. Exercises the
     // `kv_head = q_head / repeat_count` index mapping.
-    run_aura_value_case(8, 2, 8, 0.0, "gqa dense");
+    run_aura_value_case(8, 2, 8, 0.0, Dt::F32, 1e-5, "gqa dense f32");
 }
 
 #[test]
@@ -185,5 +193,18 @@ fn aura_value_int4_sparse_threshold_skips_tokens_f32() {
     // token whose phase is 0, 1, or 2 (weight 0.0 / 0.04 / 0.08) is
     // below threshold and must be skipped. GQA repeat_count = 2 so the
     // skip branch and the GQA mapping are exercised together.
-    run_aura_value_case(4, 2, 10, 0.1, "gqa sparse");
+    run_aura_value_case(4, 2, 10, 0.1, Dt::F32, 1e-5, "gqa sparse f32");
+}
+
+#[test]
+fn aura_value_int4_mha_matches_naive_reference_f16() {
+    // f16: looser tolerance — load/store narrowing + f16 accumulation
+    // drift on the per-thread token sum.
+    run_aura_value_case(4, 4, 8, 0.0, Dt::F16, 1e-2, "mha dense f16");
+}
+
+#[test]
+fn aura_value_int4_mha_matches_naive_reference_bf16() {
+    // bf16: 7-bit mantissa, looser still than f16.
+    run_aura_value_case(4, 4, 8, 0.0, Dt::Bf16, 5e-2, "mha dense bf16");
 }
