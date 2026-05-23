@@ -14,7 +14,7 @@ use crate::{
     CliError,
     DiffArgs,
     matches_filter,
-    term::{Color, Style, paint_stderr},
+    term::{Color, Style, paint_stderr, paint_stdout},
 };
 
 pub fn run(args: &DiffArgs) -> Result<(), CliError> {
@@ -82,7 +82,7 @@ pub fn run(args: &DiffArgs) -> Result<(), CliError> {
     let outcome = render(&baseline, &current, &opts);
 
     if outcome.total_rows == 0 {
-        eprintln!(
+        println!(
             "  {}",
             paint_stderr("No matching results to diff.", Style::new().fg(Color::BrightBlack)),
         );
@@ -214,10 +214,8 @@ pub fn render(baseline: &[Value], current: &[Value], opts: &RenderOpts) -> Rende
         eprintln!("{}", paint_stderr(heading, Style::new().fg(Color::Cyan).bold()));
     }
 
-    eprintln!();
-    for row in &diff_rows {
-        print_diff_row(row);
-    }
+    println!();
+    print_diff_table(&diff_rows);
 
     print_summary(regressions, improvements, unchanged, new_rows, removed, opts.threshold);
 
@@ -287,61 +285,111 @@ fn sort_diff_rows(diff_rows: &mut [DiffRow], sort: &str) {
     }
 }
 
-fn print_diff_row(row: &DiffRow) {
-    let (op_col, shape_col) = format_op_shape(&row.op, &row.shape);
+/// Display-ready column data for one diff row, with unstyled text for
+/// width measurement and style parameters for final styling (matching
+/// bench's approach: pad text then style the whole padded string with
+/// `paint_stdout`).
+struct DiffRowDisplay {
+    op: String,       // unstyled
+    shape: String,    // unstyled
+    baseline: String, // unstyled, e.g. "104%" or "—"
+    current: String,  // unstyled, e.g. "—" or "420%"
+    delta: String,    // unstyled, e.g. "▲ +88%" or "removed"
+    baseline_style: Style,
+    current_style: Style,
+    delta_style: Style,
+}
 
-    let baseline_str = row.baseline_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "—".into());
-    let current_str = row.current_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "—".into());
-    let delta_str = match row.kind {
-        DeltaKind::New => "new".to_string(),
-        DeltaKind::Removed => "removed".to_string(),
-        _ => {
-            let arrow = match row.kind {
-                DeltaKind::Regression =>
-                    paint_stderr("▼", Style::new().fg(Color::BrightRed).bold()),
-                DeltaKind::Improvement =>
-                    paint_stderr("▲", Style::new().fg(Color::BrightGreen).bold()),
-                _ => paint_stderr("—", Style::new().fg(Color::BrightBlack)),
-            };
-            let delta = row.delta_pct.unwrap_or(0.0);
-            format!(
-                "{} {}",
-                arrow,
-                paint_stderr(format!("{:+.0}%", delta), match row.kind {
-                    DeltaKind::Regression => Style::new().fg(Color::BrightRed).bold(),
-                    DeltaKind::Improvement => Style::new().fg(Color::BrightGreen).bold(),
-                    _ => Style::new().fg(Color::BrightBlack),
-                },),
-            )
+fn build_diff_row_display(row: &DiffRow) -> DiffRowDisplay {
+    let baseline = row.baseline_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "—".into());
+    let current = row.current_pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "—".into());
+
+    // Baseline/current style — dim for new/removed, bright white otherwise
+    let (baseline_style, current_style) = match row.kind {
+        DeltaKind::New | DeltaKind::Removed =>
+            (Style::new().fg(Color::BrightBlack), Style::new().fg(Color::BrightBlack)),
+        _ => (Style::new().fg(Color::BrightWhite), Style::new().fg(Color::BrightWhite)),
+    };
+
+    // Delta column style:
+    //   green bold = improvement (▲ +88%)
+    //   red bold   = regression (▼ -35%)
+    //   yellow     = borderline / within threshold (▲ +5%, ▼ -3%)
+    //   dim        = exactly 0% (— +0%)
+    //   red        = "removed"
+    //   cyan       = "new"
+    let (delta, delta_style) = match row.kind {
+        DeltaKind::Removed => ("removed".to_string(), Style::new().fg(Color::Red)),
+        DeltaKind::New => ("new".to_string(), Style::new().fg(Color::Cyan)),
+        DeltaKind::Unchanged => {
+            let pct = row.delta_pct.unwrap_or(0.0);
+            if pct == 0.0 {
+                (format!("— {:+.0}%", pct), Style::new().fg(Color::BrightBlack))
+            } else {
+                let arrow = if pct > 0.0 { "▲" } else { "▼" };
+                (format!("{arrow} {:+.0}%", pct), Style::new().fg(Color::Yellow))
+            }
         },
-    };
-
-    let (baseline_cell, current_cell) = match row.kind {
-        DeltaKind::New | DeltaKind::Removed => (
-            paint_stderr(&baseline_str, Style::new().fg(Color::BrightBlack)),
-            paint_stderr(&current_str, Style::new().fg(Color::BrightBlack)),
-        ),
-        _ => (
-            paint_stderr(&baseline_str, Style::new().fg(Color::BrightWhite)),
-            paint_stderr(&current_str, Style::new().fg(Color::BrightWhite)),
-        ),
-    };
-
-    let sep = paint_stderr("│", Style::new().fg(Color::BrightBlack).dim());
-
-    let kind_label = match row.kind {
         DeltaKind::Regression =>
-            paint_stderr("REGRESSION", Style::new().fg(Color::BrightRed).bold()),
-        DeltaKind::Improvement => paint_stderr("improvement", Style::new().fg(Color::BrightGreen)),
-        DeltaKind::New => paint_stderr("new", Style::new().fg(Color::Cyan)),
-        DeltaKind::Removed => paint_stderr("removed", Style::new().fg(Color::BrightRed)),
-        DeltaKind::Unchanged => String::new(),
+            (format!("▼ {:+.0}%", row.delta_pct.unwrap_or(0.0)), Style::new().fg(Color::Red).bold()),
+        DeltaKind::Improvement => (
+            format!("▲ {:+.0}%", row.delta_pct.unwrap_or(0.0)),
+            Style::new().fg(Color::Green).bold(),
+        ),
     };
 
-    eprintln!(
-        "  {} {sep} {} {sep} {} → {} {sep} {}  {}",
-        op_col, shape_col, baseline_cell, current_cell, delta_str, kind_label,
-    );
+    DiffRowDisplay {
+        op: row.op.clone(),
+        shape: row.shape.clone(),
+        baseline,
+        current,
+        delta,
+        baseline_style,
+        current_style,
+        delta_style,
+    }
+}
+
+/// Print the whole diff table with aligned columns.
+fn print_diff_table(rows: &[DiffRow]) {
+    let displays: Vec<DiffRowDisplay> = rows.iter().map(build_diff_row_display).collect();
+
+    // Measure column widths from unstyled text.
+    let op_w = displays.iter().map(|d| d.op.len()).max().unwrap_or(4).max(4);
+    let shape_w = displays.iter().map(|d| d.shape.len()).max().unwrap_or(5).max(5);
+    let bl_w = displays.iter().map(|d| d.baseline.len()).max().unwrap_or(3);
+    let cur_w = displays.iter().map(|d| d.current.len()).max().unwrap_or(3);
+    let delta_w = displays.iter().map(|d| d.delta.len()).max().unwrap_or(2).max(2);
+
+    let sep = paint_stdout("│", Style::new().fg(Color::BrightBlack).dim());
+
+    // Apply style to padded text directly (matching bench's approach).
+    let op_style = Style::new().fg(Color::Cyan).bold();
+    let shape_style = Style::new().fg(Color::BrightWhite);
+
+    for d in &displays {
+        let op_styled = paint_stdout(pad_right(&d.op, op_w), op_style);
+        let shape_styled = paint_stdout(pad_right(&d.shape, shape_w), shape_style);
+        let bl_styled = paint_stdout(pad_left(&d.baseline, bl_w), d.baseline_style);
+        let cur_styled = paint_stdout(pad_left(&d.current, cur_w), d.current_style);
+        let delta_styled = paint_stdout(pad_left(&d.delta, delta_w), d.delta_style);
+
+        println!(
+            "  {op_styled} {sep} {shape_styled} {sep} {bl_styled} → {cur_styled} {sep} {delta_styled}",
+        );
+    }
+}
+
+/// Pad `s` on the right with spaces to reach `width`.
+fn pad_right(s: &str, width: usize) -> String {
+    let len = s.len();
+    if len >= width { s.to_string() } else { format!("{s}{: <len$}", "", len = width - len) }
+}
+
+/// Pad `s` on the left with spaces to reach `width`.
+fn pad_left(s: &str, width: usize) -> String {
+    let len = s.len();
+    if len >= width { s.to_string() } else { format!("{: >len$}{s}", "", len = width - len) }
 }
 
 fn print_summary(
@@ -441,12 +489,6 @@ fn build_result_map(results: &[Value]) -> HashMap<RowKey, (f64, f64)> {
     map
 }
 
-fn format_op_shape(op: &str, shape: &str) -> (String, String) {
-    let op_col = paint_stderr(format!("{op:<20}"), Style::new().fg(Color::Cyan).bold());
-    let shape_col = paint_stderr(format!("{shape:<26}"), Style::new().fg(Color::BrightWhite));
-    (op_col, shape_col)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -517,5 +559,133 @@ mod tests {
         let outcome = render(&baseline, &current, &opts);
         assert_eq!(outcome.regressions, 0);
         assert_eq!(outcome.total_rows, 1);
+    }
+
+    // ── pad_left / pad_right ─────────────────────────────────────────
+
+    #[test]
+    fn pad_left_adds_spaces() {
+        assert_eq!(pad_left("42", 5), "   42");
+    }
+
+    #[test]
+    fn pad_left_no_op_when_equal() {
+        assert_eq!(pad_left("hello", 5), "hello");
+    }
+
+    #[test]
+    fn pad_left_no_op_when_longer() {
+        assert_eq!(pad_left("hello", 3), "hello");
+    }
+
+    #[test]
+    fn pad_right_adds_spaces() {
+        assert_eq!(pad_right("ab", 4), "ab  ");
+    }
+
+    #[test]
+    fn pad_right_no_op_when_equal() {
+        assert_eq!(pad_right("rust", 4), "rust");
+    }
+
+    // ── build_diff_row_display: delta column carries all info ─────
+
+    #[test]
+    fn removed_row_shows_label_in_delta() {
+        let row = DiffRow {
+            op: "affine".into(),
+            shape: "bits=4 f32".into(),
+            baseline_pct: Some(104.0),
+            current_pct: None,
+            delta_pct: None,
+            kind: DeltaKind::Removed,
+        };
+        let d = build_diff_row_display(&row);
+        assert_eq!(d.delta, "removed");
+    }
+
+    #[test]
+    fn new_row_shows_label_in_delta() {
+        let row = DiffRow {
+            op: "new_op".into(),
+            shape: "N=64M f32".into(),
+            baseline_pct: None,
+            current_pct: Some(95.0),
+            delta_pct: None,
+            kind: DeltaKind::New,
+        };
+        let d = build_diff_row_display(&row);
+        assert_eq!(d.delta, "new");
+    }
+
+    #[test]
+    fn unchanged_zero_delta_is_dim() {
+        let row = DiffRow {
+            op: "rms_norm".into(),
+            shape: "B=1024 N=4096 f16".into(),
+            baseline_pct: Some(101.0),
+            current_pct: Some(101.0),
+            delta_pct: Some(0.0),
+            kind: DeltaKind::Unchanged,
+        };
+        let d = build_diff_row_display(&row);
+        assert_eq!(d.delta, "— +0%");
+    }
+
+    #[test]
+    fn unchanged_borderline_uses_arrow() {
+        let row = DiffRow {
+            op: "rms_norm".into(),
+            shape: "B=1024 N=4096 f32".into(),
+            baseline_pct: Some(110.0),
+            current_pct: Some(113.0),
+            delta_pct: Some(3.0),
+            kind: DeltaKind::Unchanged,
+        };
+        let d = build_diff_row_display(&row);
+        // Arrow appears (not dash) for borderline non-zero changes
+        assert_eq!(d.delta, "▲ +3%");
+    }
+
+    #[test]
+    fn unchanged_borderline_negative_uses_down_arrow() {
+        let row = DiffRow {
+            op: "rms_norm".into(),
+            shape: "B=1024 N=4096 bf16".into(),
+            baseline_pct: Some(102.0),
+            current_pct: Some(99.0),
+            delta_pct: Some(-3.0),
+            kind: DeltaKind::Unchanged,
+        };
+        let d = build_diff_row_display(&row);
+        assert_eq!(d.delta, "▼ -3%");
+    }
+
+    #[test]
+    fn regression_delta_is_unstyled_text() {
+        let row = DiffRow {
+            op: "sort".into(),
+            shape: "B=1024 N=1024 f32".into(),
+            baseline_pct: Some(100.0),
+            current_pct: Some(65.0),
+            delta_pct: Some(-35.0),
+            kind: DeltaKind::Regression,
+        };
+        let d = build_diff_row_display(&row);
+        assert_eq!(d.delta, "▼ -35%");
+    }
+
+    #[test]
+    fn improvement_delta_is_unstyled_text() {
+        let row = DiffRow {
+            op: "rms_norm".into(),
+            shape: "B=1024 N=64 bf16".into(),
+            baseline_pct: Some(332.0),
+            current_pct: Some(420.0),
+            delta_pct: Some(88.0),
+            kind: DeltaKind::Improvement,
+        };
+        let d = build_diff_row_display(&row);
+        assert_eq!(d.delta, "▲ +88%");
     }
 }

@@ -70,9 +70,9 @@ struct BenchArgs {
     /// numbers always tie back to a clean commit SHA.
     #[arg(long = "allow-dirty")]
     allow_dirty: bool,
-    /// Skip the post-bench diff against the target-branch baseline.
-    #[arg(long = "no-diff")]
-    no_diff: bool,
+    /// Opt into the post-bench diff against the target-branch baseline.
+    #[arg(long = "diff")]
+    diff: bool,
     /// Git ref whose `baselines/<chip>.json` to diff against (default:
     /// first of `origin/dev`, `upstream/dev`, `dev` that resolves).
     #[arg(long = "baseline-ref")]
@@ -211,8 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // metaltile crates; METALTILE_DEBUG=trace enables trace level.
     // When the env-var is absent the subscriber is still installed but the filter
     // rejects everything, so library crates pay only the ~1 ns no-subscriber cost.
-    let _debug_level = std::env::var("METALTILE_DEBUG").ok();
-    let filter = match _debug_level.as_deref() {
+    let debug_level = std::env::var("METALTILE_DEBUG").ok();
+    let filter = match debug_level.as_deref() {
         Some("1") | Some("debug") => "metaltile=debug",
         Some("trace") => "metaltile=trace",
         _ => "off",

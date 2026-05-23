@@ -1,5 +1,10 @@
 name: Tile
 
+# Cancel in-progress runs when a new commit is pushed to the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # Slow macOS job: `tile build` + `tile bench` together take ~5-6 min
 # on the GitHub-hosted runner. Skip on PRs that can't affect kernel
 # emission, dispatch, or measurement — docs-only PRs, baseline-JSON
@@ -8,19 +13,19 @@ on:
   push:
     branches: [main, dev]
     paths:
-      - 'crates/**'
+      - 'crates/**/*.rs'
+      - 'crates/**/Cargo.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - '.github/workflows/tile.yml'
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
     paths:
-      - 'crates/**'
+      - 'crates/**/*.rs'
+      - 'crates/**/Cargo.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - '.github/workflows/tile.yml'
   workflow_dispatch: {}
 
 permissions:
@@ -31,11 +36,11 @@ permissions:
   pull-requests: write
 
 env:
-  CLICOLOR: 1
+  CLICOLOR_FORCE: 1
 
 jobs:
   tile:
-    name: Tile
+    name: Suite
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -49,29 +54,29 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build
-        run: cargo run --release -p metaltile-cli -- build
+      # Build the CLI once and add the release binary to PATH so all
+      # subsequent steps call `tile` directly without cargo overhead.
+      - name: Install tile CLI
+        run: |
+          cargo build --profile ci -p metaltile-cli
+          echo "${GITHUB_WORKSPACE}/target/ci" >> "$GITHUB_PATH"
 
-      # `--no-diff` because the next step renders the diff against the
-      # committed baseline (rather than the in-tree one auto-diff would
-      # pick on a PR that already modified its own baseline) and posts
-      # it as a comment. `--allow-dirty` is defensive — CI checks out
+      - name: Build
+        run: tile build
+
+      # Diff is opt-in (`--diff`); the next step runs `tile diff` separately.
+      # `--allow-dirty` is defensive — CI checks out
       # clean, but a future codegen step could mutate a tracked file.
       - name: Bench
-        run: |
-          cargo run --release -p metaltile-cli -- bench -vv \
-            --allow-dirty --no-diff --json /tmp/bench.json
+        run: tile bench -vv --allow-dirty --json /tmp/bench.json
 
-      # Snapshot the raw bench JSON into the committed-baseline format
-      # (`tile snap` envelope) and upload it as an artifact. snap runs
-      # *on the runner* so the `device` field is the runner's real
+      # Snapshot the raw bench JSON into the committed-baseline format.
+      # snap runs *on the runner* so the `device` field reflects the real
       # chip — letting a maintainer download it and commit it as
-      # `baselines/<chip-slug>.json` for a runner chip nobody owns
-      # locally (e.g. the paravirtualized macOS runner). Also the first
-      # building block for the auto-baseline workflow (issue #130).
+      # `baselines/<chip-slug>.json`.
       - name: Snapshot bench result
         run: |
-          cargo run --release -q -p metaltile-cli -- snap \
+          tile snap \
             --from /tmp/bench.json -o /tmp/bench-snapshot.json \
             --note "CI runner capture @ ${{ github.sha }} (${{ github.ref_name }})"
 
@@ -93,10 +98,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          DEVICE_NAME=$(
-            cargo run --release -q -p metaltile-cli -- device --json \
-              | jq -r '.device'
-          )
+          DEVICE_NAME=$(tile device --json | jq -r '.device')
           # Same rule as `cmd::bench::chip_slug` in the Rust code:
           # lowercase, collapse non-alphanumeric runs to a single dash,
           # trim leading/trailing dashes.
@@ -105,12 +107,14 @@ jobs:
             | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
           BL="baselines/${SLUG}.json"
           echo "chip='${DEVICE_NAME}' slug='${SLUG}' baseline='${BL}'"
+          COMMIT_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          COMMIT_SHORT="${COMMIT_SHA:0:7}"
 
           {
             echo "<!-- bench-diff:${SLUG} -->"
             echo "### \`tile bench\` vs \`${BL}\`"
             echo
-            echo "Runner chip: \`${DEVICE_NAME}\` (slug \`${SLUG}\`)"
+            echo "Runner chip: \`${DEVICE_NAME}\` (slug \`${SLUG}\`) | commit \`${COMMIT_SHORT}\`"
             echo
             if [ ! -f "$BL" ]; then
               echo "_No committed baseline for this runner chip — skipping diff._"
@@ -119,11 +123,15 @@ jobs:
                 echo "Available baselines: $(ls baselines/*.json | xargs -n1 basename | tr '\n' ' ')"
               fi
             else
+              echo "<details>"
+              echo "<summary>tile diff @ commit \`${COMMIT_SHORT}\`</summary>"
+              echo
               echo '```ansi'
               # `|| true` so a regression exit code (1) doesn't kill the job.
-              cargo run --release -q -p metaltile-cli -- diff \
-                "$BL" /tmp/bench.json 2>&1 || true
+              tile diff "$BL" /tmp/bench.json 2>&1 || true
               echo '```'
+              echo
+              echo '</details>'
             fi
           } > /tmp/bench-diff-comment.md
 
@@ -131,11 +139,30 @@ jobs:
           cat /tmp/bench-diff-comment.md
           echo "---- end bench-diff comment body ----"
 
+          # Find an existing bench-diff comment by its marker and edit it.
+          # If none exists, create a new one.  This keeps PR threads clean
+          # as new commits come in — one rolling comment, not a pile of them.
+          #
           # Fork PRs get a read-only GITHUB_TOKEN regardless of the
           # `pull-requests: write` permission above — GitHub blocks
           # write tokens to mitigate untrusted-fork attacks. Log a
           # warning instead of failing the job; the comment body is
           # already in the step log right above.
-          if ! gh pr comment "$PR_NUMBER" --body-file /tmp/bench-diff-comment.md; then
-            echo "::warning::Could not post bench-diff comment (likely a fork PR with read-only token). Comment body is in this step log."
+          MARKER="<!-- bench-diff:${SLUG} -->"
+          EXISTING_ID=$(gh pr view "$PR_NUMBER" --json comments --jq \
+            --arg marker "$MARKER" \
+            '[.comments[] | select(.body | contains($marker)) | .id] | first')
+
+          REPO="${{ github.repository }}"
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Updating existing bench-diff comment #${EXISTING_ID}"
+            if ! gh api "repos/${REPO}/issues/comments/${EXISTING_ID}" \
+                 -X PATCH -F body=@/tmp/bench-diff-comment.md --silent; then
+              echo "::warning::Could not update bench-diff comment (likely a fork PR with read-only token)."
+            fi
+          else
+            echo "Creating new bench-diff comment"
+            if ! gh pr comment "$PR_NUMBER" --body-file /tmp/bench-diff-comment.md; then
+              echo "::warning::Could not post bench-diff comment (likely a fork PR with read-only token). Comment body is in this step log."
+            fi
           fi

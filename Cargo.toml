@@ -53,6 +53,15 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+# CI profile: same correctness as release but skips fat-LTO and forces
+# max parallelism so cold builds finish in roughly half the time.
+# Bench numbers are unaffected — kernels are Metal shaders compiled by
+# xcrun, not Rust code, so Rust LTO settings have no bearing on them.
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [profile.bench]
 inherits = "release"
 debug = true

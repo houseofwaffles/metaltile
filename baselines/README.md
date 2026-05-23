@@ -40,7 +40,7 @@ without being asked. It picks the file `baselines/<your-chip>.json`
 out of the first ref of `origin/dev`, `upstream/dev`, `dev` that
 resolves, at the merge-base with `HEAD` — so the comparison stays
 honest even on a PR that already updated its own baseline. Override
-the ref with `--baseline-ref <ref>`, or skip the diff with `--no-diff`.
+the ref with `--baseline-ref <ref>`, or opt in with `--diff`.
 
 In CI (`.github/workflows/kernels.yml`), the same diff is rendered
 against the in-tree baseline matching the runner chip and posted as a

@@ -1,10 +1,15 @@
 name: Check
 
+# Cancel in-progress runs when a new commit is pushed to the same PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
   workflow_dispatch: {}
 
 permissions:
@@ -52,15 +57,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check --all
 
-  clippy:
-    name: Clippy
+  clippy-test:
+    name: Clippy + Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
         with:
           egress-policy: block
           allowed-endpoints: >
             github.com:443
+            release-assets.githubusercontent.com:443
+            objects.githubusercontent.com:443
             static.crates.io:443
             crates.io:443
             index.crates.io:443
@@ -73,28 +81,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
       - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
-        with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            static.crates.io:443
-            crates.io:443
-            index.crates.io:443
-            static.rust-lang.org:443
-
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace
+      - run: cargo nextest run --workspace
 
   commit-hygiene:
     name: Commits

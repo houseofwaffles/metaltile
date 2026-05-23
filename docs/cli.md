@@ -16,7 +16,7 @@ Runs every kernel against its MLX reference and reports throughput + a correctne
 
 ```
 tile bench [-f <substr>] [-v|-vv] [-o <file.json>] [--allow-dirty]
-           [--no-diff] [--baseline-ref <git-ref>]
+           [--diff] [--baseline-ref <git-ref>]
 ```
 
 | Flag | Effect |
@@ -25,7 +25,7 @@ tile bench [-f <substr>] [-v|-vv] [-o <file.json>] [--allow-dirty]
 | `-v` / `-vv` | `-v` adds occupancy + register profile; `-vv` adds GPU timing (min µs + bandwidth) |
 | `-o, --json <file>` | also write results as JSON |
 | `--allow-dirty` | run on a dirty working tree (default: refuses, so numbers tie to a clean SHA) |
-| `--no-diff` | skip the post-bench diff against the target-branch baseline |
+| `--diff` | opt into the post-bench diff against the target-branch baseline |
 | `--baseline-ref <ref>` | git ref whose `baselines/<chip>.json` to diff against (default: first of `origin/dev`, `upstream/dev`, `dev`) |
 
 ## `tile build` — compile kernels to MSL

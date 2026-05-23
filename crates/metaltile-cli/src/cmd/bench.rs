@@ -242,8 +242,13 @@ pub fn run(args: &BenchArgs) -> Result<(), crate::CliError> {
     }
     println!();
 
-    if !args.no_diff {
-        try_auto_diff(&runner.device_name, &all, args.baseline_ref.as_deref());
+    if args.diff {
+        try_auto_diff(
+            &runner.device_name,
+            &all,
+            args.filter.as_deref(),
+            args.baseline_ref.as_deref(),
+        );
     }
 
     if let Some(path) = json_out {
@@ -260,7 +265,12 @@ pub fn run(args: &BenchArgs) -> Result<(), crate::CliError> {
 /// just-finished bench against it. Best-effort: any failure (no git
 /// repo, no resolved ref, no baseline file at that ref, etc.) logs a
 /// one-line skip note and returns. Never aborts the bench.
-fn try_auto_diff(device: &str, results: &[OpResult], baseline_ref_override: Option<&str>) {
+fn try_auto_diff(
+    device: &str,
+    results: &[OpResult],
+    filter: Option<&str>,
+    baseline_ref_override: Option<&str>,
+) {
     let slug = chip_slug(device);
     let baseline_path = format!("baselines/{slug}.json");
 
@@ -311,6 +321,7 @@ fn try_auto_diff(device: &str, results: &[OpResult], baseline_ref_override: Opti
     let opts = diff_cmd::RenderOpts {
         heading: Some(&heading),
         sort: "regression",
+        filter,
         ..diff_cmd::RenderOpts::default()
     };
     let outcome = diff_cmd::render(&baseline_rows, &current_rows, &opts);
