@@ -710,6 +710,41 @@ inventory::submit! {
     }
 }
 
+/// Fused elementwise sigmoid + mul. Computes
+///   `out[i] = a[i] * sigmoid(b[i])`
+/// in one dispatch. Used by Qwen3 attention layer's output gate:
+///   attn_out = attn(x) * sigmoid(gate_proj(x))
+/// Currently expressed as `Ops.mul(attnFlat, Ops.sigmoid(gate))` —
+/// two dispatches. This fuses to one, saving 10 dispatches per
+/// Qwen3.6-A3B decode token (1 per attn layer × 10 attn layers).
+///
+/// Sigmoid is computed at f32 precision via load-side cast to avoid
+/// bf16 saturation drift near the asymptotes.
+#[kernel]
+pub fn mt_sigmoid_mul<T>(a: Tensor<T>, b: Tensor<T>, out: Tensor<T>) {
+    let idx = program_id(0);
+    let av = load(a[idx]).cast::<f32>();
+    let bv = load(b[idx]).cast::<f32>();
+    let sig = 1.0f32 / (1.0f32 + exp(0.0f32 - bv));
+    store(out[idx], (av * sig).cast::<T>());
+}
+
+inventory::submit! {
+    BenchSpec {
+        op: "unary",
+        subop: "sigmoid_mul",
+        kernel_name: "mt_sigmoid_mul",
+        kernel_ir: mt_sigmoid_mul::kernel_ir_for,
+        dtypes: &[DType::F32, DType::F16, DType::BF16],
+        tol: 1e-3,
+        mlx_src: None,
+        mlx_pattern: None,
+        shapes: &[],
+        dispatch: BenchDispatch::Generic,
+        kernel_mode: Some(KernelMode::Elementwise),
+    }
+}
+
 inventory::submit! {
     BenchSpec {
         op: "unary",
