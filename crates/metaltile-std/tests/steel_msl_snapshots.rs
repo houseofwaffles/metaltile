@@ -17,15 +17,13 @@
 //! the codegen path.
 //!
 //! Refresh after an intentional codegen change:
-//!   cargo insta test --accept -p metaltile-std --features nax --test steel_msl_snapshots
+//!   cargo insta test --accept -p metaltile-std --test steel_msl_snapshots
 //! Or interactively:
 //!   cargo insta review
 //!
-//! Gated behind the `nax` Cargo feature — the steel_*_nax / quantized_nax
-//! kernels lower through `MetalPerformancePrimitives` cooperative-tensor
-//! intrinsics that only emit when `nax` is on.
-
-#![cfg(feature = "nax")]
+//! NAX kernels lower through `MetalPerformancePrimitives` cooperative-tensor
+//! intrinsics. They compile unconditionally now; runtime dispatch is gated
+//! by `skip_unless_apple10` (the M4+ tensor-core test guard).
 
 use insta::assert_snapshot;
 use metaltile_codegen::{MslGenerator, msl::MslConfig};

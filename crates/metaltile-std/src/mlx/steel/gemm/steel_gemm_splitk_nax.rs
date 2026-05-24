@@ -1,7 +1,8 @@
 //! `mt_steel_gemm_splitk_nax` — split-K GEMM via `mpp::tensor_ops::matmul2d`.
 //!
-//! NAX (Apple tensor-core) port of the two-kernel split-K GEMM. Gated
-//! behind the `nax` Cargo feature (Metal 4 / macOS 26+).
+//! NAX (Apple tensor-core) port of the two-kernel split-K GEMM.
+//! Requires Metal 4 / macOS 26+ and Apple10+ hardware; runtime-gated
+//! via `Context::chip_family()`.
 //!
 //! Split-K partitions the K dimension across the grid z-axis so a
 //! skinny-M / skinny-N matmul with a very large K still saturates the

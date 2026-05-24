@@ -11,15 +11,13 @@
 //! the metallib still links on older toolchains; on such toolchains this
 //! test fails the correctness check, which is the intended signal.
 //!
-//! Gated behind the `nax` Cargo feature.
 //!
 //! Run:
-//!   cargo test --release -p metaltile-std --features nax \
-//!     --test quantized_nax_gpu_correctness -- --nocapture
+//!   cargo test --release -p metaltile-std --test quantized_nax_gpu_correctness -- --nocapture
 //!
 //! This file is correctness only — no bench harness wired in.
 
-#![cfg(all(target_os = "macos", feature = "nax"))]
+#![cfg(target_os = "macos")]
 
 use std::collections::BTreeMap;
 

@@ -11,13 +11,11 @@
 //! - group_size = 32 (natural int8 group; int4 used 64).
 //! - Weight codes span 0..255 (uint8), not 0..15 (uint4).
 //!
-//! Gated behind the `nax` Cargo feature.
 //!
 //! Run:
-//!   cargo test --release -p metaltile-std --features nax \
-//!     --test quantized_nax_int8_gpu_correctness -- --nocapture
+//!   cargo test --release -p metaltile-std --test quantized_nax_int8_gpu_correctness -- --nocapture
 
-#![cfg(all(target_os = "macos", feature = "nax"))]
+#![cfg(target_os = "macos")]
 
 use std::collections::BTreeMap;
 

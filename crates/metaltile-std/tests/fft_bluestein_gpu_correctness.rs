@@ -144,6 +144,7 @@ fn run_bluestein(
     let u = |v: usize| (v as u32).to_le_bytes().to_vec();
     pre_bufs.insert("n_len".into(), u(n));
     pre_bufs.insert("m_len".into(), u(M));
+    pre_bufs.insert("rows".into(), u(rows));
     pre_bufs.insert("inv".into(), inv_bytes.clone());
 
     let mut k_pre = mt_fft_bluestein_preprocess::kernel_ir_for(dt.to_dtype());
@@ -183,6 +184,7 @@ fn run_bluestein(
     cmul_bufs.insert("out_re".into(), pack_bytes(&vec![0.0f32; pre_n_out], dt));
     cmul_bufs.insert("out_im".into(), pack_bytes(&vec![0.0f32; pre_n_out], dt));
     cmul_bufs.insert("m_len".into(), u(M));
+    cmul_bufs.insert("rows".into(), u(rows));
 
     let mut k_cmul = mt_fft_bluestein_cmul::kernel_ir_for(dt.to_dtype());
     k_cmul.mode = KernelMode::Grid3D;
@@ -218,6 +220,7 @@ fn run_bluestein(
     post_bufs.insert("out_im".into(), pack_bytes(&vec![0.0f32; n_out_total], dt));
     post_bufs.insert("n_len".into(), u(n));
     post_bufs.insert("m_len".into(), u(M));
+    post_bufs.insert("rows".into(), u(rows));
     post_bufs.insert("inv".into(), inv_bytes.clone());
 
     let mut k_post = mt_fft_bluestein_postprocess::kernel_ir_for(dt.to_dtype());
@@ -231,18 +234,26 @@ fn run_bluestein(
     (out_re[..n_out_total].to_vec(), out_im[..n_out_total].to_vec())
 }
 
-/// Relative error = |a - b| / max(|a|, |b|, 1e-8) for each element.
+/// Signal-to-noise error: `max |actual - expected|` normalised by the
+/// largest expected magnitude (real or imag) in the whole spectrum.
+///
+/// We deliberately avoid per-bin relative error: for real-input
+/// transforms many bins land near zero (the DFT of a sparse-spectrum
+/// signal), and `noise / tiny_expected` blows up to O(1) at those bins
+/// even though the actual numerical noise is on the order of the FFT's
+/// precision floor. Signal-norm-relative error is the standard SNR
+/// measure for FFT validation and matches what downstream STT/Whisper
+/// consumers actually care about.
 fn max_rel_err(a_re: &[f32], a_im: &[f32], b_re: &[f32], b_im: &[f32]) -> f32 {
-    a_re.iter()
+    let signal_max =
+        b_re.iter().chain(b_im.iter()).map(|x| x.abs()).fold(0.0_f32, f32::max).max(1e-8);
+    let max_abs = a_re
+        .iter()
         .zip(a_im)
         .zip(b_re.iter().zip(b_im))
-        .map(|((ar, ai), (br, bi))| {
-            let ea = (ar - br).abs();
-            let eb = (ai - bi).abs();
-            let norm = ar.abs().max(br.abs()).max(ai.abs()).max(bi.abs()).max(1e-8);
-            ea.max(eb) / norm
-        })
-        .fold(0.0_f32, f32::max)
+        .map(|((ar, ai), (br, bi))| (ar - br).abs().max((ai - bi).abs()))
+        .fold(0.0_f32, f32::max);
+    max_abs / signal_max
 }
 
 fn ramp_signal(rows: usize, n: usize, offset: f32, stride: usize) -> Vec<f32> {

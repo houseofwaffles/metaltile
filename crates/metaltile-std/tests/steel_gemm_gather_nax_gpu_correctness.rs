@@ -6,13 +6,12 @@
 //! 32-wide N-block multiplies against. Validated against a naive CPU
 //! oracle that applies the same two redirections.
 //!
-//! Requires macOS 26+ / Metal 4. Gated behind the `nax` Cargo feature.
+//! Requires macOS 26+ / Metal 4.
 //!
 //! Run:
-//!   cargo test --release -p metaltile-std --features nax \
-//!     --test steel_gemm_gather_nax_gpu_correctness -- --nocapture
+//!   cargo test --release -p metaltile-std --test steel_gemm_gather_nax_gpu_correctness -- --nocapture
 
-#![cfg(all(target_os = "macos", feature = "nax"))]
+#![cfg(target_os = "macos")]
 
 use std::collections::BTreeMap;
 

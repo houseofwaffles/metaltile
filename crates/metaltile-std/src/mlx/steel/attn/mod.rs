@@ -1,7 +1,6 @@
 pub mod steel_attention;
 pub mod steel_attention_mma;
 pub mod steel_attention_mma_bf16;
-#[cfg(feature = "nax")]
 pub mod steel_attention_nax;
 
 use metaltile_core::{dtype::DType, ir::Kernel};

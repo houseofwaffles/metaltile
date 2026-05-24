@@ -155,25 +155,36 @@ pub fn patch_embed_mma<T>(
     let w_h_base = global_h * patch_dim;
 
     // ── K-block loop (step 32 through patch_dim) ─────────────────────────
+    // K-tail handling: `patch_dim = in_ch * patch_h * patch_w` isn't
+    // always a multiple of 32 (e.g. ViT-patch14, in_ch=3 → 588). Both
+    // coop loads mask OOB K-taps with `select(kt < patch_dim, load(...), 0)`
+    // and clamp the gather index to 0, so the partial K-tile leaves the
+    // MMA accumulator correct without reading past the buffers.
     for kb in range(0u32, patch_dim, 32u32) {
         // ─ 1. Coop A load (implicit patch unfold gather) ─────────────────
         for i in range(0u32, 8u32, 1u32) {
             let kt = kb + a_k_base + i;
-            // Decompose kt into (ic, py, px).
-            let ic = kt / phw;
-            let rem_kt = kt - ic * phw;
+            let in_bounds = kt < patch_dim;
+            let kt_safe = select(in_bounds, kt, 0u32);
+            // Decompose kt_safe into (ic, py, px).
+            let ic = kt_safe / phw;
+            let rem_kt = kt_safe - ic * phw;
             let py = rem_kt / patch_w;
             let px = rem_kt - py * patch_w;
             let img_idx = ic * input_plane + (py0 + py) * in_w + (px0 + px);
-            let val = load(image[img_idx]).cast::<T>();
+            let raw = load(image[img_idx]).cast::<f32>();
+            let val = select(in_bounds, raw, 0.0f32).cast::<T>();
             threadgroup_store("as", a_pat_row * stride + a_k_base + i, val);
         }
 
         // ─ 2. Coop B load (weight `[hidden, patch_dim]` row-major) ───────
         for i in range(0u32, 8u32, 1u32) {
             let kt = kb + b_k_base + i;
-            let w_idx = w_h_base + kt;
-            let val = load(weight[w_idx]).cast::<T>();
+            let in_bounds = kt < patch_dim;
+            let kt_safe = select(in_bounds, kt, 0u32);
+            let w_idx = w_h_base + kt_safe;
+            let raw = load(weight[w_idx]).cast::<f32>();
+            let val = select(in_bounds, raw, 0.0f32).cast::<T>();
             threadgroup_store("bs", b_h_row * stride + b_k_base + i, val);
         }
 

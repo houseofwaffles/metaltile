@@ -6,9 +6,6 @@ license.workspace = true
 description = "MetalTile kernel standard library — benchmark metadata and type definitions"
 publish = true
 
-[features]
-nax = []
-
 [dependencies]
 thiserror.workspace = true
 metaltile.workspace = true

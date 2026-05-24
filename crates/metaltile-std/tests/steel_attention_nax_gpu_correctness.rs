@@ -11,14 +11,13 @@
 //! the metallib still links; this test then fails the correctness
 //! check, which is the intended signal.
 //!
-//! Gated behind the `nax` Cargo feature. `head_dim` is fixed at 32 —
+//! `head_dim` is fixed at 32 —
 //! the NAX QK descriptor's K-dim.
 //!
 //! Run:
-//!   cargo test --release -p metaltile-std --features nax \
-//!     --test steel_attention_nax_gpu_correctness -- --nocapture
+//!   cargo test --release -p metaltile-std --test steel_attention_nax_gpu_correctness -- --nocapture
 
-#![cfg(all(target_os = "macos", feature = "nax"))]
+#![cfg(target_os = "macos")]
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::BTreeMap;

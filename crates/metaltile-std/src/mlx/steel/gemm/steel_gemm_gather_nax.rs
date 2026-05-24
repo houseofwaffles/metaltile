@@ -10,7 +10,8 @@
 //!     Selected matrix base = `rhs_indices[n_tile] * k * n`.
 //!
 //! This is the MLX `gather_mm` op — the dense-matmul half of a MoE FFN.
-//! Gated behind the `nax` Cargo feature (Metal 4 / macOS 26+).
+//! Requires Metal 4 / macOS 26+ and Apple10+ hardware; runtime-gated via
+//! `Context::chip_family()`.
 //!
 //! Expressed entirely in the `#[kernel]` DSL via the `coop_tile_*`
 //! intrinsics — no `Op::InlineMsl`. It is exactly `mt_steel_gemm_fused_nax`

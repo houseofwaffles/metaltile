@@ -159,13 +159,21 @@ pub fn conv3d_mma<T>(
     let w_oc_base = global_oc * total_k;
 
     // ── K-block loop ──────────────────────────────────────────────────────
+    // K-tail handling: `total_k = in_ch * kd * kh * kw` rarely lands on
+    // a multiple of 32 (e.g. in_ch=4, k=3³ → 108). The A/B coop loads
+    // mask out-of-bound K-taps with `select(kt < total_k, load(...), 0)`
+    // and clamp the gather index to 0 on OOB so we never read past the
+    // input/weight buffer. Zero contributions on both sides leave the
+    // partial-K MMA accumulator correct.
     for kb in range(0u32, total_k, 32u32) {
         // ─ 1. Coop A load (implicit 5D im2col gather) ───────────────────
         for i in range(0u32, 8u32, 1u32) {
             let kt = kb + a_k_base + i;
-            // Decompose kt into (ic, kz, ky, kx).
-            let ic = kt / kdhw;
-            let rem_kt = kt - ic * kdhw;
+            let in_bounds = kt < total_k;
+            let kt_safe = select(in_bounds, kt, 0u32);
+            // Decompose kt_safe into (ic, kz, ky, kx).
+            let ic = kt_safe / kdhw;
+            let rem_kt = kt_safe - ic * kdhw;
             let kz = rem_kt / khw;
             let rem_kh = rem_kt - kz * khw;
             let ky = rem_kh / kw;
@@ -175,15 +183,19 @@ pub fn conv3d_mma<T>(
             let ih = oh_pv + ky;
             let iw = ow_pv + kx;
             let in_idx = pv_in_base + ic * in_vol + id * in_plane + ih * in_w + iw;
-            let val = load(input[in_idx]).cast::<T>();
+            let raw = load(input[in_idx]).cast::<f32>();
+            let val = select(in_bounds, raw, 0.0f32).cast::<T>();
             threadgroup_store("as", a_pv_row * stride + a_k_base + i, val);
         }
 
         // ─ 2. Coop B load (weight, dense OIDHW) ─────────────────────────
         for i in range(0u32, 8u32, 1u32) {
             let kt = kb + b_k_base + i;
-            let w_idx = w_oc_base + kt;
-            let val = load(weight[w_idx]).cast::<T>();
+            let in_bounds = kt < total_k;
+            let kt_safe = select(in_bounds, kt, 0u32);
+            let w_idx = w_oc_base + kt_safe;
+            let raw = load(weight[w_idx]).cast::<f32>();
+            let val = select(in_bounds, raw, 0.0f32).cast::<T>();
             threadgroup_store("bs", b_oc_row * stride + b_k_base + i, val);
         }
 

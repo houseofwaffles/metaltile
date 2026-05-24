@@ -116,16 +116,16 @@ via `#[bench_kernel(…)]` + `#[kernel]`.
 | `scaled_dot_product_attention.rs` | SDPA vector decode kernel |
 | `rope.rs` | `mt_rope_f16` |
 
-**Quantized:** `quantized.rs`, `fp_quantized.rs`, `quantized_nax.rs`\*, `fp_quantized_nax.rs`\*
+**Quantized:** `quantized.rs`, `fp_quantized.rs`, `quantized_nax.rs`, `fp_quantized_nax.rs`
 
 | Op file | Kernel(s) |
 |---|---|
 | `quantized.rs` | Quantized GeMV (int4) |
 | `fp_quantized.rs` | FP4 quantize/dequantize |
-| `quantized_nax.rs` \* | NAX-accelerated quantized matvec |
-| `fp_quantized_nax.rs` \* | NAX-accelerated FP4 dequantize |
+| `quantized_nax.rs` | NAX-accelerated quantized matvec (M4+ runtime) |
+| `fp_quantized_nax.rs` | NAX-accelerated FP4 dequantize (M4+ runtime) |
 
-\* = gated behind `features = ["nax"]`
+NAX kernels build by default; the runtime dispatcher gates them via `Context::chip_family()` on Apple10+ hardware. Tests use `skip_unless_apple10` to auto-skip on pre-M4 chips.
 
 **Misc:** `random.rs`, `conv.rs`, `fft.rs`, `fence.rs`
 
@@ -211,9 +211,7 @@ everywhere.
 
 ### Feature flags
 
-| Flag | Effect |
-|---|---|
-| `nax` | Enables NAX-hardware kernels: `ops::fp_quantized_nax`, `ops::quantized_nax` |
+None — the crate has no Cargo features. NAX (Apple cooperative-tensor) kernels build by default; runtime gating happens via `Context::chip_family()`.
 
 ## Extending
 

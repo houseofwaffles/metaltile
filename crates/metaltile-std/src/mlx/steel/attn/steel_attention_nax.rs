@@ -1,7 +1,8 @@
 //! `mt_sdpa_prefill_nax` — flash attention via `mpp::tensor_ops::matmul2d`.
 //!
 //! NAX (Apple tensor-core) port of the steel flash-attention prefill
-//! kernel. Gated behind the `nax` Cargo feature (Metal 4 / macOS 26+).
+//! kernel. Requires Metal 4 / macOS 26+ and Apple10+ hardware (M4 family
+//! or newer); runtime-gated via `Context::chip_family()`.
 //!
 //! Expressed in the `#[kernel]` DSL via the `coop_tile_*` intrinsics —
 //! no `Op::InlineMsl`. The cooperative-tensor counterpart of
@@ -259,12 +260,14 @@ pub fn mt_sdpa_prefill_nax<T>(
 //   Ps        : 16 × 20  (16 rows × (BK=16 + TG_SKEW=4))
 //   Ss        : 16 × 20  (fp32 attention scores, reused per K-block)
 //   Os        : 16 × ($head_dim + TG_SKEW)   fp32 running accumulator
-//   Obk       : 16 × ($head_dim + TG_SKEW)   fp32 per-block P·V accumulator
+//   Obk       : 16 × 36                       fp32 per-D-chunk PV scratch
 //
 // The QK D-chunk loop uses `overwrite` for the first chunk and
 // `accumulate` for subsequent chunks so partial scores add up correctly.
-// The PV D-chunk loop reuses the same `pv` descriptor (overwrite per chunk,
-// then manually accumulated into Os from Obk_chunk scratch).
+// The PV D-chunk loop overwrites Obk per chunk and immediately adds the
+// chunk into the matching 32-wide column band of Os — this keeps Obk at
+// one chunk's worth (576 fp32) instead of full-width, which is what lets
+// d=256 fit under Metal's 32 KB TG-memory cap.
 macro_rules! sdpa_prefill_nax_wide {
     ($name:ident, $head_dim:literal, $n_chunks:literal, $os_slots:literal) => {
         #[doc = concat!(
@@ -277,7 +280,7 @@ macro_rules! sdpa_prefill_nax_wide {
             "head_dim axis of the Q/K/V loads and the Os accumulator scale up.\n\n",
             "See module-level docs for the D-chunk loop design.\n",
             "Generic `T ∈ {f32, f16, bf16}`; `coop_stage(T)` for bf16 safety.\n",
-            "`#[cfg(feature = \"nax\")]` — needs macOS 26+ / Metal 4.",
+            "Runtime-gated to Apple10+ — needs macOS 26+ / Metal 4.",
         )]
         #[kernel]
         #[allow(clippy::too_many_arguments)]
@@ -299,8 +302,8 @@ macro_rules! sdpa_prefill_nax_wide {
             let kv_head = q_head / gqa_factor;
             let lane = simd_lane;
 
-            let head_dim = $head_dim as u32;
-            let n_chunks = $n_chunks as u32;
+            let head_dim = $head_dim;
+            let n_chunks = $n_chunks;
             let q_len_off = k_len - q_len;
 
             // Slab offsets — q/out: [batch, n_q_heads, q_len, D]; k/v: [batch, n_kv_heads, k_len, D].
@@ -313,38 +316,41 @@ macro_rules! sdpa_prefill_nax_wide {
             //   Ps       : 16 × 20 — attention weights (BK=16 + TG_SKEW=4)
             //   Ss       : 16 × 20 — accumulated scores per K-block (fp32)
             //   Os       : 16 × ($os_slots) — running output accumulator (fp32)
-            //   Obk      : 16 × ($os_slots) — per-block P·V scratch (fp32)
+            //   Obk      : 16 × 36 — per-D-chunk P·V scratch (fp32, reused across chunks)
+            //
+            // For d=256 the running Os already costs 16640 bytes; keeping
+            // a second full-width Obk would push past Metal's 32 KB TG
+            // memory cap. Instead Obk is sized for one 32-wide D-chunk
+            // (576 fp32 slots) and we accumulate each PV chunk into the
+            // matching slice of Os directly — eliminating the old step 5.
             threadgroup_alloc("Qs", 576, coop_stage(T)); // 16 × 36
             threadgroup_alloc("Ks", 576, coop_stage(T));
             threadgroup_alloc("Vs", 576, coop_stage(T));
             threadgroup_alloc("Ps", 320, coop_stage(T)); // 16 × 20
             threadgroup_alloc("Ss", 320, f32);           // 16 × 20
             threadgroup_alloc("Os", $os_slots, f32);
-            threadgroup_alloc("Obk", $os_slots, f32);
+            threadgroup_alloc("Obk", 576, f32);          // 16 × 36 — one D-chunk
 
-            // TG_LD_O = head_dim + TG_SKEW (for Os/Obk row stride).
+            // TG_LD_O = head_dim + TG_SKEW (for Os row stride).
             let tg_ld_o = head_dim + 4u32;
 
-            // Load the full Q tile for this thread's head into Qs,
-            // cycling through n_chunks D-chunks of 32 elements each.
-            // `lane` fills column `lane` within the current D-chunk.
-            // Os is zeroed at the same time.
+            // Zero the full Os accumulator (16 × head_dim fp32 cells).
+            // Stripe across the 32 lanes by D-chunk: each lane writes its
+            // column index across all 16 rows × all n_chunks chunks. The
+            // previous combined Q-load + Os-zero loop only zeroed the
+            // dc=0 D-chunk (columns 0..32); columns 32..head_dim then
+            // carried whatever stale TG-memory landed there, which on
+            // single-tile inputs combined with the first K-block's
+            // rescale `exp(-1e30 - finite) ≈ 0` to produce 0 × ±∞ = NaN.
+            // The K-block loop reloads Qs every iteration so we don't
+            // need to prime it here.
             for dc in range(0u32, n_chunks, 1u32) {
                 let d_off = dc * 32u32;
                 for _r in range(0u32, 16u32, 1u32) {
-                    let q_dev = q_head_row_off + (q_tile_first + _r) * head_dim + d_off + lane;
-                    let qv = load(q[q_dev]).cast::<f32>() * scale;
-                    threadgroup_store("Qs", _r * 36u32 + lane, qv);
-                    // Zero Os once (dc==0); subsequent chunks accumulate.
-                    if dc == 0u32 {
-                        threadgroup_store("Os", _r * tg_ld_o + d_off + lane, 0.0f32);
-                    }
+                    threadgroup_store("Os", _r * tg_ld_o + d_off + lane, 0.0f32);
                 }
-                threadgroup_barrier();
-                // Re-store Qs into the fixed 16×36 chunk buffer for later K-block reuse.
-                // (The load loop above already wrote to Qs.)
-                threadgroup_barrier();
             }
+            threadgroup_barrier();
 
             // Per-row online-softmax state.
             let mut row_m = -1.0e30f32;
@@ -477,15 +483,16 @@ macro_rules! sdpa_prefill_nax_wide {
                 }
                 threadgroup_barrier();
 
-                // ── Step 4: Obk = Σ_{dc} P · V_dc ──────────────────────────
-                // Zero Obk before accumulating D-chunks.
-                if owns_row {
-                    for _d in range(0u32, head_dim, 1u32) {
-                        threadgroup_store("Obk", my_row * tg_ld_o + _d, 0.0f32);
-                    }
-                }
-                threadgroup_barrier();
-
+                // ── Step 4: Os += P · V, accumulating per D-chunk ───────────
+                // Step 2 already rescaled the running Os by `exp(row_m - new_m)`
+                // across all head_dim, so all that's left here is to add the
+                // PV contribution. We process one 32-wide D-chunk at a time:
+                // load V chunk into Vs, run PV into Obk (16 × 36 scratch),
+                // then add the chunk into Os[row][d_off + 0..32]. This
+                // collapses the previous two-step (full-width Obk then
+                // Os += Obk) into a single per-chunk accumulation and frees
+                // 16 × (head_dim + 4 - 36) fp32 cells of TG memory — the
+                // savings is what gets d=256 under Metal's 32 KB cap.
                 for dc in range(0u32, n_chunks, 1u32) {
                     let d_off = dc * 32u32;
                     // Load V slice for this D-chunk into Vs.
@@ -496,36 +503,23 @@ macro_rules! sdpa_prefill_nax_wide {
                     threadgroup_barrier();
 
                     // PV produces a 16×32 block of the output for this D-chunk.
-                    // We store it to a 16×36 scratch window starting at Obk[row][d_off].
-                    // Since pv is overwrite-per-call, each D-chunk writes its 32-wide
-                    // slice; we then add that into Obk manually.
-                    threadgroup_alloc("Opv", 576, f32); // 16 × 36 scratch for this chunk
+                    // Store directly into Obk (the per-chunk scratch).
                     coop_tile_load_a("pv", "Ps", true, coop_stage(T), 20, 16);
                     coop_tile_load_b("pv", "Vs", true, coop_stage(T), 36, 16);
                     coop_tile_run("pv");
-                    coop_tile_store_c("pv", "Opv", true, f32, 36, 16);
+                    coop_tile_store_c("pv", "Obk", true, f32, 36, 16);
                     threadgroup_barrier();
 
-                    // Accumulate this 32-wide slice into the full Obk row.
+                    // Add this 32-wide slice into the matching Os column band.
                     if owns_row {
                         for _d in range(0u32, 32u32, 1u32) {
-                            let opv = threadgroup_load("Opv", my_row * 36u32 + _d);
-                            let ob = threadgroup_load("Obk", my_row * tg_ld_o + d_off + _d);
-                            threadgroup_store("Obk", my_row * tg_ld_o + d_off + _d, ob + opv);
+                            let ob = threadgroup_load("Obk", my_row * 36u32 + _d);
+                            let o = threadgroup_load("Os", my_row * tg_ld_o + d_off + _d);
+                            threadgroup_store("Os", my_row * tg_ld_o + d_off + _d, o + ob);
                         }
                     }
                     threadgroup_barrier();
                 }
-
-                // ── Step 5: add Obk into the running Os accumulator ─────────
-                if owns_row {
-                    for _d in range(0u32, head_dim, 1u32) {
-                        let o = threadgroup_load("Os", my_row * tg_ld_o + _d);
-                        let ob = threadgroup_load("Obk", my_row * tg_ld_o + _d);
-                        threadgroup_store("Os", my_row * tg_ld_o + _d, o + ob);
-                    }
-                }
-                threadgroup_barrier();
             }
 
             // ── Step 6: normalize and store output ───────────────────────────
@@ -545,9 +539,9 @@ macro_rules! sdpa_prefill_nax_wide {
 // d64:  16 × 68  = 1088
 // d128: 16 × 132 = 2112
 // d256: 16 × 260 = 4160
-sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d64, 64, 2, 1088);
-sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d128, 128, 4, 2112);
-sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d256, 256, 8, 4160);
+sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d64, 64u32, 2u32, 1088);
+sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d128, 128u32, 4u32, 2112);
+sdpa_prefill_nax_wide!(mt_sdpa_prefill_nax_d256, 256u32, 8u32, 4160);
 
 #[cfg(test)]
 mod tests {

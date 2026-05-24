@@ -196,14 +196,15 @@ fft_kernel!(mt_fft_n1024, 1024u32, 10u32, 0.000_976_562_5f32, "n1024");
 //
 // ## Bluestein identity
 //
-// The key identity: `nk = (n² + k² - (k-n)²) / 2`. Substituting into
-// the DFT sum:
+// The key identity: `nk = (n² + k² - (k-n)²) / 2`. Substituting into the
+// forward DFT sum `X[k] = Σ_n x[n] exp(-i2πnk/N)`:
 //
-//   X[k] = exp(iπk²/N) Σ_n x[n] exp(iπn²/N) · a[k-n]
+//   X[k] = exp(-iπk²/N) · Σ_n [x[n] · exp(-iπn²/N)] · exp(+iπ(k-n)²/N)
 //
-// where `a[m] = exp(-iπm²/N)` is the convolution kernel. The chirp
-// pre-multiply turns the DFT into a linear convolution in m=(k-n), which
-// the FFT evaluates in O(N log N).
+// So pre-multiply by `exp(-iπn²/N)`, convolve against kernel
+// `a[m] = exp(+iπm²/N)` (positive-sign chirp), post-multiply by
+// `exp(-iπk²/N)`. The chirp pre-multiply turns the DFT into a linear
+// convolution in m=(k-n), which the FFT evaluates in O(N log N).
 //
 // ## Usage pattern (caller side)
 //
@@ -224,10 +225,16 @@ fft_kernel!(mt_fft_n1024, 1024u32, 10u32, 0.000_976_562_5f32, "n1024");
 ///   `pre[m] = 0` for `m ∈ [N, M)` (zero-pad to radix-2 length M).
 ///
 /// Input: `in_re / in_im [rows, N]`; output: `out_re / out_im [rows, M]`.
-/// Constexprs: `n` (original length), `m` (padded power-of-two length), `inv`.
+/// Constexprs: `n_len` (original length), `m_len` (padded power-of-two
+/// length), `rows` (batch dimension), `inv` (0 forward, 1 inverse).
 ///
-/// Grid3D: one thread per element of `[rows, M]`.
+/// Grid3D: one thread per element of `[rows, M]`. `rows` is a constexpr
+/// so the kernel can bounds-check against `rows * m_len` — the caller
+/// dispatches `ceil(rows*M/tpg)` workgroups and the trailing threads
+/// must skip OOB writes (Apple Silicon silently lands OOB writes into
+/// adjacent buffer slots and corrupts the output).
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_preprocess<T>(
     in_re: Tensor<T>,
     in_im: Tensor<T>,
@@ -235,41 +242,50 @@ pub fn mt_fft_bluestein_preprocess<T>(
     mut out_im: Tensor<T>,
     #[constexpr] n_len: u32,
     #[constexpr] m_len: u32,
+    #[constexpr] rows: u32,
     #[constexpr] inv: u32,
 ) {
     // One thread per output element (row, col) in [rows, M].
     let idx = program_id::<0>();
-    let col = idx % m_len;
-    let row = idx / m_len;
+    // Bounds guard for trailing threads when rows*M isn't a multiple of
+    // tpg — wrap the whole body so OOB threads write nothing. (DSL has
+    // no `return`; an outer `if` is the only escape hatch.)
+    if idx < rows * m_len {
+        let col = idx % m_len;
+        let row = idx / m_len;
 
-    let pi = 3.141592653589793f32;
-    // For inv=0 (forward): chirp angle = +πn²/N (the conjugate for X[k] side).
-    // Standard Bluestein uses exp(-iπn²/N) on input and exp(-iπk²/N) on output.
-    // Forward DFT: angle_sign = -1; inverse: angle_sign = +1.
-    let angle_sign = select(inv == 0u32, -1.0f32, 1.0f32);
+        let pi = 3.141592653589793f32;
+        // Standard Bluestein for the forward DFT uses exp(-iπn²/N) on
+        // the input side and exp(-iπk²/N) on the output side (paired
+        // with a positive-sign convolution kernel built by
+        // `mt_fft_bluestein_chirp_filter`). Inverse flips both signs.
+        //   forward (inv=0): angle_sign = -1   (chirp = exp(-iπn²/N))
+        //   inverse (inv=1): angle_sign = +1   (chirp = exp(+iπn²/N))
+        let angle_sign = select(inv == 0u32, -1.0f32, 1.0f32);
 
-    // Zero-pad region: col >= n_len writes zero.
-    if col >= n_len {
-        store(out_re[row * m_len + col], 0.0f32.cast::<T>());
-        store(out_im[row * m_len + col], 0.0f32.cast::<T>());
-    } else {
-        // Chirp angle: angle_sign * π * n² / N.
-        let n_f = col.cast::<f32>();
-        let n_len_f = n_len.cast::<f32>();
-        let angle = angle_sign * pi * n_f * n_f / n_len_f;
-        let wr = cos(angle);
-        let wi = sin(angle);
+        // Zero-pad region: col >= n_len writes zero.
+        if col >= n_len {
+            store(out_re[row * m_len + col], 0.0f32.cast::<T>());
+            store(out_im[row * m_len + col], 0.0f32.cast::<T>());
+        } else {
+            // Chirp angle: angle_sign * π * n² / N.
+            let n_f = col.cast::<f32>();
+            let n_len_f = n_len.cast::<f32>();
+            let angle = angle_sign * pi * n_f * n_f / n_len_f;
+            let wr = cos(angle);
+            let wi = sin(angle);
 
-        // Load input (complex).
-        let xr = load(in_re[row * n_len + col]).cast::<f32>();
-        let xi = load(in_im[row * n_len + col]).cast::<f32>();
+            // Load input (complex).
+            let xr = load(in_re[row * n_len + col]).cast::<f32>();
+            let xi = load(in_im[row * n_len + col]).cast::<f32>();
 
-        // Complex multiply: (xr + xi·i)(wr + wi·i).
-        let pr = xr * wr - xi * wi;
-        let pi_v = xr * wi + xi * wr;
+            // Complex multiply: (xr + xi·i)(wr + wi·i).
+            let pr = xr * wr - xi * wi;
+            let pi_v = xr * wi + xi * wr;
 
-        store(out_re[row * m_len + col], pr.cast::<T>());
-        store(out_im[row * m_len + col], pi_v.cast::<T>());
+            store(out_re[row * m_len + col], pr.cast::<T>());
+            store(out_im[row * m_len + col], pi_v.cast::<T>());
+        }
     }
 }
 
@@ -294,10 +310,14 @@ inventory::submit! {
 /// Computes `a[m]` for the circular convolution `filter_re / filter_im`
 /// `[1, M]` (single row, M = padded power-of-two length):
 ///
-///   a[0]     = 1 + 0i   (n=0 chirp is always 1)
-///   a[n]     = exp(-i π n² / N)   for n ∈ [1, N)   (conjugate chirp)
-///   a[M-n]   = a[n]               for n ∈ [1, N)   (time-reversal for convolution)
-///   a[m]     = 0                  for m ∈ [N, M-N+1)
+///   a[0]     = 1 + 0i              (n=0 chirp is always 1)
+///   a[n]     = exp(+i π n² / N)    for n ∈ [1, N)   (positive-sign chirp)
+///   a[M-n]   = a[n]                for n ∈ [1, N)   (time-reversal — `a` is symmetric since |n|²=|-n|²)
+///   a[m]     = 0                   for m ∈ [N, M-N+1)
+///
+/// The positive sign matches the Bluestein identity for the forward DFT
+/// when pre/postprocess use `exp(-iπn²/N)` (see module docs). Using the
+/// negative sign here would make the convolution sum collapse to noise.
 ///
 /// This is a single-row kernel (grid = [M, 1, 1]).
 ///
@@ -322,8 +342,9 @@ pub fn mt_fft_bluestein_chirp_filter(
     if in_range {
         let n_f = n_tap.cast::<f32>();
         let n_len_f = n_len.cast::<f32>();
-        // Conjugate chirp: exp(-iπn²/N).
-        let angle = -pi * n_f * n_f / n_len_f;
+        // Positive-sign chirp: exp(+iπn²/N). Matches the Bluestein
+        // identity's `exp(+iπ(k-n)²/N)` convolution kernel.
+        let angle = pi * n_f * n_f / n_len_f;
         let wr = cos(angle);
         let wi = sin(angle);
         store(filter_re[m], wr);
@@ -365,6 +386,7 @@ inventory::submit! {
 /// broadcast across rows. Generic over `T` for the per-row input;
 /// the filter is always f32 (pre-computed once as f32).
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_cmul<T>(
     y_re: Tensor<T>,
     y_im: Tensor<T>,
@@ -373,22 +395,26 @@ pub fn mt_fft_bluestein_cmul<T>(
     mut out_re: Tensor<T>,
     mut out_im: Tensor<T>,
     #[constexpr] m_len: u32,
+    #[constexpr] rows: u32,
 ) {
     let idx = program_id::<0>();
-    let col = idx % m_len;
+    // Bounds guard — see preprocess kernel for rationale.
+    if idx < rows * m_len {
+        let col = idx % m_len;
 
-    let yr = load(y_re[idx]).cast::<f32>();
-    let yi = load(y_im[idx]).cast::<f32>();
-    // Filter broadcasts across rows (index by col only).
-    let fr = load(filter_re[col]);
-    let fi = load(filter_im[col]);
+        let yr = load(y_re[idx]).cast::<f32>();
+        let yi = load(y_im[idx]).cast::<f32>();
+        // Filter broadcasts across rows (index by col only).
+        let fr = load(filter_re[col]);
+        let fi = load(filter_im[col]);
 
-    // Complex multiply.
-    let pr = yr * fr - yi * fi;
-    let pi_v = yr * fi + yi * fr;
+        // Complex multiply.
+        let pr = yr * fr - yi * fi;
+        let pi_v = yr * fi + yi * fr;
 
-    store(out_re[idx], pr.cast::<T>());
-    store(out_im[idx], pi_v.cast::<T>());
+        store(out_re[idx], pr.cast::<T>());
+        store(out_im[idx], pi_v.cast::<T>());
+    }
 }
 
 inventory::submit! {
@@ -421,6 +447,7 @@ inventory::submit! {
 ///
 /// Grid3D: one thread per element of `[rows, N]`.
 #[kernel]
+#[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_postprocess<T>(
     conv_re: Tensor<T>,
     conv_im: Tensor<T>,
@@ -428,36 +455,40 @@ pub fn mt_fft_bluestein_postprocess<T>(
     mut out_im: Tensor<T>,
     #[constexpr] n_len: u32,
     #[constexpr] m_len: u32,
+    #[constexpr] rows: u32,
     #[constexpr] inv: u32,
 ) {
     let idx = program_id::<0>();
-    let k = idx % n_len;
-    let row = idx / n_len;
+    // Bounds guard — see preprocess kernel for rationale.
+    if idx < rows * n_len {
+        let k = idx % n_len;
+        let row = idx / n_len;
 
-    let pi = 3.141592653589793f32;
-    // Post-multiply chirp: same sign convention as pre-multiply.
-    let angle_sign = select(inv == 0u32, -1.0f32, 1.0f32);
+        let pi = 3.141592653589793f32;
+        // Post-multiply chirp: same sign convention as pre-multiply.
+        let angle_sign = select(inv == 0u32, -1.0f32, 1.0f32);
 
-    let k_f = k.cast::<f32>();
-    let n_len_f = n_len.cast::<f32>();
-    let angle = angle_sign * pi * k_f * k_f / n_len_f;
-    let wr = cos(angle);
-    let wi = sin(angle);
+        let k_f = k.cast::<f32>();
+        let n_len_f = n_len.cast::<f32>();
+        let angle = angle_sign * pi * k_f * k_f / n_len_f;
+        let wr = cos(angle);
+        let wi = sin(angle);
 
-    // Load from the IFFT output at position (row, k). The circular
-    // convolution result is in [rows, M]; we only need the first N values.
-    let cr = load(conv_re[row * m_len + k]).cast::<f32>();
-    let ci = load(conv_im[row * m_len + k]).cast::<f32>();
+        // Load from the IFFT output at position (row, k). The circular
+        // convolution result is in [rows, M]; we only need the first N values.
+        let cr = load(conv_re[row * m_len + k]).cast::<f32>();
+        let ci = load(conv_im[row * m_len + k]).cast::<f32>();
 
-    // Complex multiply.
-    let pr = cr * wr - ci * wi;
-    let pi_v = cr * wi + ci * wr;
+        // Complex multiply.
+        let pr = cr * wr - ci * wi;
+        let pi_v = cr * wi + ci * wr;
 
-    // Inverse scale: 1/N for the inverse DFT, 1 for forward.
-    let scale = select(inv == 0u32, 1.0f32, 1.0f32 / n_len_f);
+        // Inverse scale: 1/N for the inverse DFT, 1 for forward.
+        let scale = select(inv == 0u32, 1.0f32, 1.0f32 / n_len_f);
 
-    store(out_re[idx], (pr * scale).cast::<T>());
-    store(out_im[idx], (pi_v * scale).cast::<T>());
+        store(out_re[idx], (pr * scale).cast::<T>());
+        store(out_im[idx], (pi_v * scale).cast::<T>());
+    }
 }
 
 inventory::submit! {

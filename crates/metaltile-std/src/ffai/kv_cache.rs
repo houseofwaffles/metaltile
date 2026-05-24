@@ -280,13 +280,25 @@ macro_rules! quantize_kv_fp8 {
                     let e_lo = select(raw_e < $emin, $emin, raw_e);
                     let e = select(e_lo > $emax, $emax, e_lo);
                     let quantum = exp2(e - $mant_f);
+                    // q_snapped = round(norm / quantum) lands in
+                    // `[2^mant_f, 2^(mant_f+1)]` — it's the raw mantissa
+                    // *including* the implicit leading 1 bit (since
+                    // norm in binade `[2^e, 2^(e+1)]` divided by
+                    // `2^(e - mant_f)` gives `[2^mant_f, 2^(mant_f+1)]`).
+                    // Subtract `2^mant_f` to get the stored mantissa.
                     let q_snapped = select(norm > 0.0f32, round(norm / quantum), 0.0f32);
-                    // Clamp to max representable mantissa at this exponent.
-                    let max_m = exp2($mant_f) - 1.0f32;
-                    let q_m = select(q_snapped > max_m, max_m, q_snapped);
+                    let mant_offset = exp2($mant_f);
+                    let m_unbiased =
+                        select(q_snapped > mant_offset, q_snapped - mant_offset, 0.0f32);
+                    // Clamp at max representable mantissa (q rounding up
+                    // to 2^(mant_f+1) is a near-boundary value that we
+                    // saturate instead of bumping the exponent — keeps
+                    // the kernel branch-free; error is bounded by quantum).
+                    let max_m = mant_offset - 1.0f32;
+                    let q_m = select(m_unbiased > max_m, max_m, m_unbiased);
                     // Encode as fp8 bit pattern (7 magnitude bits + 1 sign).
-                    // exponent biased to unsigned: e_int = e + emax (= bias - 1)
-                    // shifted left by the mantissa count.
+                    // exponent biased by $emax (encoder/decoder must
+                    // share this convention — see decoder for details).
                     let e_int = (e + $emax).cast::<u32>();
                     let m_int = q_m.cast::<u32>();
                     let code7 = (e_int << $mant_i) | m_int;
@@ -316,7 +328,7 @@ macro_rules! quantize_kv_fp8 {
 }
 
 macro_rules! bulk_dequant_kv_fp8 {
-    ($name:ident, $subop:literal, $mant_f:literal, $mant_i:literal, $emin:literal, $fp8max:literal) => {
+    ($name:ident, $subop:literal, $mant_f:literal, $mant_i:literal, $emin:literal, $emax:literal, $fp8max:literal) => {
         /// fp8 KV-cache bulk dequant — one thread per output element.
         #[kernel]
         pub fn $name<T>(
@@ -355,11 +367,13 @@ macro_rules! bulk_dequant_kv_fp8 {
             let m_mask = (1u32 << $mant_i) - 1u32;
             let m_raw = code7 & m_mask;
             let is_normal = select(e_raw > 0u32, 1u32, 0u32);
-            // Bias: 7-bit code with `mant_i` mantissa bits → bias = (1 << (7 - mant_i)) - 1.
-            // E4M3 → 7; E5M2 → 15.
-            let exp_bits = 7u32 - $mant_i;
-            let bias = (1u32 << exp_bits) - 1u32;
-            let e_f = e_raw.cast::<f32>() - bias.cast::<f32>();
+            // Bias = `$emax` — must mirror the `e_int = e + $emax` encoding
+            // in the corresponding `quantize_kv_fp8_*` kernel. The earlier
+            // formula `(1 << (7 - mant_i)) - 1` matches the IEEE convention
+            // (bias = 7 for E4M3, 15 for E5M2) but NOT the encoder's
+            // convention (bias = 8 for E4M3, 15 for E5M2 — `$emax`),
+            // producing a constant exponent offset that wrecks the round-trip.
+            let e_f = e_raw.cast::<f32>() - $emax;
             // Normal: 2^(e_raw - bias) * (1 + m_raw / 2^mant).
             let norm_mag = exp2(e_f) * (1.0f32 + m_raw.cast::<f32>() * exp2(-($mant_f)));
             // Subnormal: 2^emin * m_raw / 2^mant.
@@ -389,15 +403,22 @@ macro_rules! bulk_dequant_kv_fp8 {
     };
 }
 
-// E4M3: 3 mantissa bits, exponent range [-6, 8] (bias 7), max 448.
+// E4M3: 3 mantissa bits.
+// IEEE-spec E4M3 reaches biased exp 15 for special-normal encodings up
+// to 448, but the encoder here uses `e_int = e + $emax` and 7-bit code
+// packing, so the safe representable max needs `2·$emax ≤ 15`. Using
+// $emax = 7 (max biased exp 14) gives a max value of 2^7·(1+7/8) = 240.
+// The full IEEE 448-range would require a special-case branch in the
+// encoder for the biased-exp-15 sub-range; not worth the perf cost for
+// a KV-cache quantizer where the practical max value is well below 240.
 quantize_kv_fp8!(
     quantize_kv_fp8_e4m3,
     "quantize_fp8_e4m3",
     3.0f32,
     3u32,
     -6.0f32,
-    8.0f32,
-    448.0f32
+    7.0f32,
+    240.0f32
 );
 // E5M2: 2 mantissa bits, exponent range [-14, 15] (bias 15), max 57344.
 quantize_kv_fp8!(
@@ -415,7 +436,8 @@ bulk_dequant_kv_fp8!(
     3.0f32,
     3u32,
     -6.0f32,
-    448.0f32
+    7.0f32,
+    240.0f32
 );
 bulk_dequant_kv_fp8!(
     bulk_dequant_kv_fp8_e5m2,
@@ -423,5 +445,6 @@ bulk_dequant_kv_fp8!(
     2.0f32,
     2u32,
     -14.0f32,
+    15.0f32,
     57344.0f32
 );

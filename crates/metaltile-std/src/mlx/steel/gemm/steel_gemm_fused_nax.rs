@@ -2,8 +2,8 @@
 //!
 //! NAX (Apple tensor-core) port of the `nn` (non-transposed) steel-gemm
 //! `C = A · B` where `A: [M, K]`, `B: [K, N]`, `C: [M, N]`, all row-major.
-//! Gated behind the `nax` Cargo feature — the kernel requires the Metal 4
-//! `MetalPerformancePrimitives` framework (macOS 26+).
+//! Requires the Metal 4 `MetalPerformancePrimitives` framework (macOS 26+)
+//! and Apple10+ hardware; runtime-gated via `Context::chip_family()`.
 //!
 //! Expressed entirely in the `#[kernel]` DSL via the `coop_tile_*`
 //! intrinsics — no `Op::InlineMsl`. The `coop_tile_*` ops lower to the

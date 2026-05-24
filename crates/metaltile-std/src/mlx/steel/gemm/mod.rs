@@ -1,11 +1,8 @@
 pub mod steel_gemm_fused;
-#[cfg(feature = "nax")]
 pub mod steel_gemm_fused_nax;
 pub mod steel_gemm_gather;
-#[cfg(feature = "nax")]
 pub mod steel_gemm_gather_nax;
 pub mod steel_gemm_masked;
 pub mod steel_gemm_segmented;
 pub mod steel_gemm_splitk;
-#[cfg(feature = "nax")]
 pub mod steel_gemm_splitk_nax;

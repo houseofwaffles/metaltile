@@ -16,13 +16,11 @@
 //! the metallib still links; this test then fails the correctness check,
 //! which is the intended signal.
 //!
-//! Gated behind the `nax` Cargo feature.
 //!
 //! Run:
-//!   cargo test --release -p metaltile-std --features nax \
-//!     --test steel_gemm_splitk_nax_gpu_correctness -- --nocapture
+//!   cargo test --release -p metaltile-std --test steel_gemm_splitk_nax_gpu_correctness -- --nocapture
 
-#![cfg(all(target_os = "macos", feature = "nax"))]
+#![cfg(target_os = "macos")]
 
 use std::collections::BTreeMap;
 
