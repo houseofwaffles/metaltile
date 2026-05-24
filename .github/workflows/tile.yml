@@ -126,9 +126,11 @@ jobs:
               echo "<details>"
               echo "<summary>tile diff @ commit \`${COMMIT_SHORT}\`</summary>"
               echo
-              echo '```ansi'
+              echo '```'
+              # Strip ANSI colour codes so the PR comment renders cleanly.
               # `|| true` so a regression exit code (1) doesn't kill the job.
-              tile diff "$BL" /tmp/bench.json 2>&1 || true
+              tile diff "$BL" /tmp/bench.json 2>&1 \
+                | sed 's/\x1b\[[0-9;]*m//g' || true
               echo '```'
               echo
               echo '</details>'
