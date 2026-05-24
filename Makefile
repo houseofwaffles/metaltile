@@ -58,7 +58,7 @@ test-validate: ## cargo test --workspace under Metal shader validation (diagnost
 
 .PHONY: coverage
 coverage: ## test coverage report (requires cargo-llvm-cov)
-	./scripts/coverage.sh
+	./.github/scripts/coverage.sh
 
 # ─── Lint / format ────────────────────────────────────────────────────
 #

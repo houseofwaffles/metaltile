@@ -13,7 +13,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - 'codecov.yml'
+      - '.github/configs/codecov.yml'
       - '.github/workflows/coverage.yml'
   workflow_dispatch: {}
 
@@ -65,6 +65,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: coverage.json
+          codecov_yml_path: .github/configs/codecov.yml
           fail_ci_if_error: false
           verbose: true
 

@@ -1,6 +1,6 @@
 # Pre-commit hooks for metaltile.
-# Install:  pip install pre-commit && pre-commit install
-# Run all:  pre-commit run --all-files
+# Install:  pip install pre-commit && pre-commit install --config .github/configs/.pre-commit-config.yaml
+# Run all:  pre-commit run --all-files --config .github/configs/.pre-commit-config.yaml
 
 repos:
   - repo: local

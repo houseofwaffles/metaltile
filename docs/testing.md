@@ -41,7 +41,7 @@ cargo test --release -p metaltile-std --test <kernel>_gpu_correctness -- --ignor
 | Job | Workflow | What it runs |
 |---|---|---|
 | `typos` / `clippy` / tests | `.github/workflows/check.yml` | spell-check, lint `-D warnings`, `cargo test --workspace` |
-| coverage | `.github/workflows/coverage.yml` | `cargo llvm-cov --workspace --codecov` on macOS, uploads to Codecov; runs on pushes touching `crates/`, `Cargo.*`, `rust-toolchain.toml`, `codecov.yml` |
+| coverage | `.github/workflows/coverage.yml` | `cargo llvm-cov --workspace --codecov` on macOS, uploads to Codecov; runs on pushes touching `crates/`, `Cargo.*`, `rust-toolchain.toml`, `.github/configs/codecov.yml` |
 | PR title | `.github/workflows/pr.yml` | validates the conventional-commit format |
 | labels | `.github/workflows/auto-label.yml` | release-notes labels from the PR-title prefix |
 
@@ -87,7 +87,7 @@ Fixtures exist to **exercise distinct emit paths**, not to be exhaustive — add
 
 ## Coverage
 
-`make coverage` (or `./scripts/coverage.sh`) produces an HTML report at `target/llvm-cov/html/index.html`; `./scripts/coverage.sh summary` prints the per-file table CI emits. Per-crate floors live in `codecov.yml`:
+`make coverage` (or `./.github/scripts/coverage.sh`) produces an HTML report at `target/llvm-cov/html/index.html`; `./.github/scripts/coverage.sh summary` prints the per-file table CI emits. Per-crate floors live in `.github/configs/codecov.yml`:
 
 | Crate | Floor |
 |---|---|
