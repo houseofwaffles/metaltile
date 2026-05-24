@@ -27,14 +27,15 @@
 //! Codegen-only. Validated by `rope_yarn_gpu_correctness` + FFAI
 //! integration tests.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="rope",
+    subop="rope_yarn",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn ffai_rope_yarn<T>(
     qk: Tensor<T>,
@@ -83,20 +84,4 @@ pub fn ffai_rope_yarn<T>(
 
     store(out[i1], o1.cast::<T>());
     store(out[i2], o2.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rope",
-        subop: "rope_yarn",
-        kernel_name: "ffai_rope_yarn",
-        kernel_ir: ffai_rope_yarn::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

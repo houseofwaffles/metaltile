@@ -51,14 +51,15 @@
 //! per prefill step in state traffic alone. The chunked variant does
 //! 2 MiB × 30 = 60 MiB.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="gated_delta",
+    subop="prep_chunk",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn mt_gated_delta_prep_chunk<T>(
     conv_out: Tensor<T>,      // [B, T, 2·Hk·Dk + Hv·Dv]
@@ -202,25 +203,12 @@ pub fn mt_gated_delta_prep_chunk<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "gated_delta",
-        subop: "prep_chunk",
-        kernel_name: "mt_gated_delta_prep_chunk",
-        kernel_ir: mt_gated_delta_prep_chunk::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use metaltile_core::ir::KernelMode;
+
     use super::*;
+    use crate::bench_types::DType;
 
     /// Developer aid — dump the full generated MSL for inspection.
     /// `cargo test -p metaltile-std --lib --release -- ffai::gated_delta_prep_chunk::tests::dump --nocapture`

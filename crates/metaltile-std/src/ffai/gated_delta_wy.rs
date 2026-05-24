@@ -64,14 +64,15 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="gated_delta",
+    subop="wy_chunk",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn mt_gated_delta_wy_chunk<T>(
     q: Tensor<T>,
@@ -361,21 +362,5 @@ pub fn mt_gated_delta_wy_chunk<T>(
     for ii in range(lane, total_state, 32u32) {
         let s = threadgroup_load("tg_state", ii);
         store(state_out[state_base + ii], s.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "gated_delta",
-        subop: "wy_chunk",
-        kernel_name: "mt_gated_delta_wy_chunk",
-        kernel_ir: mt_gated_delta_wy_chunk::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

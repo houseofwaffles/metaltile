@@ -33,13 +33,9 @@
 //! upstream file about Qwen3.5-9B `!!!!!` decoding regressions when
 //! this was fp32 + caller-side cast.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::{DType, FLOAT_DTYPES},
-    spec::{BenchDispatch, BenchSpec},
-};
+use crate::bench_types::DType;
 
 // Keep `DType` referenced — the bf16-only shortlist was a legacy default;
 // now that the partials and output are all `Tensor<T>` the kernel handles
@@ -48,6 +44,7 @@ const _: DType = DType::F32;
 
 macro_rules! aura_flash_pass2_kernel {
     ($name:ident, $dims_per_lane:literal, $subop:literal) => {
+        #[bench_kernel(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)]
         #[kernel]
         pub fn $name<T>(
             o_partials: Tensor<T>,
@@ -109,22 +106,6 @@ macro_rules! aura_flash_pass2_kernel {
                     let v = stack_load("o", i) * inv_l;
                     store(output[q_idx * dim + d], v.cast::<T>());
                 }
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "aura",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: FLOAT_DTYPES,
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Reduction),
             }
         }
     };

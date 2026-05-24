@@ -85,14 +85,15 @@
 //! to avoid catastrophic cancellation in the `exp(max_old - max_new)`
 //! rescale at long context.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_sdpa_decode<T>(
     q: Tensor<T>,
@@ -325,22 +326,6 @@ pub fn ffai_sdpa_decode<T>(
         store(out[out_off + 1u32], so1.cast::<T>());
         store(out[out_off + 2u32], so2.cast::<T>());
         store(out[out_off + 3u32], so3.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode",
-        kernel_name: "ffai_sdpa_decode",
-        kernel_ir: ffai_sdpa_decode::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }
 

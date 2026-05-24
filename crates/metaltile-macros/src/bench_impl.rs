@@ -35,6 +35,19 @@ pub enum ClassKind {
     AffineQuantize,
     SdpaVector,
     SdpaPrefill,
+    /// Generic dispatch with empty shapes and explicit kernel_mode.
+    /// Used by ffai kernels that register via `BenchDispatch::Generic`
+    /// but don't use the auto-generated ShapeSpec from the simple classes.
+    GenericEmpty,
+    /// Two-pass SDPA decode: pass1 + pass2 chained dispatch.
+    /// Requires: h (head_dim), n_kv, n_heads, gqa_factor, batch,
+    /// blocks, pass2_kernel (module name).
+    SdpaVector2Pass,
+    /// Batched-Q SDPA decode for speculative decoding.
+    /// Requires: h (head_dim), n_kv, n_heads, gqa_factor, batch_q,
+    /// variant (Decode | PrefillTile), tpg.  For PrefillTile variant,
+    /// also requires bq, bk, wm, wn.
+    SdpaBatchedDecode,
 }
 
 pub enum InputKind {
@@ -42,6 +55,20 @@ pub enum InputKind {
     Positive,
     Half,
     Unit,
+}
+
+pub enum KernelModeArg {
+    None,
+    Elementwise,
+    Reduction,
+    Grid3D,
+    SimdGroup2D,
+}
+
+/// `BatchedDecodeVariant` discriminator for `SdpaBatchedDecode`.
+pub enum BatchedDecodeVariantArg {
+    Decode,
+    PrefillTile,
 }
 
 pub struct BenchArgs {
@@ -57,6 +84,7 @@ pub struct BenchArgs {
     pub mlx: Option<LitStr>,
     pub dtypes: Option<Expr>,
     pub metal_file: Option<LitStr>,
+    pub kernel_mode: KernelModeArg,
     // RowNorm-specific
     pub reads: Option<LitInt>,
     pub out_elements: Option<LitInt>,
@@ -91,6 +119,12 @@ pub struct BenchArgs {
     pub bk: Option<LitInt>,
     pub wm: Option<LitInt>,
     pub wn: Option<LitInt>,
+    // SdpaVector2Pass
+    pub blocks: Option<LitInt>,
+    pub pass2_kernel: Option<Ident>,
+    // SdpaBatchedDecode
+    pub batch_q: Option<LitInt>,
+    pub variant: Option<BatchedDecodeVariantArg>,
 }
 
 fn parse_input(s: &str, span: proc_macro2::Span) -> syn::Result<InputKind> {
@@ -149,6 +183,11 @@ impl Parse for BenchArgs {
         let mut bk_field: Option<LitInt> = None;
         let mut wm_field: Option<LitInt> = None;
         let mut wn_field: Option<LitInt> = None;
+        let mut km_field: Option<KernelModeArg> = None;
+        let mut blocks_field: Option<LitInt> = None;
+        let mut pass2_kernel_field: Option<Ident> = None;
+        let mut batch_q_field: Option<LitInt> = None;
+        let mut variant_field: Option<BatchedDecodeVariantArg> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -183,6 +222,9 @@ impl Parse for BenchArgs {
                         "AffineQuantize" => ClassKind::AffineQuantize,
                         "SdpaVector" => ClassKind::SdpaVector,
                         "SdpaPrefill" => ClassKind::SdpaPrefill,
+                        "GenericEmpty" => ClassKind::GenericEmpty,
+                        "SdpaVector2Pass" => ClassKind::SdpaVector2Pass,
+                        "SdpaBatchedDecode" => ClassKind::SdpaBatchedDecode,
                         o => {
                             return Err(syn::Error::new(id.span(), format!("unknown class `{o}`")));
                         },
@@ -210,6 +252,24 @@ impl Parse for BenchArgs {
                 "mlx" => mlx = Some(input.parse()?),
                 "dtypes" => dtypes = Some(input.parse()?),
                 "metal_file" => metal_file = Some(input.parse()?),
+                "kernel_mode" => {
+                    let id: Ident = input.parse()?;
+                    let km = match id.to_string().as_str() {
+                        "None" => KernelModeArg::None,
+                        "Elementwise" => KernelModeArg::Elementwise,
+                        "Reduction" => KernelModeArg::Reduction,
+                        "Grid3D" => KernelModeArg::Grid3D,
+                        "SimdGroup2D" => KernelModeArg::SimdGroup2D,
+                        o =>
+                            return Err(syn::Error::new(
+                                id.span(),
+                                format!(
+                                    "kernel_mode must be None|Elementwise|Reduction|Grid3D|SimdGroup2D, got `{o}`"
+                                ),
+                            )),
+                    };
+                    km_field = Some(km);
+                },
                 "shapes" => shapes = Some(input.parse()?),
                 "reads" => reads = Some(input.parse()?),
                 "out_elements" => out_elements = Some(input.parse()?),
@@ -239,6 +299,22 @@ impl Parse for BenchArgs {
                 "bk" => bk_field = Some(input.parse()?),
                 "wm" => wm_field = Some(input.parse()?),
                 "wn" => wn_field = Some(input.parse()?),
+                "blocks" => blocks_field = Some(input.parse()?),
+                "pass2_kernel" => pass2_kernel_field = Some(input.parse()?),
+                "batch_q" => batch_q_field = Some(input.parse()?),
+                "variant" => {
+                    let id: Ident = input.parse()?;
+                    let var = match id.to_string().as_str() {
+                        "Decode" => BatchedDecodeVariantArg::Decode,
+                        "PrefillTile" => BatchedDecodeVariantArg::PrefillTile,
+                        o =>
+                            return Err(syn::Error::new(
+                                id.span(),
+                                format!("variant must be Decode|PrefillTile, got `{o}`"),
+                            )),
+                    };
+                    variant_field = Some(var);
+                },
                 o => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -264,6 +340,7 @@ impl Parse for BenchArgs {
             mlx,
             dtypes,
             metal_file,
+            kernel_mode: km_field.unwrap_or(KernelModeArg::None),
             shapes,
             reads,
             out_elements,
@@ -293,6 +370,10 @@ impl Parse for BenchArgs {
             bk: bk_field,
             wm: wm_field,
             wn: wn_field,
+            blocks: blocks_field,
+            pass2_kernel: pass2_kernel_field,
+            batch_q: batch_q_field,
+            variant: variant_field,
         })
     }
 }
@@ -310,6 +391,16 @@ fn opt_str(v: &Option<LitStr>) -> TokenStream {
     match v {
         Some(s) => quote! {Some(#s)},
         None => quote! {None},
+    }
+}
+
+fn kernel_mode_ts(km: &KernelModeArg) -> TokenStream {
+    match km {
+        KernelModeArg::None => quote! { None },
+        KernelModeArg::Elementwise => quote! { Some(metaltile_core::ir::KernelMode::Elementwise) },
+        KernelModeArg::Reduction => quote! { Some(metaltile_core::ir::KernelMode::Reduction) },
+        KernelModeArg::Grid3D => quote! { Some(metaltile_core::ir::KernelMode::Grid3D) },
+        KernelModeArg::SimdGroup2D => quote! { Some(metaltile_core::ir::KernelMode::SimdGroup2D) },
     }
 }
 pub fn generate_submit(fn_name: &syn::Ident, a: &BenchArgs, is_generic: bool) -> TokenStream {
@@ -921,7 +1012,74 @@ pub fn generate_submit(fn_name: &syn::Ident, a: &BenchArgs, is_generic: bool) ->
                 }
             })
         },
+        // ── GenericEmpty: Generic dispatch with empty shapes ────────────
+        ClassKind::GenericEmpty => (quote! { &[] }, quote! { crate::spec::BenchDispatch::Generic }),
+        // ── Complex: SdpaVector2Pass (two-pass SDPA decode) ────────────
+        ClassKind::SdpaVector2Pass => {
+            let hd = a.h.as_ref().expect("SdpaVector2Pass requires h (head_dim)");
+            let nkv = a.n_kv.as_ref().expect("SdpaVector2Pass requires n_kv");
+            let nh = a.n_heads.as_ref().expect("SdpaVector2Pass requires n_heads (Q heads)");
+            let gqa = a.gqa_factor.as_ref().expect("SdpaVector2Pass requires gqa_factor");
+            let batch = a.batch.as_ref().expect("SdpaVector2Pass requires batch");
+            let blocks_val = a.blocks.as_ref().expect("SdpaVector2Pass requires blocks");
+            let p2k = a.pass2_kernel.as_ref().expect("SdpaVector2Pass requires pass2_kernel");
+            let p2_name = p2k.to_string();
+            (quote! { &[] }, quote! {
+                crate::spec::BenchDispatch::SdpaVector2Pass {
+                    head_dim: #hd as usize,
+                    n_kv: #nkv as usize,
+                    n_q_heads: #nh as usize,
+                    gqa_factor: #gqa as usize,
+                    batch: #batch as usize,
+                    blocks: #blocks_val as usize,
+                    pass2_kernel_name: #p2_name,
+                    pass2_kernel_ir: #p2k::kernel_ir_for,
+                }
+            })
+        },
+        // ── Complex: SdpaBatchedDecode ──────────────────────────────────
+        ClassKind::SdpaBatchedDecode => {
+            let hd = a.h.as_ref().expect("SdpaBatchedDecode requires h (head_dim)");
+            let nkv = a.n_kv.as_ref().expect("SdpaBatchedDecode requires n_kv");
+            let nh = a.n_heads.as_ref().expect("SdpaBatchedDecode requires n_heads (Q heads)");
+            let gqa = a.gqa_factor.as_ref().expect("SdpaBatchedDecode requires gqa_factor");
+            let bq = a.batch_q.as_ref().expect("SdpaBatchedDecode requires batch_q");
+            let tpg_val = a.tpg.as_ref().expect("SdpaBatchedDecode requires tpg");
+            let variant_dispatch =
+                match a.variant.as_ref().expect("SdpaBatchedDecode requires variant") {
+                    BatchedDecodeVariantArg::Decode => {
+                        quote! { crate::spec::BatchedDecodeVariant::Decode }
+                    },
+                    BatchedDecodeVariantArg::PrefillTile => {
+                        let bq_tile = a.bq.as_ref().expect("PrefillTile requires bq");
+                        let bk_tile = a.bk.as_ref().expect("PrefillTile requires bk");
+                        let wm_tile = a.wm.as_ref().expect("PrefillTile requires wm");
+                        let wn_tile = a.wn.as_ref().expect("PrefillTile requires wn");
+                        quote! {
+                            crate::spec::BatchedDecodeVariant::PrefillTile {
+                                bq: #bq_tile as usize,
+                                bk: #bk_tile as usize,
+                                wm: #wm_tile as usize,
+                                wn: #wn_tile as usize,
+                            }
+                        }
+                    },
+                };
+            (quote! { &[] }, quote! {
+                crate::spec::BenchDispatch::SdpaBatchedDecode {
+                    head_dim: #hd as usize,
+                    n_kv: #nkv as usize,
+                    n_q_heads: #nh as usize,
+                    gqa_factor: #gqa as usize,
+                    batch_q: #bq as usize,
+                    variant: #variant_dispatch,
+                    tpg: #tpg_val as usize,
+                }
+            })
+        },
     };
+
+    let km_ts = kernel_mode_ts(&a.kernel_mode);
 
     quote! {
         ::inventory::submit! {
@@ -936,7 +1094,7 @@ pub fn generate_submit(fn_name: &syn::Ident, a: &BenchArgs, is_generic: bool) ->
                 mlx_pattern: #mlx_pat,
                 shapes:      #shapes_ts,
                 dispatch:    #dispatch_ts,
-                kernel_mode: None,
+                kernel_mode: #km_ts,
             }
         }
     }

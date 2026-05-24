@@ -47,15 +47,7 @@
 //!
 //! Codegen-only. Correctness validated by `conv2d_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 /// Emit a conv2d kernel. `$kh / $kw / $stride` are either literals (the
 /// fixed-patch variants) or the `kh / kw / stride_h / stride_w`
@@ -64,6 +56,7 @@ const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
 /// pan-and-scan tiles can carry a small pad.
 macro_rules! conv2d_kernel {
     ($name:ident, $subop:literal, $kh:expr, $kw:expr, $sh:expr, $sw:expr) => {
+        #[bench_kernel(op="conv2d", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             input: Tensor<T>,
@@ -142,22 +135,6 @@ macro_rules! conv2d_kernel {
 
             store(out[idx], acc.cast::<T>());
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "conv2d",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: ALL_FLOAT_DTYPES,
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
@@ -216,6 +193,13 @@ conv2d_kernel!(conv2d_generic, "generic", kh, kw, stride_h, stride_w);
 ///   constexprs so no division happens on the hot path.
 ///
 /// Codegen-only; correctness pinned by `conv2d_gpu_correctness`.
+#[bench_kernel(
+    op="conv2d",
+    subop="grouped",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_grouped<T>(
@@ -300,20 +284,4 @@ pub fn conv2d_grouped<T>(
     }
 
     store(out[idx], acc.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "conv2d",
-        subop: "grouped",
-        kernel_name: "conv2d_grouped",
-        kernel_ir: conv2d_grouped::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

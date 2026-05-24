@@ -29,14 +29,15 @@
 //! are handled in-kernel: out-of-range loads clamp to index 0 and
 //! contribute 0, out-of-range stores are skipped.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="gemm",
+    subop="gemm",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_gemm<T>(
     weight: Tensor<T>,
@@ -93,21 +94,5 @@ pub fn ffai_gemm<T>(
         if o < out_dim {
             store(out[r * out_dim + o], acc.cast::<T>());
         }
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "gemm",
-        subop: "gemm",
-        kernel_name: "ffai_gemm",
-        kernel_ir: ffai_gemm::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

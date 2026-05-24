@@ -53,17 +53,18 @@
 //! ssq + simd_sum + scale into that same pass and stashes the result on
 //! the per-lane stack alongside `decayed` / `k_cache`. fp32 throughout.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// Fused GDN prep + recurrence step. See module doc for layout and
 /// dispatch invariants. Drop-in replacement for the
 /// `host-prep + mt_gated_delta_step` pair in `Qwen35GDNMixer.forward`.
+#[bench_kernel(
+    op="gated_delta",
+    subop="prep_step",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn mt_gated_delta_prep_step<T>(
     conv_out: Tensor<T>,      // [B, 2·Hk·Dk + Hv·Dv]    q | k | v
@@ -228,25 +229,12 @@ pub fn mt_gated_delta_prep_step<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "gated_delta",
-        subop: "prep_step",
-        kernel_name: "mt_gated_delta_prep_step",
-        kernel_ir: mt_gated_delta_prep_step::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use metaltile_core::ir::KernelMode;
+
     use super::*;
+    use crate::bench_types::DType;
 
     /// Developer aid — dump the full generated MSL for inspection.
     /// `cargo test -p metaltile-std --lib --release -- ffai::gated_delta_prep::tests::dump --nocapture`

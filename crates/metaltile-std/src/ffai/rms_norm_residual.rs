@@ -24,15 +24,16 @@
 //! Codegen-only; correctness pinned by
 //! `tests/rms_norm_residual_gpu_correctness.rs`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// `out[r, i] = residual[r, i] + w[i] * x[r, i] * rsqrt(mean(x[r]²) + eps)`.
+#[bench_kernel(
+    op="rms_norm_residual",
+    subop="rms_norm_residual",
+    class=GenericEmpty,
+    tol=1e-4,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_rms_norm_residual<T>(
     x: Tensor<T>,
@@ -74,21 +75,5 @@ pub fn ffai_rms_norm_residual<T>(
         store(out[base + 1u32], o1.cast::<T>());
         store(out[base + 2u32], o2.cast::<T>());
         store(out[base + 3u32], o3.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rms_norm_residual",
-        subop: "rms_norm_residual",
-        kernel_name: "ffai_rms_norm_residual",
-        kernel_ir: ffai_rms_norm_residual::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-4,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

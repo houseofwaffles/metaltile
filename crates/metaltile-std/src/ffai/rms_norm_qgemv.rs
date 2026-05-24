@@ -42,17 +42,18 @@
 //! Codegen-only; correctness pinned by
 //! `tests/rms_norm_qgemv_gpu_correctness.rs`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// `y[row] = Σ_i (q[row,i]·scale + bias) · (x[i]·norm_weight[i]·inv_rms)`,
 /// with `inv_rms = rsqrt(mean(x²) + eps)`, weights int4-packed.
 /// One output row per threadgroup (original correctness-first variant).
+#[bench_kernel(
+    op="rms_norm_qgemv",
+    subop="rms_norm_qgemv",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_rms_norm_qgemv<T>(
     x: Tensor<T>,
@@ -132,6 +133,13 @@ pub fn ffai_rms_norm_qgemv<T>(
 ///
 /// Grid: `[out_dim/8, 1, 1]`. out_dim must be a multiple of 8;
 /// in_dim must be a multiple of 512; group_size must be 64.
+#[bench_kernel(
+    op="rms_norm_qgemv",
+    subop="rms_norm_qgemv_fast",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_rms_norm_qgemv_fast<T>(
     x: Tensor<T>,
@@ -453,38 +461,6 @@ pub fn ffai_rms_norm_qgemv_fast<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "rms_norm_qgemv",
-        subop: "rms_norm_qgemv",
-        kernel_name: "ffai_rms_norm_qgemv",
-        kernel_ir: ffai_rms_norm_qgemv::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rms_norm_qgemv",
-        subop: "rms_norm_qgemv_fast",
-        kernel_name: "ffai_rms_norm_qgemv_fast",
-        kernel_ir: ffai_rms_norm_qgemv_fast::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ─── ffai_rms_norm_qgemv_int8_fast ───────────────────────────────────────────
 //
 // Fused RMSNorm + int8-quantized GEMV — 8-row-per-TG perf variant.
@@ -513,6 +489,13 @@ inventory::submit! {
 ///
 /// int8 variant of `ffai_rms_norm_qgemv_fast`. Byte-extract (4 vals/pack),
 /// algebraic-split accumulator. Grid: `[out_dim/8, 1, 1]`.
+#[bench_kernel(
+    op="rms_norm_qgemv",
+    subop="rms_norm_qgemv_int8_fast",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_rms_norm_qgemv_int8_fast<T>(
     x: Tensor<T>,
@@ -731,21 +714,5 @@ pub fn ffai_rms_norm_qgemv_int8_fast<T>(
         store(output[row1], r1.cast::<T>());
         store(output[row2], r2.cast::<T>());
         store(output[row3], r3.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rms_norm_qgemv",
-        subop: "rms_norm_qgemv_int8_fast",
-        kernel_name: "ffai_rms_norm_qgemv_int8_fast",
-        kernel_ir: ffai_rms_norm_qgemv_int8_fast::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

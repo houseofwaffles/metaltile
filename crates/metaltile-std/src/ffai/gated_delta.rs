@@ -45,14 +45,15 @@
 //! recurrence in bf16 drifts after a few dozen decode steps, same
 //! reasoning as `ssm_step`. Activations stay in T.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="gated_delta",
+    subop="step",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn mt_gated_delta_step<T>(
     q: Tensor<T>,             // [B, Hk, Dk]   flat: (b * Hk + hk_idx) * Dk + dk_offset
@@ -137,22 +138,6 @@ pub fn mt_gated_delta_step<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "gated_delta",
-        subop: "step",
-        kernel_name: "mt_gated_delta_step",
-        kernel_ir: mt_gated_delta_step::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ────────────────────────────────────────────────────────────────────
 //  Chunked-prefill form (T > 1)
 // ────────────────────────────────────────────────────────────────────
@@ -192,6 +177,13 @@ inventory::submit! {
 /// - **`t_len` is a runtime u32** (passed as a scalar buffer, not a
 ///   constexpr) so a single PSO compiles for all chunk sizes the
 ///   scheduler picks.
+#[bench_kernel(
+    op="gated_delta",
+    subop="chunk",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn mt_gated_delta_chunk<T>(
     q: Tensor<T>,             // [B, T, Hk, Dk]
@@ -287,21 +279,5 @@ pub fn mt_gated_delta_chunk<T>(
     for i in range(0u32, n_per_t, 1u32) {
         let s_idx = n_per_t * dk_idx + i;
         store(state_out[state_base + s_idx], stack_load("state_reg", i).cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "gated_delta",
-        subop: "chunk",
-        kernel_name: "mt_gated_delta_chunk",
-        kernel_ir: mt_gated_delta_chunk::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

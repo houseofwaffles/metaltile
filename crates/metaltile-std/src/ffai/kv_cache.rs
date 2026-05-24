@@ -19,13 +19,7 @@
 //! Codegen-only. End-to-end correctness validated in FFAI integration
 //! tests against real model decoding.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 // ─── Raw cache append ────────────────────────────────────────────────
 
@@ -33,6 +27,13 @@ use crate::{
 // per-head cache slot at `position`. Source layout: [n_kv_heads, head_dim].
 // Dest layout: [n_kv_heads, max_seq, head_dim]. One thread per output
 // element (n_kv_heads * head_dim total threads).
+#[bench_kernel(
+    op="kv_cache",
+    subop="update",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn kv_cache_update<T>(
     src: Tensor<T>,
@@ -48,22 +49,6 @@ pub fn kv_cache_update<T>(
     store(out[dst_idx], load(src[idx]));
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "kv_cache",
-        subop: "update",
-        kernel_name: "kv_cache_update",
-        kernel_ir: kv_cache_update::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // ─── Affine quantize (int4 / int8) ────────────────────────────────────
 //
 // One thread per group.  Scans the group for min/max, derives a safe
@@ -72,6 +57,7 @@ inventory::submit! {
 // arithmetic at PSO creation.
 macro_rules! quantize_kv_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
+        #[bench_kernel(op="kv_cache", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             src: Tensor<T>,
@@ -124,22 +110,6 @@ macro_rules! quantize_kv_kernel {
                 store(out_w[dst_w_base + p], packed);
             }
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "kv_cache",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
@@ -150,6 +120,7 @@ macro_rules! quantize_kv_kernel {
 // Output layout matches raw KVCache: [n_kv_heads, max_seq, head_dim].
 macro_rules! bulk_dequant_kv_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
+        #[bench_kernel(op="kv_cache", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             in_w: Tensor<u32>,
@@ -185,22 +156,6 @@ macro_rules! bulk_dequant_kv_kernel {
             let dst_idx = h * max_seq * head_dim + pos * head_dim + d;
             store(out[dst_idx], w_real.cast::<T>());
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "kv_cache",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
@@ -231,6 +186,7 @@ macro_rules! quantize_kv_fp8 {
     ($name:ident, $subop:literal, $mant_f:literal, $mant_i:literal, $emin:literal, $emax:literal, $fp8max:literal) => {
         /// fp8 KV-cache quantize — one thread per group. Stores the group amax
         /// as scale and packs fp8-quantized codes (4 per u32, 8 bits each).
+        #[bench_kernel(op="kv_cache", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             src: Tensor<T>,
@@ -308,28 +264,13 @@ macro_rules! quantize_kv_fp8 {
                 store(out_w[dst_w_base + p], packed);
             }
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "kv_cache",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
 macro_rules! bulk_dequant_kv_fp8 {
     ($name:ident, $subop:literal, $mant_f:literal, $mant_i:literal, $emin:literal, $emax:literal, $fp8max:literal) => {
         /// fp8 KV-cache bulk dequant — one thread per output element.
+        #[bench_kernel(op="kv_cache", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             in_w: Tensor<u32>,
@@ -383,22 +324,6 @@ macro_rules! bulk_dequant_kv_fp8 {
 
             let dst_idx = h * max_seq * head_dim + pos * head_dim + d;
             store(out[dst_idx], w_real.cast::<T>());
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "kv_cache",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
         }
     };
 }

@@ -27,14 +27,15 @@
 //!
 //! Codegen-only. Correctness validated by `audio_conv1d_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="audio_conv1d",
+    subop="audio_conv1d",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn audio_conv1d<T>(
     input: Tensor<T>,
@@ -82,20 +83,4 @@ pub fn audio_conv1d<T>(
     }
 
     store(out[idx], acc.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "audio_conv1d",
-        subop: "audio_conv1d",
-        kernel_name: "audio_conv1d",
-        kernel_ir: audio_conv1d::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

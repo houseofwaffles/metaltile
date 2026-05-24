@@ -51,14 +51,15 @@
 //!
 //! Codegen-only. Correctness validated by `vocoder_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="vocoder",
+    subop="istft",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn vocoder_istft<T>(
     spec_re: Tensor<T>,
@@ -132,20 +133,4 @@ pub fn vocoder_istft<T>(
     let safe_den = select(den > 1e-8f32, den, 1.0f32);
     let out_val = select(den > 1e-8f32, num / safe_den, 0.0f32);
     store(out[t], out_val.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "vocoder",
-        subop: "istft",
-        kernel_name: "vocoder_istft",
-        kernel_ir: vocoder_istft::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

@@ -64,18 +64,17 @@
 //!
 //! Codegen-only. Correctness validated by `winograd_conv_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 /// Winograd F(2×2, 3×3) convolution. See the module docs for the
 /// algorithm and the dispatch invariants.
+#[bench_kernel(
+    op="conv2d",
+    subop="winograd_3x3",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn winograd_conv2d_3x3<T>(
@@ -325,22 +324,6 @@ pub fn winograd_conv2d_3x3<T>(
     store(out[out_row1 + ow0 + 1u32], y11.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "conv2d",
-        subop: "winograd_3x3",
-        kernel_name: "winograd_conv2d_3x3",
-        kernel_ir: winograd_conv2d_3x3::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // cuDNN-style split: hoist the filter transform.
 //
@@ -357,6 +340,13 @@ inventory::submit! {
 /// `U = G·g·Gᵀ`. One thread per `(oc, ic)` pair; `u` is `[out_ch, in_ch,
 /// 4, 4]` row-major. Dispatch: Grid3D, `program_id<0>` over
 /// `out_ch · in_ch`.
+#[bench_kernel(
+    op="conv2d",
+    subop="winograd_filter_transform_3x3",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn winograd_filter_transform_3x3<T>(
     weight: Tensor<T>,
@@ -413,27 +403,18 @@ pub fn winograd_filter_transform_3x3<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "conv2d",
-        subop: "winograd_filter_transform_3x3",
-        kernel_name: "winograd_filter_transform_3x3",
-        kernel_ir: winograd_filter_transform_3x3::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 /// Winograd F(2×2, 3×3) convolution consuming a *pre-transformed* filter
 /// buffer `u` (`[out_ch, in_ch, 4, 4]`, produced by
 /// `winograd_filter_transform_3x3`). Identical to `winograd_conv2d_3x3`
 /// except the per-`(oc, ic)` filter transform is replaced by 16 loads of
 /// the precomputed `U`. Pair them: filter-transform once, then this.
+#[bench_kernel(
+    op="conv2d",
+    subop="winograd_3x3_split",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn winograd_conv2d_3x3_split<T>(
@@ -631,20 +612,4 @@ pub fn winograd_conv2d_3x3_split<T>(
     store(out[out_row0 + ow0 + 1u32], y01.cast::<T>());
     store(out[out_row1 + ow0], y10.cast::<T>());
     store(out[out_row1 + ow0 + 1u32], y11.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "conv2d",
-        subop: "winograd_3x3_split",
-        kernel_name: "winograd_conv2d_3x3_split",
-        kernel_ir: winograd_conv2d_3x3_split::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

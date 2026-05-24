@@ -72,15 +72,7 @@
 //!
 //! Codegen-only. Correctness validated by `conv2d_mma_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 /// MMA-tiled 2D convolution (stride=1, dilation=1, pad=0).
 ///
@@ -88,6 +80,13 @@ const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
 /// Each TG computes a 32×32 tile of `out[pixels, out_channels]`.
 ///
 /// Correctness pinned by `conv2d_mma_gpu_correctness`.
+#[bench_kernel(
+    op="conv2d",
+    subop="mma",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_mma<T>(
@@ -351,20 +350,4 @@ pub fn conv2d_mma<T>(
         out[(out_px_base + 8u32 + fm) * out_ch + out_oc_base + 8u32 + fn1],
         simdgroup_elem_load(c_f11, 1).cast::<T>(),
     );
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "conv2d",
-        subop: "mma",
-        kernel_name: "conv2d_mma",
-        kernel_ir: conv2d_mma::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
 }

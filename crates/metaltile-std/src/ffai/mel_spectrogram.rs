@@ -40,18 +40,21 @@
 //!
 //! Codegen-only. Correctness validated by `mel_spectrogram_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::{DType, FLOAT_DTYPES},
-    spec::{BenchDispatch, BenchSpec},
-};
+use crate::bench_types::DType;
 
 // Keep `DType` referenced so the import survives — the inventory submits
 // use `FLOAT_DTYPES` directly now that all three kernels carry bf16.
 const _: DType = DType::F32;
 
+#[bench_kernel(
+    op="mel_spectrogram",
+    subop="mel_spectrogram",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn mel_spectrogram<T>(
     audio: Tensor<T>,
@@ -102,22 +105,6 @@ pub fn mel_spectrogram<T>(
     store(out[idx], log_mel.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "mel_spectrogram",
-        subop: "mel_spectrogram",
-        kernel_name: "mel_spectrogram",
-        kernel_ir: mel_spectrogram::kernel_ir_for,
-        dtypes: FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // FFT-routed STFT path.
 //
@@ -140,6 +127,13 @@ inventory::submit! {
 /// planes the `mt_fft_n*` kernels expect. `out_re[frame*n_fft + t] =
 /// audio[frame*hop + t] · window[t]`, `out_im` zeroed. One thread per
 /// `(frame, t)`; dispatch flat over `n_frames * n_fft`.
+#[bench_kernel(
+    op="mel_spectrogram",
+    subop="stft_window",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn mel_stft_window<T>(
     audio: Tensor<T>,
@@ -158,28 +152,19 @@ pub fn mel_stft_window<T>(
     store(out_im[idx], 0.0f32.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "mel_spectrogram",
-        subop: "stft_window",
-        kernel_name: "mel_stft_window",
-        kernel_ir: mel_stft_window::kernel_ir_for,
-        dtypes: FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 /// STFT stage 3 — Mel filterbank over an FFT'd frame buffer. `out[frame,
 /// mel] = log(Σ_{k<n_freq} mel_weight[mel,k]·(re²+im²) + log_eps)`, where
 /// `re`/`im` are `fft_re`/`fft_im` from `mt_fft_n{n_fft}`. One thread per
 /// `(frame, mel)`; dispatch flat over `n_frames * n_mels`. Output is
 /// bit-identical in form to `mel_spectrogram` — only the spectrum source
 /// (FFT vs in-thread DFT) differs.
+#[bench_kernel(
+    op="mel_spectrogram",
+    subop="filterbank",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn mel_filterbank<T>(
     fft_re: Tensor<T>,
@@ -208,20 +193,4 @@ pub fn mel_filterbank<T>(
 
     let log_mel = log(mel_acc + log_eps);
     store(out[idx], log_mel.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "mel_spectrogram",
-        subop: "filterbank",
-        kernel_name: "mel_filterbank",
-        kernel_ir: mel_filterbank::kernel_ir_for,
-        dtypes: FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

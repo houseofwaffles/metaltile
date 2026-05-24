@@ -47,15 +47,7 @@
 //!
 //! Codegen-only. Correctness validated by `conv3d_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 /// Dense 3D convolution — strides and padding, unit dilation, one
 /// channel group.
@@ -77,6 +69,13 @@ const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
 ///   no division happens on the hot path.
 ///
 /// Codegen-only; correctness pinned by `conv3d_gpu_correctness`.
+#[bench_kernel(
+    op="conv3d",
+    subop="generic",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_generic<T>(
@@ -165,22 +164,6 @@ pub fn conv3d_generic<T>(
     store(out[idx], acc.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "conv3d",
-        subop: "generic",
-        kernel_name: "conv3d_generic",
-        kernel_ir: conv3d_generic::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 /// Fully general 3D convolution — strides, dilation, padding, and
 /// grouped channels.
 ///
@@ -222,6 +205,13 @@ inventory::submit! {
 ///   `groups` itself is not needed inside the body.
 ///
 /// Codegen-only; correctness pinned by `conv3d_gpu_correctness`.
+#[bench_kernel(
+    op="conv3d",
+    subop="grouped",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_grouped<T>(
@@ -321,20 +311,4 @@ pub fn conv3d_grouped<T>(
     }
 
     store(out[idx], acc.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "conv3d",
-        subop: "grouped",
-        kernel_name: "conv3d_grouped",
-        kernel_ir: conv3d_grouped::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

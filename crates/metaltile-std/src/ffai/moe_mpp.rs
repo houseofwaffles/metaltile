@@ -38,13 +38,7 @@
 //! Correctness validated by `tests/moe_gather_qmm_mpp_correctness.rs`
 //! (cosine ≥ 0.999 vs the m1 scalar oracle).
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// MPP MoE int4 grouped BGEMM, BM=16 / BN=32 / BK=16, one simdgroup.
 ///
@@ -52,6 +46,13 @@ use crate::{
 /// packed, 8 nibbles/uint32), `scales`/`biases [n_experts, n_out,
 /// k_in/group]`, `indices [m_total]` (per-row expert id), `out
 /// [m_total, n_out]`.
+#[bench_kernel(
+    op="moe",
+    subop="gather_qmm_mma_int4_bm16_mpp",
+    class=GenericEmpty,
+    tol=5e-2,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_moe_gather_qmm_mma_int4_bm16_mpp<T>(
@@ -201,28 +202,13 @@ pub fn mt_moe_gather_qmm_mma_int4_bm16_mpp<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "moe",
-        subop: "gather_qmm_mma_int4_bm16_mpp",
-        kernel_name: "mt_moe_gather_qmm_mma_int4_bm16_mpp",
-        kernel_ir: mt_moe_gather_qmm_mma_int4_bm16_mpp::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;
     use metaltile_core::ir::Op;
 
     use super::*;
+    use crate::bench_types::DType;
 
     #[test]
     fn kernel_ir_constructs_and_uses_coop_tile_ops() {

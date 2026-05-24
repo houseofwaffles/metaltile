@@ -50,16 +50,15 @@
 //! reduce_sum tree. FFAI's `MoELayer` end-to-end equivalence tests
 //! cover both paths once the GPU router is wired.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
-
+#[bench_kernel(
+    op="dequant_gemv_expert_indexed",
+    subop="int4",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn dequant_gemv_int4_expert_indexed<T>(
     weights_stacked: Tensor<u32>,
@@ -113,21 +112,5 @@ pub fn dequant_gemv_int4_expert_indexed<T>(
     let total = reduce_sum(acc);
     if tid == 0u32 {
         store(output[row], total.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "dequant_gemv_expert_indexed",
-        subop: "int4",
-        kernel_name: "dequant_gemv_int4_expert_indexed",
-        kernel_ir: dequant_gemv_int4_expert_indexed::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

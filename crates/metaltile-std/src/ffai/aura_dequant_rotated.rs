@@ -38,15 +38,7 @@
 //! expand inner `macro_rules!` invocations (see CLAUDE.md note about
 //! PR #19's macro regression).
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 // ── Clean nibble/byte path: bits ∈ {2, 4, 8} ─────────────────────────────
 //
@@ -55,6 +47,7 @@ const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
 // amortises across all dims in the pack.
 macro_rules! aura_dequant_rotated_clean {
     ($name:ident, $bits:literal, $subop:literal) => {
+        #[bench_kernel(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             packed: Tensor<u32>,
@@ -95,22 +88,6 @@ macro_rules! aura_dequant_rotated_clean {
                 }
             }
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "aura",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: ALL_FLOAT_DTYPES,
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
@@ -125,6 +102,7 @@ macro_rules! aura_dequant_rotated_clean {
 // absolute dim index `d`, so cross-word spills resolve correctly.
 macro_rules! aura_dequant_rotated_odd {
     ($name:ident, $bits:literal, $subop:literal) => {
+        #[bench_kernel(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             packed: Tensor<u32>,
@@ -175,22 +153,6 @@ macro_rules! aura_dequant_rotated_odd {
                     let result = centroid * norm_val;
                     store(out[(bh * tokens + t) * dim + d], result.cast::<T>());
                 }
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "aura",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: ALL_FLOAT_DTYPES,
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
             }
         }
     };

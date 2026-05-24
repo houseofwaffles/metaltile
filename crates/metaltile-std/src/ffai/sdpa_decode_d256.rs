@@ -31,14 +31,15 @@
 //!
 //! Wrapping doc: see FFAI/CLAUDE.md §"Wrapping kernels in FFAI".
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode_d256",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_sdpa_decode_d256<T>(
     q: Tensor<T>,
@@ -202,22 +203,6 @@ pub fn ffai_sdpa_decode_d256<T>(
         store(out[out_off + 5u32], so5.cast::<T>());
         store(out[out_off + 6u32], so6.cast::<T>());
         store(out[out_off + 7u32], so7.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode_d256",
-        kernel_name: "ffai_sdpa_decode_d256",
-        kernel_ir: ffai_sdpa_decode_d256::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }
 

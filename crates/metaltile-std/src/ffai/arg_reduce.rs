@@ -13,13 +13,7 @@
 //! u32-output signature. Correctness validated in FFAI integration
 //! tests against reference decoder output.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 // Tree-reduction strides: 128 → 64 → 32 → 16 → 8 → 4 → 2.
 // Each iteration: threads with `lid < stride` merge the upper half into
@@ -32,6 +26,13 @@ use crate::{
 // expansion silently produced no IR.  A DSL `for` loop over the seven
 // stages yields identical MSL and survives the proc-macro intact.
 
+#[bench_kernel(
+    op="arg_reduce",
+    subop="argmax_u32",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
     let lid = tid;
@@ -79,24 +80,5 @@ pub fn ffai_argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
         let bet = (ov > tv) | ((ov == tv) & (oi < ti));
         let final_idx = select(bet, oi, ti);
         store(out[0], final_idx);
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "arg_reduce",
-        // Distinct subop so it sorts alongside `mt_argmax_f32` (subop
-        // "argmax" in mlx/arg_reduce.rs) but doesn't collide with it
-        // in the bench table.
-        subop: "argmax_u32",
-        kernel_name: "ffai_argmax",
-        kernel_ir: ffai_argmax::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

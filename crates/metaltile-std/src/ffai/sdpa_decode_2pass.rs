@@ -16,13 +16,7 @@
 //!
 //! head_dim hardcoded to 128; online softmax in fp32 throughout.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// MLX-derived `blocks` value for chained 2-pass dispatch on Apple
 /// M5 Max (architecture char `'s'`). Mirrors the curve in upstream
@@ -84,6 +78,22 @@ mod heuristic_tests {
 
 // ── Pass 1: per-block partials, GQA co-load ──────────────────────────────
 
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode_2pass",
+    class=SdpaVector2Pass,
+    h=128,
+    n_kv=4096,
+    n_heads=32,
+    gqa_factor=4,
+    batch=1,
+    blocks=32,
+    pass2_kernel=sdpa_decode_2pass_pass2,
+    tol=1e-3,
+    mlx="sdpa_vector_{tn}_128_128",
+    metal_file="scaled_dot_product_attention.metal",
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn sdpa_decode_2pass_pass1<T>(
     q: Tensor<T>,
@@ -190,6 +200,13 @@ pub fn sdpa_decode_2pass_pass1<T>(
 
 // ── Pass 2: 32-sg × 32-lane merge, MLX-style ─────────────────────────────
 
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode_2pass_pass2",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn sdpa_decode_2pass_pass2<T>(
     partial_o: Tensor<T>,
@@ -288,33 +305,6 @@ pub fn sdpa_decode_2pass_pass2<T>(
 }
 
 // Single registration covering the chained pass1+pass2 pair (d=128).
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode_2pass",
-        kernel_name: "sdpa_decode_2pass_pass1",
-        kernel_ir: sdpa_decode_2pass_pass1::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: Some(include_str!(concat!(
-            env!("OUT_DIR"),
-            "/metal/scaled_dot_product_attention.metal"
-        ))),
-        mlx_pattern: Some("sdpa_vector_{tn}_128_128"),
-        shapes: &[],
-        dispatch: BenchDispatch::SdpaVector2Pass {
-            head_dim: 128,
-            n_kv: 4096,
-            n_q_heads: 32,
-            gqa_factor: 4,
-            batch: 1,
-            blocks: 32,
-            pass2_kernel_name: "sdpa_decode_2pass_pass2",
-            pass2_kernel_ir: sdpa_decode_2pass_pass2::kernel_ir_for,
-        },
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
 
 // ── Additional head_dim variants: d={64,96,256} ──────────────────────────────
 //
@@ -839,18 +829,3 @@ pub fn sdpa_decode_2pass_pass2_d256<T>(
 // production decode dim (d=128, the base) needs the Swift wrapper
 // at this point. Add per-dim registrations here as FFAI starts
 // dispatching them.
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode_2pass_pass2",
-        kernel_name: "sdpa_decode_2pass_pass2",
-        kernel_ir: sdpa_decode_2pass_pass2::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}

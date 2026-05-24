@@ -32,16 +32,17 @@
 //! Codegen-only; correctness pinned by
 //! `tests/batched_qkv_qgemv_gpu_correctness.rs`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// Fused Q/K/V int4 quantized GEMV — one output row per TG.
 /// `program_id::<2>()` picks the matrix.
+#[bench_kernel(
+    op="batched_qkv_qgemv",
+    subop="batched_qkv_qgemv",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_batched_qkv_qgemv<T>(
     x: Tensor<T>,
@@ -158,6 +159,13 @@ pub fn ffai_batched_qkv_qgemv<T>(
 /// Grid: `[ceil(max(out_q,out_k,out_v)/8), 1, 3]`.
 /// out_q, out_k, out_v must be multiples of 8; in_dim must be a multiple
 /// of 512; group_size must be 64. TGs past a matrix's out_* rows no-op.
+#[bench_kernel(
+    op="batched_qkv_qgemv",
+    subop="batched_qkv_qgemv_fast",
+    class=GenericEmpty,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn ffai_batched_qkv_qgemv_fast<T>(
     x: Tensor<T>,
@@ -933,37 +941,5 @@ pub fn ffai_batched_qkv_qgemv_fast<T>(
                 store(out[out_q + out_k + row3], r3.cast::<T>());
             }
         }
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "batched_qkv_qgemv",
-        subop: "batched_qkv_qgemv",
-        kernel_name: "ffai_batched_qkv_qgemv",
-        kernel_ir: ffai_batched_qkv_qgemv::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "batched_qkv_qgemv",
-        subop: "batched_qkv_qgemv_fast",
-        kernel_name: "ffai_batched_qkv_qgemv_fast",
-        kernel_ir: ffai_batched_qkv_qgemv_fast::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

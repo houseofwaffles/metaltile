@@ -83,14 +83,22 @@
 //! Online-softmax math runs in fp32 throughout (storage stays in T) to
 //! avoid catastrophic cancellation in `exp(max_old - max_new)`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BatchedDecodeVariant, BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode_batched_q2",
+    class=SdpaBatchedDecode,
+    h=128,
+    n_kv=4096,
+    n_heads=32,
+    gqa_factor=4,
+    batch_q=2,
+    variant=Decode,
+    tpg=1024,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn sdpa_decode_batched_q2<T>(
     q: Tensor<T>,
@@ -338,29 +346,6 @@ pub fn sdpa_decode_batched_q2<T>(
 // Phase 1 of M7 ships only the kernel + codegen tests; the
 // `SdpaBatchedDecode` runner remains a stub (see `run_spec.rs`) until
 // the GPU dispatch path and bench rows land in the follow-up commit.
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode_batched_q2",
-        kernel_name: "sdpa_decode_batched_q2",
-        kernel_ir: sdpa_decode_batched_q2::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::SdpaBatchedDecode {
-            head_dim: 128,
-            n_kv: 4096,
-            n_q_heads: 32,
-            gqa_factor: 4,
-            batch_q: 2,
-            variant: BatchedDecodeVariant::Decode,
-            tpg: 1024,
-        },
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
 
 // ── K=4 specialization ──────────────────────────────────────────────────
 //
@@ -395,6 +380,20 @@ inventory::submit! {
 // duplicate body matches the pattern established in
 // `sdpa_decode`'s sink + window passes.
 
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode_batched_q4",
+    class=SdpaBatchedDecode,
+    h=128,
+    n_kv=4096,
+    n_heads=32,
+    gqa_factor=4,
+    batch_q=4,
+    variant=Decode,
+    tpg=512,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn sdpa_decode_batched_q4<T>(
     q: Tensor<T>,
@@ -730,33 +729,6 @@ pub fn sdpa_decode_batched_q4<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode_batched_q4",
-        kernel_name: "sdpa_decode_batched_q4",
-        kernel_ir: sdpa_decode_batched_q4::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::SdpaBatchedDecode {
-            head_dim: 128,
-            n_kv: 4096,
-            n_q_heads: 32,
-            gqa_factor: 4,
-            batch_q: 4,
-            variant: BatchedDecodeVariant::Decode,
-            // M1 Max cap at 768 → use 512. Verify cap on M4/M5
-            // before adjusting upward (other Apple GPU families
-            // have different register-file configurations).
-            tpg: 512,
-        },
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── K=8 specialization ──────────────────────────────────────────────────
 //
 // Mechanical extension of K=4: eight online-softmax streams instead of
@@ -781,6 +753,20 @@ inventory::submit! {
 // `#[kernel]` proc-macro does not expand `macro_rules!` invocations.
 // Each phase's body duplicates the established pattern.
 
+#[bench_kernel(
+    op="sdpa",
+    subop="sdpa_decode_batched_q8",
+    class=SdpaBatchedDecode,
+    h=128,
+    n_kv=4096,
+    n_heads=32,
+    gqa_factor=4,
+    batch_q=8,
+    variant=Decode,
+    tpg=256,
+    tol=1e-3,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn sdpa_decode_batched_q8<T>(
     q: Tensor<T>,
@@ -1378,33 +1364,6 @@ pub fn sdpa_decode_batched_q8<T>(
         store(out[out_off_7 + 1u32], so7_1.cast::<T>());
         store(out[out_off_7 + 2u32], so7_2.cast::<T>());
         store(out[out_off_7 + 3u32], so7_3.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "sdpa",
-        subop: "sdpa_decode_batched_q8",
-        kernel_name: "sdpa_decode_batched_q8",
-        kernel_ir: sdpa_decode_batched_q8::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::SdpaBatchedDecode {
-            head_dim: 128,
-            n_kv: 4096,
-            n_q_heads: 32,
-            gqa_factor: 4,
-            batch_q: 8,
-            variant: BatchedDecodeVariant::Decode,
-            // Conservative TPG for portability on M1/M2/M3 register
-            // pressure caps. Raise to 512 after per-chip verification
-            // on M4/M5/M7 where the 80-register budget fits at 512.
-            tpg: 256,
-        },
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }
 

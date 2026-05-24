@@ -68,15 +68,7 @@
 //! the `#[kernel]` proc-macro sees it — required because the proc-macro
 //! does not expand inner declarative macros.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 macro_rules! aura_encode_kernel {
     ($name:ident, $bits:literal, $levels:literal, $subop:literal) => {
@@ -84,6 +76,7 @@ macro_rules! aura_encode_kernel {
         // production, f32 in tests). All internal math runs in f32 —
         // we cast at the load. Everything else stays f32-only because
         // rotation, codebook, and norm-correction need the precision.
+        #[bench_kernel(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)]
         #[kernel]
         pub fn $name<T>(
             input: Tensor<T>,
@@ -208,22 +201,6 @@ macro_rules! aura_encode_kernel {
 
             if d == 0u32 {
                 store(norms_out[row], corrected_norm);
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "aura",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: ALL_FLOAT_DTYPES,
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Reduction),
             }
         }
     };

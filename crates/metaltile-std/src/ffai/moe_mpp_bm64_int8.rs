@@ -39,16 +39,17 @@
 //!
 //! Correctness validated by `tests/moe_gather_qmm_mpp_bm64_int8_correctness.rs`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 /// MPP MoE int8 grouped BGEMM, BM=BN=64 / BK=32, 4 simdgroups (2×2).
 /// Signature matches `…_int4_bm64_mpp`.
+#[bench_kernel(
+    op="moe",
+    subop="gather_qmm_mma_int8_bm64_mpp",
+    class=GenericEmpty,
+    tol=5e-2,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_moe_gather_qmm_mma_int8_bm64_mpp<T>(
@@ -218,27 +219,12 @@ pub fn mt_moe_gather_qmm_mma_int8_bm64_mpp<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "moe",
-        subop: "gather_qmm_mma_int8_bm64_mpp",
-        kernel_name: "mt_moe_gather_qmm_mma_int8_bm64_mpp",
-        kernel_ir: mt_moe_gather_qmm_mma_int8_bm64_mpp::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use metaltile_core::ir::Op;
 
     use super::*;
+    use crate::bench_types::DType;
 
     #[test]
     fn kernel_ir_constructs_and_uses_coop_tile_ops() {

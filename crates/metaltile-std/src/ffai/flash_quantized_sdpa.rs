@@ -60,16 +60,11 @@
 //! Codegen-only; correctness pinned by
 //! `tests/flash_quantized_sdpa_gpu_correctness.rs`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 macro_rules! flash_quantized_sdpa_kernel {
     ($name:ident, $bits:literal, $dim:literal, $dims_per_lane:literal, $subop:literal) => {
+        #[bench_kernel(op="flash_quantized_sdpa", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             queries: Tensor<T>,
@@ -175,22 +170,6 @@ macro_rules! flash_quantized_sdpa_kernel {
                 }
             }
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "flash_quantized_sdpa",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
@@ -223,6 +202,7 @@ flash_quantized_sdpa_kernel!(flash_quantized_sdpa_b8_d512, 8u32, 512u32, 16u32, 
 
 macro_rules! flash_quantized_sdpa_bool_mask_kernel {
     ($name:ident, $bits:literal, $dim:literal, $dims_per_lane:literal, $subop:literal) => {
+        #[bench_kernel(op="flash_quantized_sdpa", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             queries: Tensor<T>,
@@ -330,22 +310,6 @@ macro_rules! flash_quantized_sdpa_bool_mask_kernel {
                 }
             }
         }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "flash_quantized_sdpa",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
     };
 }
 
@@ -400,6 +364,7 @@ flash_quantized_sdpa_bool_mask_kernel!(
 
 macro_rules! flash_quantized_sdpa_float_mask_kernel {
     ($name:ident, $bits:literal, $dim:literal, $dims_per_lane:literal, $subop:literal) => {
+        #[bench_kernel(op="flash_quantized_sdpa", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             queries: Tensor<T>,
@@ -507,22 +472,6 @@ macro_rules! flash_quantized_sdpa_float_mask_kernel {
                     let normed = select(l_acc > 0.0f32, oi / l_acc, oi);
                     store(out[q_idx * dim + d], normed.cast::<T>());
                 }
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "flash_quantized_sdpa",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
             }
         }
     };

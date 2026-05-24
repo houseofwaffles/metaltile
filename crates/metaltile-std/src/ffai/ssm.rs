@@ -20,13 +20,7 @@
 //! Codegen-only. Correctness validated end-to-end in FFAI integration
 //! tests against real Mamba/Nemotron decoding.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
+use metaltile::{bench_kernel, kernel};
 
 // Mamba 2 / Mamba 1D depthwise causal-conv step — streaming-decode form.
 //
@@ -42,6 +36,13 @@ use crate::{
 // Grid: n_channels threads (one per channel). For Mamba 2 with conv_dim
 // ~1500 channels and K=4 this is a tiny dispatch. Activation (Mamba 2
 // follows the conv with SiLU) is the caller's concern — kept separate.
+#[bench_kernel(
+    op="ssm",
+    subop="conv1d_causal_step",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn conv1d_causal_step<T>(
     x: Tensor<T>,
@@ -86,28 +87,19 @@ pub fn conv1d_causal_step<T>(
     store(state[(kernel_size - 2u32) * n_channels + d], load(x[d]));
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "ssm",
-        subop: "conv1d_causal_step",
-        kernel_name: "conv1d_causal_step",
-        kernel_ir: conv1d_causal_step::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // Mamba 2 selective-scan single-token decode step. One thread per
 // (head, d) — no cross-thread sync needed because each (head, d)
 // column of h is owned by exactly one thread.
 //
 // This is the decode form. Chunked prefill uses a parallel-scan
 // variant — separate kernel, not in this drop.
+#[bench_kernel(
+    op="ssm",
+    subop="step",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn ssm_step<T>(
     x: Tensor<T>,
@@ -143,22 +135,6 @@ pub fn ssm_step<T>(
     store(y[h_id * head_dim + d], y_d.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "ssm",
-        subop: "step",
-        kernel_name: "ssm_step",
-        kernel_ir: ssm_step::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // Mamba 1 (Jamba) selective-scan single-token decode step — the
 // 2D-`A_log` variant of `ssm_step` above.
 //
@@ -185,6 +161,13 @@ inventory::submit! {
 // cross-thread sync because each `(head, d)` column of `h` is owned by
 // exactly one thread. The state `h` runs in fp32 (the recurrence
 // drifts in bf16 within a few dozen decode steps).
+#[bench_kernel(
+    op="ssm",
+    subop="step_a2d",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn ssm_step_a2d<T>(
     x: Tensor<T>,
@@ -225,22 +208,6 @@ pub fn ssm_step_a2d<T>(
     store(y[h_id * head_dim + d], y_d.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "ssm",
-        subop: "step_a2d",
-        kernel_name: "ssm_step_a2d",
-        kernel_ir: ssm_step_a2d::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // Faithful port of MLX's `ssm_step<T, Dh, Ds, H, G>` (alpha branch). One
 // threadgroup per `(d_idx, n)` output element, where `n ∈ [0, n_heads*batch)`
 // and `d_idx ∈ [0, dh)`. Each threadgroup runs 32 threads (one simd-group)
@@ -250,6 +217,13 @@ inventory::submit! {
 //
 // `heads_per_group` is MLX's `G`: number of Q heads sharing one (B, C)
 // slot. Total distinct (B, C) groups = n_heads / heads_per_group.
+#[bench_kernel(
+    op="ssm",
+    subop="mt_step",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Reduction,
+)]
 #[kernel]
 pub fn mt_ssm_step<T>(
     x: Tensor<T>,             // [n_heads*batch, dh]
@@ -298,21 +272,5 @@ pub fn mt_ssm_step<T>(
     if ds_idx == 0u32 {
         let d_val = load(d_skip[h_idx]).cast::<f32>();
         store(out[n * dh + d_idx], (total + x_val * d_val).cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "ssm",
-        subop: "mt_step",
-        kernel_name: "mt_ssm_step",
-        kernel_ir: mt_ssm_step::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

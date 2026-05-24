@@ -62,13 +62,9 @@
 //! unroll-pass fix landed alongside this kernel, so the guards are
 //! back in.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::{DType, FLOAT_DTYPES},
-    spec::{BenchDispatch, BenchSpec},
-};
+use crate::bench_types::DType;
 
 // Keep `DType` referenced for the inventory submit; `FLOAT_DTYPES`
 // supersedes the old `F32_ONLY` shortlist now that the kernel handles
@@ -86,6 +82,7 @@ macro_rules! aura_flash_p1_kernel {
         $causal:literal,
         $subop:literal
     ) => {
+        #[bench_kernel(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             q_rot: Tensor<T>,
@@ -248,22 +245,6 @@ macro_rules! aura_flash_p1_kernel {
                 let ml_idx = q_idx * num_blocks + block_idx;
                 store(m_partials[ml_idx], m_acc.cast::<T>());
                 store(l_partials[ml_idx], l_acc.cast::<T>());
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "aura",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: FLOAT_DTYPES,
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
             }
         }
     };

@@ -39,14 +39,15 @@
 //!
 //! Codegen-only. Correctness validated by `rope_2d_gpu_correctness`.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
+use metaltile::{bench_kernel, kernel};
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[bench_kernel(
+    op="rope",
+    subop="rope_2d",
+    class=GenericEmpty,
+    tol=0.0,
+    kernel_mode=Grid3D,
+)]
 #[kernel]
 pub fn ffai_rope_2d<T>(
     qk: Tensor<T>,
@@ -99,20 +100,4 @@ pub fn ffai_rope_2d<T>(
     let xc2 = load(qk[c2]).cast::<f32>();
     store(out[c1], (xc1 * cos_c - xc2 * sin_c).cast::<T>());
     store(out[c2], (xc1 * sin_c + xc2 * cos_c).cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rope",
-        subop: "rope_2d",
-        kernel_name: "ffai_rope_2d",
-        kernel_ir: ffai_rope_2d::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

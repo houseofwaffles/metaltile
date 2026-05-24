@@ -38,18 +38,11 @@
 //! file) silently produced empty kernels — the proc-macro doesn't expand
 //! inner declarative macros.
 
-use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+use metaltile::{bench_kernel, kernel};
 
 macro_rules! dequant_gather_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
+        #[bench_kernel(op="dequant_gather", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)]
         #[kernel]
         pub fn $name<T>(
             weight: Tensor<u32>,
@@ -90,22 +83,6 @@ macro_rules! dequant_gather_kernel {
             let bias = load(biases[token_id * groups_per_row + g]).cast::<f32>();
             let w_real = q.cast::<f32>() * scale + bias;
             store(out[idx], w_real.cast::<T>());
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "dequant_gather",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: ALL_FLOAT_DTYPES,
-                tol: 0.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
         }
     };
 }
