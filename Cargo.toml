@@ -20,12 +20,12 @@ documentation = "https://docs.rs/metaltile"
 
 [workspace.dependencies]
 # Internal
-metaltile = { path = "crates/metaltile" }
-metaltile-core = { path = "crates/metaltile-core" }
-metaltile-macros = { path = "crates/metaltile-macros" }
-metaltile-codegen = { path = "crates/metaltile-codegen" }
-metaltile-runtime = { path = "crates/metaltile-runtime" }
-metaltile-std = { path = "crates/metaltile-std" }
+metaltile = { path = "crates/metaltile", version = "0.1.0" }
+metaltile-core = { path = "crates/metaltile-core", version = "0.1.0" }
+metaltile-macros = { path = "crates/metaltile-macros", version = "0.1.0" }
+metaltile-codegen = { path = "crates/metaltile-codegen", version = "0.1.0" }
+metaltile-runtime = { path = "crates/metaltile-runtime", version = "0.1.0" }
+metaltile-std = { path = "crates/metaltile-std", version = "0.1.0" }
 
 # External
 clap = { version = "4.6", features = ["derive"] }
