@@ -74,6 +74,7 @@ pub mod sdpa_decode_d256;
 pub mod sdpa_decode_d512;
 pub mod sdpa_decode_d64;
 pub mod sdpa_multi;
+pub mod sdpa_multi_d256;
 pub mod ssm;
 pub mod ssm_replay;
 pub mod vocoder;
