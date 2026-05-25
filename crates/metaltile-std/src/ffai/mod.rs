@@ -46,6 +46,7 @@ pub mod gated_rmsnorm;
 pub mod gather;
 pub mod gemm;
 pub mod kv_cache;
+pub mod kv_cache_update_many;
 pub mod logits_min_p;
 pub mod logits_processors;
 pub mod logits_top_p;
