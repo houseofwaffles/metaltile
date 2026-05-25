@@ -66,6 +66,7 @@ pub mod rms_norm_residual;
 pub mod rms_norm_rope;
 pub mod rope_2d;
 pub mod rope_llama;
+pub mod rope_llama_many;
 pub mod rope_yarn;
 pub mod sampling;
 pub mod sdpa_bidirectional;
