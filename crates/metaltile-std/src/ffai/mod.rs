@@ -28,6 +28,7 @@ pub mod aura_value;
 pub mod batched_4_qgemv;
 pub mod batched_qkv_qgemv;
 pub mod batched_qkv_qmm;
+pub mod conv1d_causal_step_silu_cast_many;
 pub mod conv2d;
 pub mod conv2d_mma;
 pub mod conv3d;
