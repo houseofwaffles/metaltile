@@ -177,6 +177,8 @@ fn aura_flash_pair_matches_naive_reference_kb4_vb2_d128() {
     p1_buffers
         .insert("value_packed_width".into(), (value_packed_width as u32).to_le_bytes().to_vec());
     p1_buffers.insert("tokens".into(), (tokens as u32).to_le_bytes().to_vec());
+    // Fully-populated fixture: stride == live row count.
+    p1_buffers.insert("kv_stride".into(), (tokens as u32).to_le_bytes().to_vec());
     p1_buffers.insert("repeat_count".into(), (repeat as u32).to_le_bytes().to_vec());
     p1_buffers.insert("num_blocks".into(), (num_blocks as u32).to_le_bytes().to_vec());
     p1_buffers.insert("block_size".into(), (block_size as u32).to_le_bytes().to_vec());

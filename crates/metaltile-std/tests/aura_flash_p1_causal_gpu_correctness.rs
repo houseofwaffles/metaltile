@@ -132,6 +132,8 @@ fn run_p1(causal: bool, q_position: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     b.insert("key_packed_width".into(), (key_packed_width as u32).to_le_bytes().to_vec());
     b.insert("value_packed_width".into(), (value_packed_width as u32).to_le_bytes().to_vec());
     b.insert("tokens".into(), (TOKENS as u32).to_le_bytes().to_vec());
+    // Fully-populated fixture: stride == live row count.
+    b.insert("kv_stride".into(), (TOKENS as u32).to_le_bytes().to_vec());
     b.insert("repeat_count".into(), (repeat as u32).to_le_bytes().to_vec());
     b.insert("num_blocks".into(), (num_blocks as u32).to_le_bytes().to_vec());
     b.insert("block_size".into(), (BLOCK_SIZE as u32).to_le_bytes().to_vec());

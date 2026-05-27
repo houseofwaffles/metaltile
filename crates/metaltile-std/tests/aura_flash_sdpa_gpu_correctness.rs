@@ -145,6 +145,8 @@ fn run(
         ("key_packed_width", kpw as u32),
         ("value_packed_width", vpw as u32),
         ("tokens", tokens as u32),
+        // Fully-populated fixture: stride == live row count.
+        ("kv_stride", tokens as u32),
         ("repeat_count", repeat as u32),
         ("num_q_heads", num_q_heads as u32),
         ("has_sinks", has_sinks),

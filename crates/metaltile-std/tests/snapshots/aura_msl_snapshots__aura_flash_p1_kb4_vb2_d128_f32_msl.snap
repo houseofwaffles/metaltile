@@ -21,10 +21,11 @@ kernel void aura_flash_p1_kb4_vb2_d128(
     constant uint &key_packed_width [[buffer(11)]],
     constant uint &value_packed_width [[buffer(12)]],
     constant uint &tokens [[buffer(13)]],
-    constant uint &repeat_count [[buffer(14)]],
-    constant uint &num_blocks [[buffer(15)]],
-    constant uint &block_size [[buffer(16)]],
-    constant uint &q_position [[buffer(17)]],
+    constant uint &kv_stride [[buffer(14)]],
+    constant uint &repeat_count [[buffer(15)]],
+    constant uint &num_blocks [[buffer(16)]],
+    constant uint &block_size [[buffer(17)]],
+    constant uint &q_position [[buffer(18)]],
     uint3 gid [[thread_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
@@ -38,6 +39,7 @@ kernel void aura_flash_p1_kb4_vb2_d128(
     uint v_q_idx = gid.y;
     uint v_block_idx = gid.z;
     auto v3 = repeat_count;
+    auto v_kv_idx = v_q_idx / v3;
     uint v5 = 1u;
     uint v6 = 4u;
     uint v7 = 16u;
@@ -151,144 +153,144 @@ kernel void aura_flash_p1_kb4_vb2_d128(
     auto v1073741887 = 0.0f;
     o[v1073741886] = v1073741887;
     uint v61 = 1u;
-    auto v_kv_idx = v_q_idx / v3;
-    auto v62 = v_kv_idx * v18;
-    uint v71 = 0u;
-    uint v72 = 4u;
-    uint v73 = 1u;
-    uint v74 = 32u;
-    uint v141 = 0u;
-    uint v142 = 4u;
-    uint v143 = 1u;
-    uint v144 = 32u;
+    uint v72 = 0u;
+    uint v73 = 4u;
+    uint v74 = 1u;
+    uint v75 = 32u;
+    uint v142 = 0u;
+    uint v143 = 4u;
+    uint v144 = 1u;
+    uint v145 = 32u;
     for (uint i_4 = v16; i_4 < v_clamped_end; i_4 += v61) {
-        auto v64 = key_packed_width;
-        auto v63 = v62 + i_4;
-        auto v_k_packed_row = v63 * v64;
-        auto v67 = v62 + i_4;
-        auto v68 = key_norms[v67];
-        auto v70 = 0.0f;
-        auto __ml_dot_partial = v70;
-        for (uint i_5 = v71; i_5 < v72; i_5 += v73) {
-            auto v75 = i_5 * v74;
-            auto v_d = v_lane + v75;
-            auto v77 = dim;
-            auto v78 = v77 > v_d;
-            if (v78) {
-                uint v79 = 4u;
-                auto v_bit_offset = v_d * v79;
-                uint v81 = 32u;
-                auto v_word_idx = v_bit_offset / v81;
-                uint v83 = 31u;
-                auto v_shift = (v_bit_offset & v83);
-                uint v85 = 32u;
-                auto v_bits_in_w0 = v85 - v_shift;
-                uint v87 = 4u;
-                uint v89 = 4u;
-                auto v_lo_bits = select(v_bits_in_w0, v89, bool((v_bits_in_w0 >= v87)));
-                uint v91 = 4u;
-                auto v_spill = v91 - v_lo_bits;
-                auto v93 = v_k_packed_row + v_word_idx;
-                auto v_w0 = key_packed[v93];
-                uint v95 = 0u;
-                uint v97 = 1u;
-                auto v98 = v_word_idx + v97;
-                auto v_w1_idx = select(v_word_idx, v98, bool((v_spill > v95)));
-                auto v100 = v_k_packed_row + v_w1_idx;
-                auto v_w1 = key_packed[v100];
-                uint v103 = 1u;
-                uint v105 = 1u;
-                auto v106 = ((v103 << v_lo_bits) - v105);
-                uint v108 = 1u;
-                uint v110 = 1u;
-                auto v111 = ((v108 << v_spill) - v110);
-                auto v_hi = ((v_w1 & v111) << v_lo_bits);
-                auto v_value = ((((v_w0 >> v_shift) & v106) | v_hi) & v_key_mask);
+        auto v62 = kv_stride;
+        auto v63 = v_kv_idx * v62;
+        auto v65 = key_packed_width;
+        auto v64 = v63 + i_4;
+        auto v_k_packed_row = v64 * v65;
+        auto v68 = v63 + i_4;
+        auto v69 = key_norms[v68];
+        auto v71 = 0.0f;
+        auto __ml_dot_partial = v71;
+        for (uint i_5 = v72; i_5 < v73; i_5 += v74) {
+            auto v76 = i_5 * v75;
+            auto v_d = v_lane + v76;
+            auto v78 = dim;
+            auto v79 = v78 > v_d;
+            if (v79) {
+                uint v80 = 4u;
+                auto v_bit_offset = v_d * v80;
+                uint v82 = 32u;
+                auto v_word_idx = v_bit_offset / v82;
+                uint v84 = 31u;
+                auto v_shift = (v_bit_offset & v84);
+                uint v86 = 32u;
+                auto v_bits_in_w0 = v86 - v_shift;
+                uint v88 = 4u;
+                uint v90 = 4u;
+                auto v_lo_bits = select(v_bits_in_w0, v90, bool((v_bits_in_w0 >= v88)));
+                uint v92 = 4u;
+                auto v_spill = v92 - v_lo_bits;
+                auto v94 = v_k_packed_row + v_word_idx;
+                auto v_w0 = key_packed[v94];
+                uint v96 = 0u;
+                uint v98 = 1u;
+                auto v99 = v_word_idx + v98;
+                auto v_w1_idx = select(v_word_idx, v99, bool((v_spill > v96)));
+                auto v101 = v_k_packed_row + v_w1_idx;
+                auto v_w1 = key_packed[v101];
+                uint v104 = 1u;
+                uint v106 = 1u;
+                auto v107 = ((v104 << v_lo_bits) - v106);
+                uint v109 = 1u;
+                uint v111 = 1u;
+                auto v112 = ((v109 << v_spill) - v111);
+                auto v_hi = ((v_w1 & v112) << v_lo_bits);
+                auto v_value = ((((v_w0 >> v_shift) & v107) | v_hi) & v_key_mask);
                 auto v_centroid = key_cb[v_value];
                 auto v_qv = q_vals[i_5];
-                auto v118 = __ml_dot_partial;
-                auto v119 = v_qv * v_centroid;
-                auto v120 = v118 + v119;
-                __ml_dot_partial = v120;
+                auto v119 = __ml_dot_partial;
+                auto v120 = v_qv * v_centroid;
+                auto v121 = v119 + v120;
+                __ml_dot_partial = v121;
             }
         }
-        auto v121 = __ml_dot_partial;
-        float v122 = simd_sum(float(v121));
-        float v_k_norm = static_cast<float>(v68);
-        auto v_score = v122 * v_k_norm;
-        auto v124 = __ml_m_acc;
-        auto v126 = __ml_m_acc;
-        auto v_new_m = select(v_score, v126, bool((v124 > v_score)));
-        auto v128 = __ml_m_acc;
-        auto v129 = v128 - v_new_m;
-        auto v_exp_diff = exp(v129);
-        auto v131 = v_score - v_new_m;
-        auto v_exp_score = exp(v131);
-        auto v135 = value_packed_width;
-        auto v134 = v62 + i_4;
-        auto v_v_packed_row = v134 * v135;
-        auto v138 = v62 + i_4;
-        auto v139 = val_norms[v138];
-        float v_v_norm = static_cast<float>(v139);
-        for (uint i_6 = v141; i_6 < v142; i_6 += v143) {
-            auto v145 = i_6 * v144;
-            auto v_d = v_lane + v145;
-            auto v147 = dim;
-            auto v148 = v147 > v_d;
-            if (v148) {
-                uint v149 = 2u;
-                auto v_bit_offset = v_d * v149;
-                uint v151 = 32u;
-                auto v_word_idx = v_bit_offset / v151;
-                uint v153 = 31u;
-                auto v_shift = (v_bit_offset & v153);
-                uint v155 = 32u;
-                auto v_bits_in_w0 = v155 - v_shift;
-                uint v157 = 2u;
-                uint v159 = 2u;
-                auto v_lo_bits = select(v_bits_in_w0, v159, bool((v_bits_in_w0 >= v157)));
-                uint v161 = 2u;
-                auto v_spill = v161 - v_lo_bits;
-                auto v163 = v_v_packed_row + v_word_idx;
-                auto v_w0 = val_packed[v163];
-                uint v165 = 0u;
-                uint v167 = 1u;
-                auto v168 = v_word_idx + v167;
-                auto v_w1_idx = select(v_word_idx, v168, bool((v_spill > v165)));
-                auto v170 = v_v_packed_row + v_w1_idx;
-                auto v_w1 = val_packed[v170];
-                uint v173 = 1u;
-                uint v175 = 1u;
-                auto v176 = ((v173 << v_lo_bits) - v175);
-                uint v178 = 1u;
-                uint v180 = 1u;
-                auto v181 = ((v178 << v_spill) - v180);
-                auto v_hi = ((v_w1 & v181) << v_lo_bits);
+        auto v122 = __ml_dot_partial;
+        float v123 = simd_sum(float(v122));
+        float v_k_norm = static_cast<float>(v69);
+        auto v_score = v123 * v_k_norm;
+        auto v125 = __ml_m_acc;
+        auto v127 = __ml_m_acc;
+        auto v_new_m = select(v_score, v127, bool((v125 > v_score)));
+        auto v129 = __ml_m_acc;
+        auto v130 = v129 - v_new_m;
+        auto v_exp_diff = exp(v130);
+        auto v132 = v_score - v_new_m;
+        auto v_exp_score = exp(v132);
+        auto v136 = value_packed_width;
+        auto v135 = v63 + i_4;
+        auto v_v_packed_row = v135 * v136;
+        auto v139 = v63 + i_4;
+        auto v140 = val_norms[v139];
+        float v_v_norm = static_cast<float>(v140);
+        for (uint i_6 = v142; i_6 < v143; i_6 += v144) {
+            auto v146 = i_6 * v145;
+            auto v_d = v_lane + v146;
+            auto v148 = dim;
+            auto v149 = v148 > v_d;
+            if (v149) {
+                uint v150 = 2u;
+                auto v_bit_offset = v_d * v150;
+                uint v152 = 32u;
+                auto v_word_idx = v_bit_offset / v152;
+                uint v154 = 31u;
+                auto v_shift = (v_bit_offset & v154);
+                uint v156 = 32u;
+                auto v_bits_in_w0 = v156 - v_shift;
+                uint v158 = 2u;
+                uint v160 = 2u;
+                auto v_lo_bits = select(v_bits_in_w0, v160, bool((v_bits_in_w0 >= v158)));
+                uint v162 = 2u;
+                auto v_spill = v162 - v_lo_bits;
+                auto v164 = v_v_packed_row + v_word_idx;
+                auto v_w0 = val_packed[v164];
+                uint v166 = 0u;
+                uint v168 = 1u;
+                auto v169 = v_word_idx + v168;
+                auto v_w1_idx = select(v_word_idx, v169, bool((v_spill > v166)));
+                auto v171 = v_v_packed_row + v_w1_idx;
+                auto v_w1 = val_packed[v171];
+                uint v174 = 1u;
+                uint v176 = 1u;
+                auto v177 = ((v174 << v_lo_bits) - v176);
+                uint v179 = 1u;
+                uint v181 = 1u;
+                auto v182 = ((v179 << v_spill) - v181);
+                auto v_hi = ((v_w1 & v182) << v_lo_bits);
                 auto v_prev = o[i_6];
-                auto v_value = ((((v_w0 >> v_shift) & v176) | v_hi) & v_val_mask);
+                auto v_value = ((((v_w0 >> v_shift) & v177) | v_hi) & v_val_mask);
                 auto v_centroid = val_cb[v_value];
-                auto v190 = ((v_exp_score * v_centroid) * v_v_norm);
-                auto v_upd = ((v_prev * v_exp_diff) + v190);
+                auto v191 = ((v_exp_score * v_centroid) * v_v_norm);
+                auto v_upd = ((v_prev * v_exp_diff) + v191);
                 o[i_6] = v_upd;
             }
         }
-        auto v192 = __ml_l_acc;
-        auto v194 = ((v192 * v_exp_diff) + v_exp_score);
-        __ml_l_acc = v194;
+        auto v193 = __ml_l_acc;
+        auto v195 = ((v193 * v_exp_diff) + v_exp_score);
+        __ml_l_acc = v195;
         __ml_m_acc = v_new_m;
     }
-    auto v195 = num_blocks;
-    auto v197 = ((v_q_idx * v195) + v_block_idx);
-    auto v198 = dim;
-    auto v_partial_base = v197 * v198;
-    uint v200 = 0u;
-    uint v201 = 4u;
-    uint v202 = 1u;
-    uint v203 = 32u;
+    auto v196 = num_blocks;
+    auto v198 = ((v_q_idx * v196) + v_block_idx);
+    auto v199 = dim;
+    auto v_partial_base = v198 * v199;
+    uint v201 = 0u;
+    uint v202 = 4u;
+    uint v203 = 1u;
+    uint v204 = 32u;
     uint v1073741888 = 0u;
-    auto v1073741889 = v1073741888 * v203;
+    auto v1073741889 = v1073741888 * v204;
     auto v1073741890 = v_lane + v1073741889;
-    auto v1073741891 = v198 > v1073741890;
+    auto v1073741891 = v199 > v1073741890;
     if (v1073741891) {
         auto v1073741892 = o[v1073741888];
         float v1073741893 = static_cast<float>(v1073741892);
@@ -296,9 +298,9 @@ kernel void aura_flash_p1_kb4_vb2_d128(
         o_partials[v1073741894] = v1073741893;
     }
     uint v1073741895 = 1u;
-    auto v1073741896 = v1073741895 * v203;
+    auto v1073741896 = v1073741895 * v204;
     auto v1073741897 = v_lane + v1073741896;
-    auto v1073741898 = v198 > v1073741897;
+    auto v1073741898 = v199 > v1073741897;
     if (v1073741898) {
         auto v1073741899 = o[v1073741895];
         float v1073741900 = static_cast<float>(v1073741899);
@@ -306,9 +308,9 @@ kernel void aura_flash_p1_kb4_vb2_d128(
         o_partials[v1073741901] = v1073741900;
     }
     uint v1073741902 = 2u;
-    auto v1073741903 = v1073741902 * v203;
+    auto v1073741903 = v1073741902 * v204;
     auto v1073741904 = v_lane + v1073741903;
-    auto v1073741905 = v198 > v1073741904;
+    auto v1073741905 = v199 > v1073741904;
     if (v1073741905) {
         auto v1073741906 = o[v1073741902];
         float v1073741907 = static_cast<float>(v1073741906);
@@ -316,24 +318,24 @@ kernel void aura_flash_p1_kb4_vb2_d128(
         o_partials[v1073741908] = v1073741907;
     }
     uint v1073741909 = 3u;
-    auto v1073741910 = v1073741909 * v203;
+    auto v1073741910 = v1073741909 * v204;
     auto v1073741911 = v_lane + v1073741910;
-    auto v1073741912 = v198 > v1073741911;
+    auto v1073741912 = v199 > v1073741911;
     if (v1073741912) {
         auto v1073741913 = o[v1073741909];
         float v1073741914 = static_cast<float>(v1073741913);
         auto v1073741915 = v_partial_base + v1073741911;
         o_partials[v1073741915] = v1073741914;
     }
-    uint v210 = 0u;
-    auto v211 = v_lane == v210;
-    if (v211) {
-        auto v_ml_idx = ((v_q_idx * v195) + v_block_idx);
-        auto v214 = __ml_m_acc;
-        float v215 = static_cast<float>(v214);
-        m_partials[v_ml_idx] = v215;
-        auto v216 = __ml_l_acc;
-        float v217 = static_cast<float>(v216);
-        l_partials[v_ml_idx] = v217;
+    uint v211 = 0u;
+    auto v212 = v_lane == v211;
+    if (v212) {
+        auto v_ml_idx = ((v_q_idx * v196) + v_block_idx);
+        auto v215 = __ml_m_acc;
+        float v216 = static_cast<float>(v215);
+        m_partials[v_ml_idx] = v216;
+        auto v217 = __ml_l_acc;
+        float v218 = static_cast<float>(v217);
+        l_partials[v_ml_idx] = v218;
     }
 }

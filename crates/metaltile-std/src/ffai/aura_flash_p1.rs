@@ -101,6 +101,7 @@ macro_rules! aura_flash_p1_kernel {
             #[constexpr] key_packed_width: u32,
             #[constexpr] value_packed_width: u32,
             #[constexpr] tokens: u32,
+            #[constexpr] kv_stride: u32,
             #[constexpr] repeat_count: u32,
             #[constexpr] num_blocks: u32,
             #[constexpr] block_size: u32,
@@ -164,8 +165,12 @@ macro_rules! aura_flash_p1_kernel {
 
             // ── Per-token inner loop ───────────────────────────────────
             for t in range(t_start, t_end, 1u32) {
-                let k_packed_row = (kv_idx * tokens + t) * key_packed_width;
-                let k_norm = load(key_norms[kv_idx * tokens + t]).cast::<f32>();
+                // Row stride is `kv_stride` (cache's `maxSeq`), not `tokens`
+                // (live KV-row count). When the cache isn't fully populated,
+                // head 1 starts at byte offset `kv_stride`, NOT `tokens` —
+                // otherwise we'd read head 0's tail bytes as head 1's rows.
+                let k_packed_row = (kv_idx * kv_stride + t) * key_packed_width;
+                let k_norm = load(key_norms[kv_idx * kv_stride + t]).cast::<f32>();
 
                 // Q · K via compressed-domain dot — bit-extract per dim,
                 // lookup centroid in cached key_cb, accumulate against the
@@ -204,8 +209,8 @@ macro_rules! aura_flash_p1_kernel {
                 // cached val_cb, scale by exp_score · v_norm, fold into
                 // the running output via the standard online-softmax
                 // rescale-then-add.
-                let v_packed_row = (kv_idx * tokens + t) * value_packed_width;
-                let v_norm = load(val_norms[kv_idx * tokens + t]).cast::<f32>();
+                let v_packed_row = (kv_idx * kv_stride + t) * value_packed_width;
+                let v_norm = load(val_norms[kv_idx * kv_stride + t]).cast::<f32>();
 
                 for i in range(0u32, $dims_per_lane, 1u32) {
                     let d = lane + i * 32u32;

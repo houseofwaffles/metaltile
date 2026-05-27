@@ -70,6 +70,7 @@ macro_rules! aura_flash_sdpa_kernel {
             #[constexpr] key_packed_width: u32,
             #[constexpr] value_packed_width: u32,
             #[constexpr] tokens: u32,
+            #[constexpr] kv_stride: u32,
             #[constexpr] repeat_count: u32,
             #[constexpr] num_q_heads: u32,
             #[constexpr] has_sinks: u32,
@@ -121,8 +122,13 @@ macro_rules! aura_flash_sdpa_kernel {
                     select(window_size == 0u32, t < tokens, t + window_size > causal_upper);
                 if use_key {
                     // Q · K in the compressed domain.
-                    let k_packed_row = (kv_idx * tokens + t) * key_packed_width;
-                    let k_norm = load(key_norms[kv_idx * tokens + t]);
+                    // NOTE: row stride is `kv_stride` (cache's `maxSeq`), not
+                    // `tokens` (live KV-row count). For caches that aren't
+                    // fully populated yet, head 1 starts at offset
+                    // `kv_stride`, NOT `tokens` — otherwise we'd read head 0's
+                    // tail bytes as if they were head 1's rows.
+                    let k_packed_row = (kv_idx * kv_stride + t) * key_packed_width;
+                    let k_norm = load(key_norms[kv_idx * kv_stride + t]);
                     let mut dot_partial = 0.0f32;
                     for i in range(0u32, $dims_per_lane, 1u32) {
                         let d = lane + i * 32u32;
@@ -152,8 +158,9 @@ macro_rules! aura_flash_sdpa_kernel {
                     let exp_score = exp(score - new_m);
 
                     // V-side update from compressed centroids.
-                    let v_packed_row = (kv_idx * tokens + t) * value_packed_width;
-                    let v_norm = load(val_norms[kv_idx * tokens + t]);
+                    // Same `kv_stride` row stride as the K side above.
+                    let v_packed_row = (kv_idx * kv_stride + t) * value_packed_width;
+                    let v_norm = load(val_norms[kv_idx * kv_stride + t]);
                     for i in range(0u32, $dims_per_lane, 1u32) {
                         let d = lane + i * 32u32;
                         if d < dim {
