@@ -29,6 +29,8 @@ use metaltile_std::ffai::sdpa_bidirectional::{
     ffai_sdpa_bidirectional_d32,
     ffai_sdpa_bidirectional_d64,
     ffai_sdpa_bidirectional_d72,
+    ffai_sdpa_bidirectional_d80,
+    ffai_sdpa_bidirectional_d96,
 };
 
 /// CPU reference: per (query, q_head), softmax(Q·Kᵀ·scale)·V over the
@@ -88,6 +90,8 @@ enum Variant {
     D32,
     D64,
     D72,
+    D80,
+    D96,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,6 +128,8 @@ fn run_sdpa_bidirectional(
         Variant::D32 => ffai_sdpa_bidirectional_d32::kernel_ir_for(dt.to_dtype()),
         Variant::D64 => ffai_sdpa_bidirectional_d64::kernel_ir_for(dt.to_dtype()),
         Variant::D72 => ffai_sdpa_bidirectional_d72::kernel_ir_for(dt.to_dtype()),
+        Variant::D80 => ffai_sdpa_bidirectional_d80::kernel_ir_for(dt.to_dtype()),
+        Variant::D96 => ffai_sdpa_bidirectional_d96::kernel_ir_for(dt.to_dtype()),
     };
     kernel.mode = KernelMode::Reduction;
 
@@ -615,4 +621,312 @@ fn sdpa_bidirectional_d72_matches_cpu_bf16() {
         scale,
     );
     assert_close(&actual, &expected, 2e-2, "sdpa_bidirectional_d72 bf16");
+}
+
+// ─── head_dim = 80 (Qwen2.5-VL vision tower, ragged) ──────────────
+//
+// Like d72, 3 elements per lane with bounds masking — but with the
+// added subtlety that lane 26 is PARTIALLY in range (one of its three
+// indices is OOB at d=80). Exercises the per-element mask vs the
+// per-lane mask.
+
+#[test]
+fn sdpa_bidirectional_d80_no_prefix_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (4usize, 4usize, 80usize);
+    let (base_kv, n_query) = (0usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 23, 9.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+
+    let expected = naive_sdpa_bidirectional(
+        &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D80,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 1e-4, "sdpa_bidirectional_d80 no-prefix f32");
+}
+
+#[test]
+fn sdpa_bidirectional_d80_with_prefix_and_gqa_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (8usize, 2usize, 80usize);
+    let (base_kv, n_query) = (16usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 29, 12.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+
+    let expected = naive_sdpa_bidirectional(
+        &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D80,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 1e-4, "sdpa_bidirectional_d80 prefix+GQA f32");
+}
+
+#[test]
+fn sdpa_bidirectional_d80_matches_cpu_f16() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (4usize, 2usize, 80usize);
+    let (base_kv, n_query) = (12usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 23, 9.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+    let round = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| Dt::F16.round(x)).collect() };
+
+    let expected = naive_sdpa_bidirectional(
+        &round(&q),
+        &round(&k),
+        &round(&v),
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D80,
+        &q,
+        &k,
+        &v,
+        Dt::F16,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 5e-3, "sdpa_bidirectional_d80 f16");
+}
+
+#[test]
+fn sdpa_bidirectional_d80_matches_cpu_bf16() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (4usize, 2usize, 80usize);
+    let (base_kv, n_query) = (12usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 23, 9.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+    let round = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| Dt::Bf16.round(x)).collect() };
+
+    let expected = naive_sdpa_bidirectional(
+        &round(&q),
+        &round(&k),
+        &round(&v),
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D80,
+        &q,
+        &k,
+        &v,
+        Dt::Bf16,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 2e-2, "sdpa_bidirectional_d80 bf16");
+}
+
+// ─── head_dim = 96 (Qwen2-VL vision tower, clean fit) ─────────────
+//
+// 32 lanes × 3 = 96 exactly; no bounds masking. Validates the
+// no-mask branch.
+
+#[test]
+fn sdpa_bidirectional_d96_no_prefix_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (4usize, 4usize, 96usize);
+    let (base_kv, n_query) = (0usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 23, 9.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+
+    let expected = naive_sdpa_bidirectional(
+        &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D96,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 1e-4, "sdpa_bidirectional_d96 no-prefix f32");
+}
+
+#[test]
+fn sdpa_bidirectional_d96_with_prefix_and_gqa_matches_cpu_f32() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (8usize, 2usize, 96usize);
+    let (base_kv, n_query) = (16usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 29, 12.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+
+    let expected = naive_sdpa_bidirectional(
+        &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D96,
+        &q,
+        &k,
+        &v,
+        Dt::F32,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 1e-4, "sdpa_bidirectional_d96 prefix+GQA f32");
+}
+
+#[test]
+fn sdpa_bidirectional_d96_matches_cpu_f16() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (4usize, 2usize, 96usize);
+    let (base_kv, n_query) = (12usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 23, 9.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+    let round = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| Dt::F16.round(x)).collect() };
+
+    let expected = naive_sdpa_bidirectional(
+        &round(&q),
+        &round(&k),
+        &round(&v),
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D96,
+        &q,
+        &k,
+        &v,
+        Dt::F16,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 5e-3, "sdpa_bidirectional_d96 f16");
+}
+
+#[test]
+fn sdpa_bidirectional_d96_matches_cpu_bf16() {
+    let _g = gpu_lock();
+    let (n_q_heads, n_kv_heads, head_dim) = (4usize, 2usize, 96usize);
+    let (base_kv, n_query) = (12usize, 8usize);
+    let kv_stride = base_kv + n_query;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q = ramp(n_query * n_q_heads * head_dim, 23, 9.0);
+    let k = ramp(n_kv_heads * kv_stride * head_dim, 13, 6.0);
+    let v = ramp(n_kv_heads * kv_stride * head_dim, 11, 5.0);
+    let round = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&x| Dt::Bf16.round(x)).collect() };
+
+    let expected = naive_sdpa_bidirectional(
+        &round(&q),
+        &round(&k),
+        &round(&v),
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    let actual = run_sdpa_bidirectional(
+        Variant::D96,
+        &q,
+        &k,
+        &v,
+        Dt::Bf16,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        base_kv,
+        n_query,
+        kv_stride,
+        scale,
+    );
+    assert_close(&actual, &expected, 2e-2, "sdpa_bidirectional_d96 bf16");
 }
