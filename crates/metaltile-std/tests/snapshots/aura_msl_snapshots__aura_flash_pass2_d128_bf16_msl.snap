@@ -38,10 +38,10 @@ kernel void aura_flash_pass2_d128(
     auto __ml_m_acc = v6;
     auto v7 = 0.0f;
     auto __ml_l_acc = v7;
-    uint v8 = 0u;
     auto v9 = num_blocks;
-    uint v10 = 1u;
     auto v11 = v_q_idx * v9;
+    uint v8 = 0u;
+    uint v10 = 1u;
     for (uint i_1 = v8; i_1 < v9; i_1 += v10) {
         auto v_ml_idx = v11 + i_1;
         auto v13 = m_partials[v_ml_idx];
@@ -120,11 +120,11 @@ kernel void aura_flash_pass2_d128(
     }
     auto v50 = __ml_l_acc;
     auto v51 = 0.0f;
-    auto v52 = v50 > v51;
     auto v53 = 1.0f;
     auto v54 = __ml_l_acc;
-    auto v55 = v53 / v54;
     auto v56 = 0.0f;
+    auto v52 = v50 > v51;
+    auto v55 = v53 / v54;
     auto v_inv_l = bool(v52) ? v55 : v56;
     uint v61 = 32u;
     uint v1073741836 = 0u;

@@ -90,36 +90,65 @@ pub struct DeadValueElimPass;
 impl super::Pass for DeadValueElimPass {
     fn name(&self) -> &str { "dead_value_elim" }
 
-    fn run(&self, kernel: &mut Kernel) -> Result<()> {
-        for _ in 0..MAX_ITERATIONS {
-            let used = collect_used_value_ids(kernel);
-            let mut removed_any = false;
+    fn run(&self, kernel: &mut Kernel) -> Result<()> { force_eliminate_dead_values(kernel) }
+}
 
-            // Body block — canonical source of truth for the entry block.
-            removed_any |= dve_block(&mut kernel.body, &used);
-
-            // Nested blocks.  Snapshot ids so we can iterate-and-mutate.
-            // Skip `body.id` — the entry block is stored both in
-            // `kernel.body` (canonical) and in `kernel.blocks` as an
-            // unsynchronised stale copy.  Mutating the stale copy is
-            // wasted work and would never be observed by the emitter
-            // (which reads `kernel.body`).
-            let body_id = kernel.body.id;
-            let block_ids: Vec<BlockId> =
-                kernel.blocks.keys().copied().filter(|b| *b != body_id).collect();
-            for bid in block_ids {
-                let mut block =
-                    kernel.blocks.remove(&bid).ok_or_else(|| Error::BlockNotFound(bid.as_u32()))?;
-                removed_any |= dve_block(&mut block, &used);
-                kernel.blocks.insert(bid, block);
-            }
-
-            if !removed_any {
-                break;
-            }
-        }
-        Ok(())
+/// Per-pass DCE postcondition (#209/1).  Each orphan-producing pass
+/// (Vectorize, Unroll, CopyProp, CSE, LICM, IfConversion, ValueSink,
+/// Fusion, FmaFusion, AlgebraicSimplify, ConstFold) calls this at
+/// the end of its `run()` to enforce the "if you remove the only
+/// use of a value, you remove the value" invariant *as the pass's
+/// own postcondition* rather than relying on a global DCE sweep at
+/// the end of the pipeline.
+///
+/// **Test-fixture guard.**  Kernels with no side-effecting op (no
+/// Store, no Barrier, no ThreadgroupStore, …) have no liveness
+/// anchor; every value is dead by definition.  Skipping DCE in that
+/// case keeps degenerate pass-level test fixtures working without
+/// forcing every unit test to scaffold an output Store.  Production
+/// kernels always have at least one Store to an output — they hit
+/// the full DCE loop.  Tests that explicitly want to exercise DCE
+/// on an anchorless kernel call [`DeadValueElimPass`] / [`force_eliminate_dead_values`]
+/// instead.
+pub fn eliminate_dead_values(kernel: &mut Kernel) -> Result<()> {
+    let has_anchor = |b: &metaltile_core::ir::Block| b.ops.iter().any(|op| op.has_side_effects());
+    if !kernel.iter_blocks().any(has_anchor) {
+        return Ok(());
     }
+    force_eliminate_dead_values(kernel)
+}
+
+/// Unconditional DCE — runs the full fixpoint sweep regardless of
+/// whether the kernel has a liveness anchor.  Used by
+/// `DeadValueElimPass::run` (the registry entry point) and by tests
+/// that explicitly want to drive DCE without scaffolding a Store.
+///
+/// Most production callers should use [`eliminate_dead_values`] —
+/// the guarded variant correctly skips no-op work on anchorless
+/// fixtures.
+pub fn force_eliminate_dead_values(kernel: &mut Kernel) -> Result<()> {
+    for _ in 0..MAX_ITERATIONS {
+        let used = collect_used_value_ids(kernel);
+        let mut removed_any = false;
+
+        // Entry block — `kernel.body` is the canonical entry block;
+        // `kernel.blocks` only holds nested blocks (post-#209/2).
+        removed_any |= dve_block(&mut kernel.body, &used);
+
+        // Nested blocks.  Snapshot ids so we can iterate-and-mutate.
+        let block_ids: Vec<BlockId> = kernel.blocks.keys().copied().collect();
+        for bid in block_ids {
+            let mut block =
+                kernel.blocks.remove(&bid).ok_or_else(|| Error::BlockNotFound(bid.as_u32()))?;
+            removed_any |= dve_block(&mut block, &used);
+            kernel.blocks.insert(bid, block);
+        }
+
+        if !removed_any {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Walk every op in every block of the kernel; return the union of
@@ -134,27 +163,7 @@ fn collect_used_value_ids(kernel: &Kernel) -> FxHashSet<u32> {
         kernel.body.ops.len() + kernel.blocks.values().map(|b| b.ops.len()).sum::<usize>();
     let mut used: FxHashSet<u32> =
         FxHashSet::with_capacity_and_hasher(total_ops * 4, Default::default());
-
-    // `kernel.body` is the canonical entry block.  `kernel.blocks` also
-    // contains an *unsynchronised stale copy* at `body.id` (a foot-gun
-    // built into the `Kernel` data structure — see `Kernel::new` /
-    // `sync_entry_block` in metaltile-core).  Earlier passes (Unroll,
-    // Schedule, Vectorize) mutate `kernel.body` in place and never update
-    // the stale copy, so iterating `kernel.blocks.values()` would resurrect
-    // references to ValueIds that are dead in the real IR — keeping
-    // orphan loop-bound `Const`s alive purely because the stale block's
-    // Op::Loop op still names them.  Walk the canonical body, and skip
-    // its BlockId when iterating the rest of the block map.
-    for op in &kernel.body.ops {
-        for v in op.value_refs() {
-            used.insert(v.as_u32());
-        }
-    }
-    let body_id = kernel.body.id;
-    for (bid, block) in kernel.blocks.iter() {
-        if *bid == body_id {
-            continue;
-        }
+    for block in kernel.iter_blocks() {
         for op in &block.ops {
             for v in op.value_refs() {
                 used.insert(v.as_u32());
@@ -483,24 +492,21 @@ mod tests {
     }
 
     /// REGRESSION: `Kernel` stores the entry block twice — once as
-    /// `kernel.body` (the canonical, mutated-in-place source of truth)
-    /// and once as a stale copy at `kernel.blocks[body.id]` (inserted by
-    /// `Kernel::new`, never updated by passes that mutate `body`).  A
-    /// naïve use-set walk that iterates `kernel.blocks.values()`
-    /// resurrects ValueIds the live body has long since orphaned —
-    /// keeping every unrolled-loop `start`/`end`/`step` Const alive
-    /// because the stale block's `Op::Loop` still names them.
+    /// Post-#209/2 the entry block lives only at `kernel.body`;
+    /// `kernel.blocks` holds nested blocks only.  This test pins that
+    /// invariant: build a kernel, observe that `kernel.body.id` is
+    /// NOT a key in `kernel.blocks`, and confirm DCE only needs the
+    /// one canonical entry block to do its job.
     ///
-    /// Build a kernel with bounds Consts feeding an `Op::Loop`, manually
-    /// strip the loop from `kernel.body` (mimicking what Unroll does
-    /// when it inlines the body and replaces the `Op::Loop` op), then
-    /// verify DCE eliminates the bounds.  The stale `kernel.blocks[0]`
-    /// copy *still has the Op::Loop*; the test pins that DCE ignores
-    /// it.  Pre-fix, this test produced 3 surviving Consts; post-fix, 0.
+    /// Replaces the pre-fix `ignores_stale_entry_block_copy_in_kernel_blocks`
+    /// test, which was specifically reproducing the stale-copy footgun
+    /// that no longer exists.
     #[test]
-    fn ignores_stale_entry_block_copy_in_kernel_blocks() {
-        let mut k = Kernel::new("dve_stale_body");
-        // Bounds + a fake Op::Loop that originally consumed them.
+    fn entry_block_is_not_duplicated_in_kernel_blocks() {
+        let mut k = Kernel::new("dve_entry_block");
+        // Bounds + a fake Op::Loop that originally consumed them, then
+        // strip the loop from `kernel.body` — exactly the state Unroll
+        // leaves behind after inlining a loop body.
         k.body.push_op(Op::Const { value: 0 }, ValueId::new(0));
         k.body.push_op(Op::Const { value: 4 }, ValueId::new(1));
         k.body.push_op(Op::Const { value: 1 }, ValueId::new(2));
@@ -514,13 +520,14 @@ mod tests {
             step: ValueId::new(2),
             body: body_id,
         });
-
-        // Force the `kernel.blocks` map to hold a *stale* snapshot of
-        // `body`, then strip the Op::Loop from the live `body` —
-        // exactly the state Unroll leaves behind after inlining.
-        k.sync_entry_block();
         k.body.ops.pop();
         k.body.results.pop();
+
+        // Invariant: the entry block is NOT in `kernel.blocks`.
+        assert!(
+            !k.blocks.contains_key(&k.body.id),
+            "Kernel::new must not duplicate the entry block into kernel.blocks"
+        );
 
         DeadValueElimPass.run(&mut k).unwrap();
 
@@ -532,7 +539,7 @@ mod tests {
             .collect();
         assert!(
             surviving_consts.is_empty(),
-            "stale `kernel.blocks[body.id]` must not keep bound Consts alive: {surviving_consts:?}"
+            "orphan loop-bound Consts must be eliminated: {surviving_consts:?}"
         );
     }
 

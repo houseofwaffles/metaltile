@@ -33,7 +33,7 @@
 
 use std::collections::BTreeSet;
 
-use metaltile_core::ir::{BinOpKind, Block, BlockId, Kernel, Op, ValueId};
+use metaltile_core::ir::{BinOpKind, Block, BlockId, Kernel, Op, UnaryOpKind, ValueId};
 
 use crate::error::Result;
 
@@ -98,6 +98,7 @@ impl super::Pass for ConstFoldPass {
                 dce_block(block, &cross_block_refs);
             }
         }
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }
@@ -111,37 +112,53 @@ fn fold_block(block: &mut Block) {
     let mut const_overwrites: Vec<(usize, i64)> = Vec::new();
 
     for i in 0..block.ops.len() {
-        if let Op::BinOp { op, lhs, rhs } = &block.ops[i] {
-            let lv = find_const(block, *lhs);
-            let rv = find_const(block, *rhs);
+        match &block.ops[i] {
+            Op::BinOp { op, lhs, rhs } => {
+                let lv = find_const(block, *lhs);
+                let rv = find_const(block, *rhs);
 
-            // Literal-literal folding.
-            if let (Some(a), Some(b)) = (lv, rv)
-                && let Some(result) = eval_binop(*op, a, b)
-            {
-                const_overwrites.push((i, result));
-                continue;
-            }
+                // Literal-literal folding.
+                if let (Some(a), Some(b)) = (lv, rv)
+                    && let Some(result) = eval_binop(*op, a, b)
+                {
+                    const_overwrites.push((i, result));
+                    continue;
+                }
 
-            // Identity / absorbing-element folding.
-            match op {
-                BinOpKind::Add | BinOpKind::Sub => {
-                    if lv == Some(0) && matches!(op, BinOpKind::Add) {
-                        replacements.push((i, *rhs));
-                    } else if rv == Some(0) {
-                        replacements.push((i, *lhs));
-                    }
-                },
-                BinOpKind::Mul =>
-                    if lv == Some(0) || rv == Some(0) {
-                        const_overwrites.push((i, 0));
-                    } else if lv == Some(1) {
-                        replacements.push((i, *rhs));
-                    } else if rv == Some(1) {
-                        replacements.push((i, *lhs));
+                // Identity / absorbing-element folding.
+                match op {
+                    BinOpKind::Add | BinOpKind::Sub => {
+                        if lv == Some(0) && matches!(op, BinOpKind::Add) {
+                            replacements.push((i, *rhs));
+                        } else if rv == Some(0) {
+                            replacements.push((i, *lhs));
+                        }
                     },
-                _ => {},
-            }
+                    BinOpKind::Mul =>
+                        if lv == Some(0) || rv == Some(0) {
+                            const_overwrites.push((i, 0));
+                        } else if lv == Some(1) {
+                            replacements.push((i, *rhs));
+                        } else if rv == Some(1) {
+                            replacements.push((i, *lhs));
+                        },
+                    _ => {},
+                }
+            },
+            // Integer-typed `UnaryOp(Const)` folds to a single Const.
+            // Float-typed unaries (Exp, Log, Sqrt, Sin, …) intentionally
+            // stay rolled — `Op::Const` stores `i64`, so collapsing
+            // `exp(Const(2))` to a Const would lose the float-domain
+            // semantics the downstream ops expect.  See `eval_unary_op`
+            // for the integer-safe set.
+            Op::UnaryOp { op: kind, value } => {
+                if let Some(a) = find_const(block, *value)
+                    && let Some(result) = eval_unary_op(*kind, a)
+                {
+                    const_overwrites.push((i, result));
+                }
+            },
+            _ => {},
         }
     }
 
@@ -198,6 +215,37 @@ fn eval_binop(op: BinOpKind, a: i64, b: i64) -> Option<i64> {
         BinOpKind::BitOr => Some(a | b),
         BinOpKind::BitXor => Some(a ^ b),
         BinOpKind::ATan2 | BinOpKind::Rem | BinOpKind::Mod => None,
+    }
+}
+
+/// Fold `Op::UnaryOp(Const)` for the *integer-safe* unary kinds.
+///
+/// `Op::Const` stores an `i64` — float-domain unaries like `Exp`,
+/// `Log`, `Sqrt`, `Sin`, `Cos`, `Tanh`, `Erf`, `Recip`, etc. don't
+/// round-trip through an integer constant pool without changing
+/// semantics (`exp(Const(2))` ≠ `Const(7)`), so they intentionally
+/// stay rolled and the float computation happens at runtime in MSL.
+///
+/// The kinds folded here all produce an integer answer from an
+/// integer input:
+/// - `Neg` — two's-complement negation, wrapping on `i64::MIN`.
+/// - `Abs` — absolute value, wrapping on `i64::MIN` (matches
+///   `i64::wrapping_abs` semantics).
+/// - `Sign` — `-1` / `0` / `+1` based on the input's sign.
+/// - `Trunc`, `Floor`, `Ceil`, `Round` — no-ops on integers; preserve
+///   the value, drop the float-domain rounding op so downstream code
+///   sees a plain `Op::Const`.
+fn eval_unary_op(op: UnaryOpKind, a: i64) -> Option<i64> {
+    match op {
+        UnaryOpKind::Neg => Some(a.wrapping_neg()),
+        UnaryOpKind::Abs => Some(a.wrapping_abs()),
+        UnaryOpKind::Sign => Some(a.signum()),
+        UnaryOpKind::Trunc | UnaryOpKind::Floor | UnaryOpKind::Ceil | UnaryOpKind::Round => Some(a),
+        // Float-domain unaries (Exp, Log, Sqrt, Rsqrt, Recip, Sin,
+        // Cos, Tan, Erf, ErfInv, Exp2, Log2, Sinh, Cosh, Asin, Acos,
+        // Atan, Asinh, Acosh, Atanh, Tanh, Log1p, Expm1, Square) are
+        // intentionally not folded — see fn-level docstring.
+        _ => None,
     }
 }
 
@@ -268,12 +316,20 @@ mod tests {
         mut results: Vec<Option<ValueId>>,
         used_vid: ValueId,
     ) -> Block {
-        // Append an op that references `used_vid` to prevent DCE from removing it.
-        let ref_vid = ValueId::new(
-            results.iter().filter_map(|r| r.map(|v| v.as_u32())).max().unwrap_or(99) + 1,
-        );
-        ops.push(Op::BinOp { op: BinOpKind::Add, lhs: used_vid, rhs: used_vid });
-        results.push(Some(ref_vid));
+        // Append a Store that consumes `used_vid` so the per-pass DCE
+        // postcondition (#209/1) doesn't sweep the ops we want to
+        // inspect.  Stores have side effects and are never eliminated;
+        // a BinOp ref-op was used pre-#209/1 but is itself DCE-eligible
+        // (its result has no consumer), so cascade-removal would strip
+        // the whole chain.  Using a Store anchors `used_vid` against
+        // the kernel's `out` param.
+        ops.push(metaltile_core::ir::Op::Store {
+            dst: "out".into(),
+            indices: vec![metaltile_core::ir::IndexExpr::Value(used_vid)],
+            value: used_vid,
+            mask: None,
+        });
+        results.push(None);
 
         let mut k = Kernel::new("test");
         k.body.push_op(Op::Const { value: 0 }, ValueId::new(0));
@@ -392,5 +448,105 @@ mod tests {
         let block = fold_in_block(ops, results, ValueId::new(102));
         let has_const_zero = block.ops.iter().any(|op| matches!(op, Op::Const { value: 0 }));
         assert!(has_const_zero, "x*0 should become Const(0)");
+    }
+
+    #[test]
+    fn folds_unary_neg_of_const() {
+        // Neg(Const(7)) → Const(-7).
+        let ops = vec![Op::Const { value: 7 }, Op::UnaryOp {
+            op: UnaryOpKind::Neg,
+            value: ValueId::new(100),
+        }];
+        let results = vec![Some(ValueId::new(100)), Some(ValueId::new(101))];
+        let block = fold_in_block(ops, results, ValueId::new(101));
+        // Stand-alone Neg op must be gone — folded into a Const.
+        assert!(
+            !block.ops.iter().any(|op| matches!(op, Op::UnaryOp { .. })),
+            "Neg(Const) should fold away"
+        );
+        assert!(
+            block.ops.iter().any(|op| matches!(op, Op::Const { value: -7 })),
+            "Neg(Const(7)) should produce Const(-7): {:?}",
+            block.ops
+        );
+    }
+
+    #[test]
+    fn folds_unary_abs_of_const() {
+        // Abs(Const(-5)) → Const(5).
+        let ops = vec![Op::Const { value: -5 }, Op::UnaryOp {
+            op: UnaryOpKind::Abs,
+            value: ValueId::new(100),
+        }];
+        let results = vec![Some(ValueId::new(100)), Some(ValueId::new(101))];
+        let block = fold_in_block(ops, results, ValueId::new(101));
+        assert!(
+            block.ops.iter().any(|op| matches!(op, Op::Const { value: 5 })),
+            "Abs(Const(-5)) should produce Const(5): {:?}",
+            block.ops
+        );
+    }
+
+    #[test]
+    fn folds_unary_sign_of_const() {
+        // Sign(Const(-42)) → Const(-1).  Triple coverage: -42, 0, +42.
+        for (input, expected) in [(-42i64, -1i64), (0, 0), (42, 1)] {
+            let ops = vec![Op::Const { value: input }, Op::UnaryOp {
+                op: UnaryOpKind::Sign,
+                value: ValueId::new(100),
+            }];
+            let results = vec![Some(ValueId::new(100)), Some(ValueId::new(101))];
+            let block = fold_in_block(ops, results, ValueId::new(101));
+            assert!(
+                block.ops.iter().any(|op| matches!(op, Op::Const { value } if *value == expected)),
+                "Sign(Const({input})) should produce Const({expected}): {:?}",
+                block.ops
+            );
+        }
+    }
+
+    #[test]
+    fn float_unary_of_const_not_folded() {
+        // Exp(Const(2)) must NOT fold — Op::Const stores i64 and the
+        // float-domain semantics of `exp(2.0)` ≠ `Const(7)`.  Stay
+        // rolled; the float compute happens at runtime in MSL.
+        let ops = vec![Op::Const { value: 2 }, Op::UnaryOp {
+            op: UnaryOpKind::Exp,
+            value: ValueId::new(100),
+        }];
+        let results = vec![Some(ValueId::new(100)), Some(ValueId::new(101))];
+        let block = fold_in_block(ops, results, ValueId::new(101));
+        assert!(
+            block.ops.iter().any(|op| matches!(op, Op::UnaryOp { op: UnaryOpKind::Exp, .. })),
+            "Exp(Const) must stay unfolded: {:?}",
+            block.ops
+        );
+    }
+
+    #[test]
+    fn folds_integer_noop_unary_of_const() {
+        // Trunc/Floor/Ceil/Round on integer Const are no-ops on the
+        // value — drop the op and keep the Const.  This collapses the
+        // `Op::UnaryOp { Trunc | Floor | Ceil | Round, Const(a) }`
+        // pattern that's common in code-paths that mix integer index
+        // math with float-domain ops (e.g. `(idx as f32).floor()`
+        // where the cast-Const-floor sequence reduces away).
+        for kind in [UnaryOpKind::Trunc, UnaryOpKind::Floor, UnaryOpKind::Ceil, UnaryOpKind::Round]
+        {
+            let ops =
+                vec![Op::Const { value: 9 }, Op::UnaryOp { op: kind, value: ValueId::new(100) }];
+            let results = vec![Some(ValueId::new(100)), Some(ValueId::new(101))];
+            let block = fold_in_block(ops, results, ValueId::new(101));
+            assert!(
+                !block.ops.iter().any(|op| matches!(op, Op::UnaryOp { .. })),
+                "{kind:?}(Const(9)) should fold away: {:?}",
+                block.ops
+            );
+            assert!(
+                block.ops.iter().any(|op| matches!(op, Op::Const { value: 9 })),
+                "{kind:?}(Const(9)) should produce Const(9): {:?}",
+                block.ops
+            );
+        }
     }
 }

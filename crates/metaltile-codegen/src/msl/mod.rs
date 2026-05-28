@@ -80,16 +80,6 @@ fn kernel_uses_identifier(kernel: &Kernel, name: &str) -> bool {
 /// runtime-assert hooks even when the kernel body doesn't consult
 /// them, and the body parser keeps those decls on the kernel
 /// signature for ABI consistency.
-///
-/// **Stale-block-copy hazard.**  `Kernel::new` inserts the entry block
-/// at *both* `kernel.body` AND `kernel.blocks[body.id]`, then optimization
-/// passes (Unroll / Schedule / DCE) mutate `kernel.body` in place and
-/// never sync the copy.  Iterating `kernel.blocks.values()` would
-/// resurrect references to ops that the real IR has eliminated — e.g.
-/// a `Load(q_position, [])` that const-fold + algebraic-simplify +
-/// dead-value-elim correctly retired from `kernel.body`.  Skip the
-/// `body.id` entry when walking blocks; same fix as
-/// `passes::dead_value_elim::collect_used_value_ids`.
 fn kernel_references_param(kernel: &Kernel, name: &str) -> bool {
     let op_refs = |op: &Op| -> bool {
         if op.load_src() == Some(name) || op.store_dst() == Some(name) {
@@ -121,16 +111,8 @@ fn kernel_references_param(kernel: &Kernel, name: &str) -> bool {
         }
         false
     };
-    let check = |ops: &[Op]| ops.iter().any(op_refs);
-    if check(&kernel.body.ops) {
-        return true;
-    }
-    let body_id = kernel.body.id;
-    for (bid, block) in kernel.blocks.iter() {
-        if *bid == body_id {
-            continue; // stale copy — see doc comment
-        }
-        if check(&block.ops) {
+    for block in kernel.iter_blocks() {
+        if block.ops.iter().any(op_refs) {
             return true;
         }
     }
@@ -171,7 +153,7 @@ fn kernel_has_reduce_mean(kernel: &Kernel) -> bool {
 /// path fires for `axis == 0` in `Reduction` / `Tile2D` mode when
 /// `expected_tpg` is `None` or greater than the simd width — see
 /// `MslGenerator::emit_reduce` in `reduce.rs`.
-fn kernel_reduce_uses_n_simd(kernel: &Kernel, config: &MslConfig) -> bool {
+pub(super) fn kernel_reduce_uses_n_simd(kernel: &Kernel, config: &MslConfig) -> bool {
     let tg_modes = matches!(
         kernel.mode,
         metaltile_core::ir::KernelMode::Reduction | metaltile_core::ir::KernelMode::Tile2D
@@ -244,58 +226,12 @@ impl ReductionPreambleGates {
     fn needs_lsize3_attr(&self) -> bool { self.needs_lsize }
 }
 
-/// Return `true` if the kernel actually references `simd_lane` as an
-/// identifier in the emitted MSL.  Tighter than `feat.needs_simd_lane`
-/// (which is set by any op with the `needs_simd_lane` flag, including
-/// `SimdReduce` / `SimdShuffleXor` / `SimdgroupMatMul` whose emit
-/// lowers to a builtin call like `simd_sum(value)` and never names
-/// `simd_lane`).
-///
-/// Real consumers — one row per MSL emit site:
-/// - `Op::SimdLaneId` → `auto vNN = simd_lane;` (emit_block.rs)
-/// - direct `Op::Load { src: "simd_lane", indices: [] }` (DSL identifier)
-/// - `Op::Reduce` slow path → `simd_lane == 0` / `simd_lane < n_simd`
-///   (reduce.rs:100,106) — fires when TPG > simd_size
-/// - matmul / tiled emit (`feat.is_matmul`) → `simd_lane >> 1`
-///   (matmul.rs:311)
-fn kernel_needs_simd_lane_attr(kernel: &Kernel, config: &MslConfig, is_matmul: bool) -> bool {
-    if is_matmul {
-        return true;
-    }
-    let has_simd_lane_id = |ops: &[Op]| ops.iter().any(|op| matches!(op, Op::SimdLaneId));
-    if has_simd_lane_id(&kernel.body.ops)
-        || kernel.blocks.values().any(|b| has_simd_lane_id(&b.ops))
-    {
-        return true;
-    }
-    if kernel_uses_identifier(kernel, "simd_lane") {
-        return true;
-    }
-    // Slow-path Op::Reduce uses simd_lane in the two-level emit.
-    kernel_reduce_uses_n_simd(kernel, config)
-}
-
-/// Symmetric to `kernel_needs_simd_lane_attr`: `simd_group` identifier
-/// is referenced only by `Op::SimdGroupId`, direct loads, slow-path
-/// reductions (reduce.rs:100,103 — `simd_group == 0` and
-/// `tg_name[simd_group]`), and matmul tiled emit (matmul.rs:173-174 —
-/// `sg_x = simd_group % …` / `sg_y = simd_group / …`).
-fn kernel_needs_simd_group_attr(kernel: &Kernel, config: &MslConfig, is_matmul: bool) -> bool {
-    if is_matmul {
-        return true;
-    }
-    let has_simd_group_id = |ops: &[Op]| ops.iter().any(|op| matches!(op, Op::SimdGroupId));
-    if has_simd_group_id(&kernel.body.ops)
-        || kernel.blocks.values().any(|b| has_simd_group_id(&b.ops))
-    {
-        return true;
-    }
-    if kernel_uses_identifier(kernel, "simd_group") || kernel_uses_identifier(kernel, "simd_id") {
-        return true;
-    }
-    // Slow-path Op::Reduce uses simd_group in the two-level emit.
-    kernel_reduce_uses_n_simd(kernel, config)
-}
+// Signature gating for `uint simd_lane [[thread_index_in_simdgroup]]`
+// and `uint simd_group [[simdgroup_index_in_threadgroup]]` lives on
+// `KernelFeatures::needs_simd_lane` / `needs_simd_group` (see
+// `features.rs`).  Pre-#209/4 hand-rolled `kernel_needs_simd_*_attr`
+// predicates duplicated the work; the OpFlag layer now reflects actual
+// MSL identifier consumption directly.
 
 // ---------------------------------------------------------------------------
 // Generator
@@ -554,19 +490,15 @@ impl MslGenerator {
             },
         }
         // NOTE: SimdGroup2D mode emits simd_lane and simd_group inline above.
-        // Other modes add them conditionally here.  Pre-fix, `feat.needs_simd_*`
-        // was over-broad (set by SimdReduce/SimdShuffleXor/etc. whose emits
-        // don't actually reference these identifiers); tightened predicates
-        // gate on actual MSL consumption — see `kernel_needs_simd_lane_attr`
-        // and `kernel_needs_simd_group_attr`.
-        if !matches!(kernel.mode, KernelMode::SimdGroup2D)
-            && kernel_needs_simd_lane_attr(kernel, &self.config, feat.is_matmul)
-        {
+        // Other modes add them conditionally here.  `feat.needs_simd_*`
+        // now reflects actual MSL identifier consumption directly (post-#209/4):
+        // the `needs_simd_lane`/`needs_simd_group` OpFlags live only on
+        // `Op::SimdLaneId`/`Op::SimdGroupId`, plus the per-feature multi-op
+        // cases (matmul / Reduce slow path) handled in `features.rs`.
+        if !matches!(kernel.mode, KernelMode::SimdGroup2D) && feat.needs_simd_lane {
             write!(out, ",\n    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
         }
-        if !matches!(kernel.mode, KernelMode::SimdGroup2D)
-            && kernel_needs_simd_group_attr(kernel, &self.config, feat.is_matmul)
-        {
+        if !matches!(kernel.mode, KernelMode::SimdGroup2D) && feat.needs_simd_group {
             write!(out, ",\n    uint simd_group [[simdgroup_index_in_threadgroup]]").unwrap();
         }
 
@@ -624,13 +556,6 @@ impl MslGenerator {
         let mut hoists: Vec<String> = Vec::new();
         let extra_names: BTreeMap<ValueId, String> = BTreeMap::new();
 
-        // Compute the per-kernel skip set ONCE before emitting any
-        // block. `Op::Mul` ops whose result is consumed by an FMA-eligible
-        // Add/Sub (and nowhere else) would otherwise produce
-        // `auto vNN = ml * mr;` orphan lines under the MSL FMA peephole —
-        // see `compute_fma_absorbed_mul_skips` for the full rationale.
-        let skip_emit = emit_block::fma_absorbed_mul_skips(kernel);
-
         if feat.is_matmul {
             self.emit_tiled(&mut body_buf, "    ", kernel, None)?;
         } else {
@@ -643,7 +568,6 @@ impl MslGenerator {
                 type_env,
                 &extra_names,
                 &mut hoists,
-                &skip_emit,
             )?;
         }
 

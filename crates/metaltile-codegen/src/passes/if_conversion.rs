@@ -77,6 +77,7 @@ impl super::Pass for IfConversionPass {
             kernel.blocks.insert(*bid, block);
         }
 
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

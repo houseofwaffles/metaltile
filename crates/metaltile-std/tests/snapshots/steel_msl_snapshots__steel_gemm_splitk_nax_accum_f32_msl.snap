@@ -20,9 +20,9 @@ kernel void mt_steel_gemm_splitk_accum_nax(
     auto v_total = v1 * v2;
     auto v4 = partials[v_idx];
     auto __ml_acc = v4;
-    uint v5 = 1u;
     auto v6 = n_splits;
     uint v7 = 1u;
+    uint v5 = 1u;
     for (uint i_0 = v5; i_0 < v6; i_0 += v7) {
         auto v8 = __ml_acc;
         auto v10 = ((i_0 * v_total) + v_idx);

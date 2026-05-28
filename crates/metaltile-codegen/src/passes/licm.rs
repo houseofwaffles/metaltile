@@ -74,15 +74,10 @@ impl super::Pass for LicmPass {
         // Process nested blocks first (inside-out / post-order), then kernel.body last.
         // BlockIds are allocated in order, so higher IDs are deeper-nested children.
         // Sorting descending ensures children are processed before their parents,
-        // allowing multi-level hoisting (e.g. b3→b2→b1→b0) in a single pass.
-        //
-        // Exclude kernel.body.id: kernel.blocks may contain an entry with the same
-        // BlockId as kernel.body (when the root block is stored there). Processing it
-        // here would operate on the wrong Block object and empty child blocks before
-        // the explicit kernel.body call below.
-        let body_id = kernel.body.id;
-        let mut block_ids: Vec<BlockId> =
-            blocks.keys().copied().filter(|&bid| bid != body_id).collect();
+        // allowing multi-level hoisting (e.g. b3→b2→b1→b0) in a single pass.  Post
+        // #209/2, `kernel.blocks` holds nested blocks only — the entry block lives
+        // at `kernel.body`, processed explicitly after the inner loop below.
+        let mut block_ids: Vec<BlockId> = blocks.keys().copied().collect();
         block_ids.sort_by_key(|bid| -(bid.as_u32() as i32));
 
         for bid in block_ids {
@@ -96,6 +91,7 @@ impl super::Pass for LicmPass {
         // hoisted into direct child blocks by the inner-block passes above.
         kernel.blocks = blocks;
         licm_block(&mut kernel.body, &mut kernel.blocks, &def_block, &read_only);
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

@@ -19,7 +19,24 @@ use super::MslGenerator;
 pub(super) struct KernelFeatures {
     pub has_tile: bool,
     pub is_matmul: bool,
+    /// `true` iff the emitted MSL references `simd_lane` as a C identifier.
+    /// Drives the `uint simd_lane [[thread_index_in_simdgroup]]`
+    /// kernel-attr emission.  Set by the per-op `needs_simd_lane`
+    /// OpFlag (which now lives only on `Op::SimdLaneId` after the
+    /// #209/4 tightening) plus the multi-op cases that the OpFlag
+    /// can't express statically: the two-level `Op::Reduce` slow
+    /// path, the matmul tiled emit (`feat.is_matmul`), and
+    /// `Op::CoopTile*` / `mpp::` `Op::InlineMsl` (cooperative MMA
+    /// requires the same parameter for binding-table purposes).
+    /// Pre-#209/4 the OpFlag was set by every simdgroup-related op
+    /// regardless of whether the emit referenced the identifier; that
+    /// over-broad shape produced ~200 `-Wunused-parameter` warnings
+    /// against `simd_lane` until #207 routed around it.
     pub needs_simd_lane: bool,
+    /// Symmetric to `needs_simd_lane` for `simd_group`.  See
+    /// `needs_simd_lane`'s doc for the full rationale.  Same trigger
+    /// set: `Op::SimdGroupId`, `Op::Reduce` slow path, matmul,
+    /// `Op::CoopTile*` / MPP inline.
     pub needs_simd_group: bool,
     pub needs_simdgroup_matrix: bool,
     pub needs_bf16_struct: bool,
@@ -69,6 +86,34 @@ impl MslGenerator {
         let tensor_2d = kernel.params.iter().filter(|p| p.shape.rank() == 2).count();
         feat.is_matmul = feat.has_tile && tensor_2d >= 2;
 
+        // Matmul tiled emit (matmul.rs:173-174,311) references both
+        // `simd_group` and `simd_lane` as identifiers — gate their
+        // kernel-attr emission on `is_matmul`.  Pre-#209/4 the
+        // signature gating lived in `msl::kernel_needs_simd_*_attr`
+        // helpers that hand-rolled the same predicate; folding it
+        // into `KernelFeatures` deletes those helpers.
+        if feat.is_matmul {
+            feat.needs_simd_lane = true;
+            feat.needs_simd_group = true;
+        }
+
+        // `Op::Reduce` with `axis == 0` in `Reduction`/`Tile2D` mode
+        // routes through the two-level threadgroup-reduction path
+        // when the dispatched TPG is > simd_size — see `emit_reduce`
+        // in `reduce.rs`.  That path emits `simd_lane == 0` and
+        // `simd_group == 0` checks; the fast path (TPG ≤ simd_size)
+        // emits a bare `simd_*(value)` call with no identifier ref.
+        //
+        // The OpFlag layer can't express the conditional ("only when
+        // the slow path fires") because it depends on `expected_tpg`
+        // at codegen time, not on the op itself.  So we special-case
+        // it here at the feature-analysis layer, where the `config`
+        // is in scope.
+        if super::kernel_reduce_uses_n_simd(kernel, &self.config) {
+            feat.needs_simd_lane = true;
+            feat.needs_simd_group = true;
+        }
+
         feat
     }
 
@@ -114,11 +159,17 @@ impl MslGenerator {
                 if src == "simd_lane" {
                     feat.needs_simd_lane = true;
                 }
-                // `n_simd` is the number of simdgroups per threadgroup —
-                // it is derived from `lsize / 32` and emitted in the Reduction
-                // mode preamble alongside `simd_group`. Any kernel that reads
-                // `n_simd` also needs that preamble block.
-                if src == "simd_group" || src == "simd_id" || src == "n_simd" {
+                // `simd_id` is a DSL synonym for `simd_group` (the
+                // kernel-attr `[[simdgroup_index_in_threadgroup]]`).
+                // Reading either name means the kernel signature
+                // needs the attr.  `n_simd` is a *different* preamble
+                // identifier (`uint n_simd = lsize / 32u;`) derived
+                // from `lsize` only — it does NOT require the
+                // `simd_group` kernel attr.  Pre-#209/4 these were
+                // conflated, producing `-Wunused-parameter` warnings
+                // on every kernel that referenced `n_simd` without
+                // also using `simd_group`.
+                if src == "simd_group" || src == "simd_id" {
                     feat.needs_simd_group = true;
                 }
             },
@@ -149,19 +200,21 @@ impl MslGenerator {
             | Op::CoopTileRun { .. }
             | Op::CoopTileStoreC { .. } => {
                 feat.needs_mpp = true;
-                feat.needs_simd_lane = true;
-                feat.needs_simd_group = true;
+                // CoopTile / MPP cooperative-matmul intrinsics use
+                // their own simdgroup binding internally and never
+                // reference `simd_lane` / `simd_group` as C
+                // identifiers in the emitted MSL.  Pre-#209/4 this
+                // arm set both attrs anyway, producing
+                // `-Wunused-parameter` warnings on every MPP kernel.
+                // If a CoopTile kernel ever does spell those out (via
+                // a Load with src="simd_lane" / "simd_group"), the
+                // direct-identifier arm below catches it.
             },
             // Detect MPP tensor-ops usage in raw inline MSL — escape-hatch
             // for kernels that call `mpp::tensor_ops::matmul2d` / NAX.
             // Forces the codegen preamble to include the framework header.
-            // MPP MMA is simdgroup-cooperative — pulls in the same simd
-            // built-ins as the simdgroup_matrix path.
-            // CoopTile* ops use cooperative matmul — force the MPP framework header.
             Op::InlineMsl { source, .. } if source.contains("mpp::") => {
                 feat.needs_mpp = true;
-                feat.needs_simd_lane = true;
-                feat.needs_simd_group = true;
             },
             _ => {},
         }

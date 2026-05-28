@@ -67,10 +67,10 @@ kernel void mt_fp_qmm_nax(
     auto v_x_ws_base = v26 + v_x_k_base;
     auto v28 = k;
     uint v29 = 8u;
-    auto v_packs_per_row = v28 / v29;
     auto v_wn_plus_wr = v_w_n_base + v_x_m_row;
     auto v32 = gs_per_row;
     auto v_sb_base = v_wn_plus_wr * v32;
+    auto v_packs_per_row = v28 / v29;
     auto v_w_pack_row_base = v_wn_plus_wr * v_packs_per_row;
     uint v35 = 36u;
     auto v_xs_sg_off = v_sg_m_base * v35;
@@ -78,8 +78,6 @@ kernel void mt_fp_qmm_nax(
     auto v_ws_sg_off = v_sg_n_base * v37;
     uint v39 = 256u;
     auto v_sg_scratch_off = v_sg * v39;
-    uint v41 = 0u;
-    uint v42 = 32u;
     auto v43 = v_x_m_base + v_x_m_row;
     auto v44 = v43 * v28;
     uint v47 = 0u;
@@ -103,6 +101,8 @@ kernel void mt_fp_qmm_nax(
     uint v89 = 1u;
     uint v90 = 1u;
     uint v93 = 2u;
+    uint v41 = 0u;
+    uint v42 = 32u;
     for (uint i_0 = v41; i_0 < v28; i_0 += v42) {
         auto v45 = v44 + i_0;
         auto v_x_row_dev_base = v45 + v_x_k_base;
@@ -152,17 +152,17 @@ kernel void mt_fp_qmm_nax(
     uint v110 = 2u;
     auto v_o_row = v_lane / v110;
     uint v112 = 1u;
-    auto v113 = (v_lane & v112);
     uint v114 = 8u;
+    auto v113 = (v_lane & v112);
     auto v_o_col_base = v113 * v114;
-    uint v116 = 0u;
-    uint v117 = 8u;
-    uint v118 = 1u;
     uint v120 = 16u;
     auto v121 = v_o_row * v120;
     auto v122 = v_sg_scratch_off + v121;
     auto v_out_m_base = v_x_m_base + v_sg_m_base;
     auto v125 = v_out_m_base + v_o_row;
+    uint v116 = 0u;
+    uint v117 = 8u;
+    uint v118 = 1u;
     for (uint i_3 = v116; i_3 < v117; i_3 += v118) {
         auto v_col = v_o_col_base + i_3;
         auto v123 = v122 + v_col;

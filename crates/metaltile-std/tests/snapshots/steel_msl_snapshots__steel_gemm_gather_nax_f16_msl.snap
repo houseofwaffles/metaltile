@@ -59,8 +59,8 @@ kernel void mt_steel_gemm_gather_nax(
     uint v19 = 4u;
     auto v_x_m_row = v_lane_in_tg / v19;
     uint v21 = 3u;
-    auto v_x_k_quad = (v_lane_in_tg & v21);
     uint v23 = 8u;
+    auto v_x_k_quad = (v_lane_in_tg & v21);
     auto v_x_k_base = v_x_k_quad * v23;
     uint v25 = 36u;
     auto v26 = v_x_m_row * v25;
@@ -75,12 +75,10 @@ kernel void mt_steel_gemm_gather_nax(
     auto v_a_src_row = lhs_indices[v34];
     auto v_b_mat = rhs_indices[v16];
     auto v37 = k;
-    auto v38 = v_b_mat * v37;
     auto v39 = n;
+    auto v38 = v_b_mat * v37;
     auto v_b_base = v38 * v39;
     auto v_b_n = v_w_n_base + v_x_m_row;
-    uint v42 = 0u;
-    uint v43 = 32u;
     auto v44 = v_a_src_row * v37;
     uint v47 = 0u;
     uint v48 = 8u;
@@ -88,6 +86,8 @@ kernel void mt_steel_gemm_gather_nax(
     uint v55 = 0u;
     uint v56 = 8u;
     uint v57 = 1u;
+    uint v42 = 0u;
+    uint v43 = 32u;
     for (uint i_0 = v42; i_0 < v37; i_0 += v43) {
         auto v45 = v44 + i_0;
         auto v_a_row_dev_base = v45 + v_x_k_base;
@@ -119,17 +119,17 @@ kernel void mt_steel_gemm_gather_nax(
     uint v67 = 2u;
     auto v_o_row = v_lane / v67;
     uint v69 = 1u;
-    auto v70 = (v_lane & v69);
     uint v71 = 8u;
+    auto v70 = (v_lane & v69);
     auto v_o_col_base = v70 * v71;
-    uint v73 = 0u;
-    uint v74 = 8u;
-    uint v75 = 1u;
     uint v77 = 16u;
     auto v78 = v_o_row * v77;
     auto v79 = v_sg_scratch_off + v78;
     auto v82 = ((v_x_m_base + v_sg_m_base) + v_o_row);
     auto v83 = v82 * v39;
+    uint v73 = 0u;
+    uint v74 = 8u;
+    uint v75 = 1u;
     for (uint i_3 = v73; i_3 < v74; i_3 += v75) {
         auto v_col = v_o_col_base + i_3;
         auto v80 = v79 + v_col;

@@ -99,6 +99,7 @@ impl super::Pass for UnrollPass {
             kernel.blocks.insert(*bid, block);
         }
 
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

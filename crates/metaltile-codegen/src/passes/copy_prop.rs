@@ -58,6 +58,7 @@ impl super::Pass for CopyPropPass {
 
         copy_prop_block_fixpoint(&mut kernel.body);
 
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

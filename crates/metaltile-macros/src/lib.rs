@@ -581,9 +581,9 @@ mod tests {
             bench(op="unary", subop="exp", class=Unary, tol=1e-4)
         };
         assert!(attr.bench.is_some());
-        let ba = attr.bench.unwrap();
-        assert_eq!(ba.op.value(), "unary");
-        assert_eq!(ba.subop.value(), "exp");
+        let bench = attr.bench.unwrap();
+        assert_eq!(bench.op.value(), "unary");
+        assert_eq!(bench.subop.value(), "exp");
     }
 
     fn assert_param_output(tokens: &str, name: &str, expected: bool) {

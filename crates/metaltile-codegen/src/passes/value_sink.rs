@@ -68,6 +68,7 @@ impl super::Pass for ValueSinkPass {
             kernel.blocks.insert(bid, block);
         }
 
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }
@@ -336,6 +337,16 @@ mod tests {
             Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(3) },
             ValueId::new(4),
         );
+        // Anchor the Mul result against per-pass DCE (#209/1) — without
+        // this, `v4` (Mul) has no consumer and DCE strips both Mul and
+        // its upstream Add, masking the "barrier-blocks-sinking"
+        // invariant we're trying to assert.
+        k.body.push_op_no_result(Op::Store {
+            dst: "out".into(),
+            indices: vec![],
+            value: ValueId::new(4),
+            mask: None,
+        });
 
         let add_pos_before =
             k.body.ops.iter().position(|op| matches!(op, Op::BinOp { op: BinOpKind::Add, .. }));

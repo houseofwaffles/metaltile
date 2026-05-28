@@ -3575,25 +3575,26 @@ pub fn mt_qmm_mma_m16_int8<T>(
 // is the loosest of any variant — bench tol matches int4/int8 at 1e-2;
 // cosine similarity at production shapes is the relevant signal, not abs
 // error (small element magnitudes dominate).
-#[bench_kernel(
-    op="quantized",
-    subop="qmm_mma_int2",
-    class=QuantizedMatMul,
-    shapes=&QUANTIZED_SHAPES,
-    m=32,
-    group_size=64,
-    tpg=128,
-    bits=2,
-    // int2 max_q=3: only 4 quant levels → per-group error is the highest of
-    // the affine family. Cosine similarity at production shapes (M=4096+,
-    // K=4096+) is what the bench harness asserts, not pointwise error.
-    // tol=1e-2 matches int4/int8.
-    tol=1e-2,
-    mlx="affine_qmm_t_{tn}_gs_64_b_2_alN_true_batch_0",
-    metal_file="quantized.metal",
-    dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+#[kernel(
+    bench(
+        op="quantized",
+        subop="qmm_mma_int2",
+        class=QuantizedMatMul,
+        shapes=&QUANTIZED_SHAPES,
+        m=32,
+        group_size=64,
+        tpg=128,
+        bits=2,
+        // int2 max_q=3: only 4 quant levels → per-group error is the highest of
+        // the affine family. Cosine similarity at production shapes (M=4096+,
+        // K=4096+) is what the bench harness asserts, not pointwise error.
+        // tol=1e-2 matches int4/int8.
+        tol=1e-2,
+        mlx="affine_qmm_t_{tn}_gs_64_b_2_alN_true_batch_0",
+        metal_file="quantized.metal",
+        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
+    )
 )]
-#[kernel]
 pub fn mt_qmm_mma_int2<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,

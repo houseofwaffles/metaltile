@@ -23,8 +23,8 @@ kernel void aura_value_int4(
     uint v_head_idx = gid.y;
     auto v2 = repeat_count;
     auto v_kv_head = v_head_idx / v2;
-    uint v6 = 16u;
     uint v7 = 1u;
+    uint v6 = 16u;
     auto v_mask = v6 - v7;
     uint v9 = 4u;
     auto v_bit_offset = v_d * v9;
@@ -35,17 +35,17 @@ kernel void aura_value_int4(
     uint v15 = 32u;
     auto v_bits_in_w0 = v15 - v_shift;
     uint v17 = 4u;
-    auto v18 = v_bits_in_w0 >= v17;
     uint v19 = 4u;
+    auto v18 = v_bits_in_w0 >= v17;
     auto v_lo_bits = bool(v18) ? v19 : v_bits_in_w0;
     uint v21 = 4u;
     auto v_spill = v21 - v_lo_bits;
     auto v23 = 0.0f;
     auto __ml_acc = v23;
-    uint v24 = 0u;
     auto v25 = tokens;
-    uint v26 = 1u;
     auto v27 = v_head_idx * v25;
+    uint v24 = 0u;
+    uint v26 = 1u;
     for (uint i_0 = v24; i_0 < v25; i_0 += v26) {
         auto v28 = v27 + i_0;
         auto v29 = weights[v28];
@@ -84,8 +84,8 @@ kernel void aura_value_int4(
         }
     }
     auto v70 = dim;
-    auto v72 = ((v_head_idx * v70) + v_d);
     auto v73 = __ml_acc;
     float v74 = static_cast<float>(v73);
+    auto v72 = ((v_head_idx * v70) + v_d);
     output[v72] = v74;
 }

@@ -497,6 +497,39 @@ pub enum Op {
         rhs: ValueId,
     },
 
+    /// Fused multiply-add: `a * b + c` as a single op.  Lowers to
+    /// `fma(a, b, c)` in MSL.  Floats-only — the GPU FMA path requires
+    /// IEEE float operands.
+    ///
+    /// Created by `FmaFusionPass` from the pattern
+    ///     `Op::Mul(a, b) → v_mul`
+    ///     `Op::Add(v_mul, c) → v_add`   (or `Sub(v_mul, c)` with `c` negated)
+    /// when `v_mul` has no consumers other than the absorbing Add/Sub
+    /// AND all operand types are floats (`Mul` of integers stays as a
+    /// plain BinOp; `Add(i64, i64)` doesn't have an FMA path either).
+    /// The Mul becomes dead and is swept up by the DCE pass.
+    ///
+    /// Pre-fix, this fusion lived as an emit-time peephole in
+    /// `emit_block.rs` that turned the textual `auto v_add = v_mul +
+    /// c;` into `auto v_add = fma(a, b, c);` while leaving the
+    /// upstream `Op::Mul` in the IR — the standalone Mul then emitted
+    /// `auto v_mul = a * b;` as a dead variable in MSL.  #207 worked
+    /// around it with `compute_fma_absorbed_mul_skips` in the emit
+    /// path.  Lifting the fusion into the IR makes the Mul orphan a
+    /// real producer-with-no-consumer and lets DCE handle it
+    /// naturally.
+    #[elementwise]
+    #[cheap_alu]
+    #[result_same_type]
+    Fma {
+        #[vid]
+        a: ValueId,
+        #[vid]
+        b: ValueId,
+        #[vid]
+        c: ValueId,
+    },
+
     /// Tile matrix multiply: `dot(a, b)`.
     #[result_custom]
     Dot {
@@ -507,8 +540,6 @@ pub enum Op {
     },
 
     /// Reduction along an axis.
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[result_custom]
     Reduce {
         #[vid]
@@ -795,8 +826,6 @@ pub enum Op {
     },
 
     /// Prefix scan along an axis (inclusive or exclusive).
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[result_same_type]
     Scan {
         #[vid]
@@ -858,8 +887,6 @@ pub enum Op {
     // ---- SIMD-group and threadgroup primitives ----
     /// SIMD-group reduction: reduce all lanes within the SIMD group.
     /// Maps to `simd_sum(v)`, `simd_max(v)`, `simd_min(v)` (Metal 2.1+).
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[result_same_type]
     SimdReduce {
         #[vid]
@@ -870,8 +897,6 @@ pub enum Op {
     /// SIMD-group butterfly shuffle: `simd_shuffle_xor(value, mask)`.
     /// Used by Steel attention row reductions, where lanes sharing the same
     /// MMA row exchange values through fixed xor masks (for example 1 and 8).
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[result_same_type]
     SimdShuffleXor {
         #[vid]
@@ -881,16 +906,12 @@ pub enum Op {
 
     /// Allocate a simdgroup matrix of shape M×N with given element type.
     /// Emits `simdgroup_matrix<T, M, N> name;` in MSL.
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[needs_simdgroup_matrix]
     #[result_f32_scalar]
     SimdgroupAlloc { dtype: DType, m: u32, n: u32 },
 
     /// Load one element from a simdgroup matrix: `result = name.thread_elements()[index]`.
     /// Produces a scalar value.
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[needs_simdgroup_matrix]
     #[result_f32_scalar]
     SimdgroupElemLoad {
@@ -901,8 +922,6 @@ pub enum Op {
 
     /// Store one element into a simdgroup matrix: `name.thread_elements()[index] = data`.
     /// No result (side-effecting).
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[needs_simdgroup_matrix]
     #[no_result]
     SimdgroupElemStore {
@@ -926,8 +945,6 @@ pub enum Op {
     /// and column dimensions of the loaded fragment — used to load a B
     /// operand stored row-major `[N, K]` as if it were `[K, N]` for the
     /// standard `C = A * B` MMA layout (MLX `qmm_t` pattern).
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[needs_simdgroup_matrix]
     #[no_result]
     SimdgroupLoad {
@@ -942,8 +959,6 @@ pub enum Op {
 
     /// simdgroup multiply-accumulate: `C = A * B + C`.
     /// All three operands must be simdgroup matrices of compatible shapes.
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[needs_simdgroup_matrix]
     #[no_result]
     SimdgroupMatMul {
@@ -969,8 +984,6 @@ pub enum Op {
 
     /// SIMD-group inclusive prefix scan.
     /// Maps to `simd_scan_inclusive_<op>(v)` (Metal 3.0+).
-    #[needs_simd_lane]
-    #[needs_simd_group]
     #[result_f32_scalar]
     SimdScan {
         #[vid]
@@ -1416,17 +1429,24 @@ pub struct Kernel {
 
 impl Kernel {
     pub fn new(name: impl Into<String>) -> Self {
-        let body = Block::new(BlockId::new(0));
-        let mut blocks = FxHashMap::default();
-        blocks.insert(BlockId::new(0), body.clone());
-
         Kernel {
             name: name.into(),
             mode: KernelMode::default(),
             params: Vec::new(),
             constexprs: Vec::new(),
-            body,
-            blocks,
+            body: Block::new(BlockId::new(0)),
+            // `kernel.blocks` holds NESTED blocks only — loop bodies,
+            // if-then/else branches, etc.  The entry block lives at
+            // `kernel.body` and is the canonical source of truth for
+            // block 0.  Earlier versions also inserted a clone of the
+            // entry block here under `BlockId(0)`; that copy was never
+            // updated by passes mutating `kernel.body`, and any code
+            // walking `kernel.blocks.values()` for analysis ended up
+            // reading stale state.  Lookups now go through
+            // `kernel.body` for the entry block and `kernel.blocks`
+            // for everything else — see [`iter_blocks`] for a unified
+            // walk.
+            blocks: FxHashMap::default(),
             return_shapes: Vec::new(),
             tile_annotations: FxHashMap::default(),
             bfloat_reinterpret_cast: false,
@@ -1435,18 +1455,34 @@ impl Kernel {
     }
 
     /// Add a block to the kernel, returning its ID.
+    ///
+    /// Panics if `block.id == self.body.id` — the entry block lives in
+    /// `self.body`, not `self.blocks`.
     pub fn add_block(&mut self, block: Block) -> BlockId {
+        debug_assert_ne!(
+            block.id, self.body.id,
+            "entry block lives in kernel.body, not kernel.blocks"
+        );
         let id = block.id;
         self.blocks.insert(id, block);
         id
     }
 
-    /// Synchronize the canonical entry block into the block map.
-    ///
-    /// The public `body` field is the source of truth for block 0. Some call
-    /// sites still inspect `blocks`, so keep the entry in sync when cloning or
-    /// before handing the block map to consumers.
-    pub fn sync_entry_block(&mut self) { self.blocks.insert(self.body.id, self.body.clone()); }
+    /// Iterate every block in the kernel — entry block first, then
+    /// nested blocks in `kernel.blocks` insertion order.  Use this when
+    /// an analysis needs to walk all SSA defs / uses across the kernel
+    /// (liveness, use-counting, identifier scanning).  Walking only
+    /// `self.blocks.values()` would skip the entry block; walking only
+    /// `self.body` would skip nested loop/if bodies.
+    pub fn iter_blocks(&self) -> impl Iterator<Item = &Block> {
+        std::iter::once(&self.body).chain(self.blocks.values())
+    }
+
+    /// Mutable variant of [`iter_blocks`].  Order matches [`iter_blocks`]:
+    /// entry block first, then nested blocks.
+    pub fn iter_blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> {
+        std::iter::once(&mut self.body).chain(self.blocks.values_mut())
+    }
 
     /// Get a block by ID.
     pub fn get_block(&self, id: BlockId) -> Option<&Block> {
@@ -1467,15 +1503,18 @@ impl Kernel {
 
 impl Clone for Kernel {
     fn clone(&self) -> Self {
-        let mut blocks = self.blocks.clone();
-        blocks.insert(self.body.id, self.body.clone());
+        // `kernel.blocks` no longer holds the entry block — see the
+        // `Kernel::new` comment for the data-structure rationale.  A
+        // plain field-by-field clone is correct now; previously this
+        // re-inserted the entry block under `body.id` to paper over
+        // the stale-copy invariant.
         Kernel {
             name: self.name.clone(),
             mode: self.mode,
             params: self.params.clone(),
             constexprs: self.constexprs.clone(),
             body: self.body.clone(),
-            blocks,
+            blocks: self.blocks.clone(),
             return_shapes: self.return_shapes.clone(),
             tile_annotations: self.tile_annotations.clone(),
             bfloat_reinterpret_cast: self.bfloat_reinterpret_cast,
@@ -1664,6 +1703,9 @@ impl Op {
             },
             Op::BinOp { op, lhs, rhs } => {
                 write!(f, "BinOp({op:?}, v{}, v{})", lhs.as_u32(), rhs.as_u32())
+            },
+            Op::Fma { a, b, c } => {
+                write!(f, "Fma(v{}, v{}, v{})", a.as_u32(), b.as_u32(), c.as_u32())
             },
             Op::Dot { a, b } => write!(f, "Dot(v{}, v{})", a.as_u32(), b.as_u32()),
             Op::Reduce { value, axis, op } => {
@@ -1962,18 +2004,26 @@ mod tests {
     use super::{Block, BlockId, Kernel, Op, ValueId};
 
     #[test]
-    fn clone_refreshes_entry_block_snapshot() {
-        let mut kernel = Kernel::new("sync");
-        kernel.body.push_op(Op::Const { value: 7 }, ValueId::new(0));
-        let cloned = kernel.clone();
-        let entry =
-            cloned.blocks.get(&BlockId::new(0)).expect("entry block must exist after clone");
-        assert_eq!(entry.ops, cloned.body.ops);
-        assert_eq!(entry.results, cloned.body.results);
+    fn entry_block_lives_in_body_not_blocks() {
+        // The entry block is `kernel.body`; `kernel.blocks` only holds
+        // nested blocks (loop bodies, if-then/else).  Earlier versions
+        // also kept a never-updated clone of the entry block in
+        // `kernel.blocks[body.id]`; that was the source of the
+        // "stale block" footgun documented in #209/2.
+        let mut kernel = Kernel::new("body");
+        kernel.body.push_op(Op::Const { value: 1 }, ValueId::new(0));
+        assert_eq!(kernel.body.ops.len(), 1);
+        assert!(
+            !kernel.blocks.contains_key(&kernel.body.id),
+            "entry block must NOT be present in kernel.blocks"
+        );
     }
 
     #[test]
     fn getters_treat_body_as_authoritative_entry_block() {
+        // `get_block(body.id)` returns `&kernel.body` directly; pushing
+        // to it is observed both via the field and via the getter (no
+        // stale copy to refresh).
         let mut kernel = Kernel::new("body");
         kernel.body.push_op(Op::Const { value: 1 }, ValueId::new(0));
         assert_eq!(kernel.get_block(BlockId::new(0)).expect("entry block must exist").ops.len(), 1);
@@ -1982,26 +2032,26 @@ mod tests {
         body.push_op(Op::Const { value: 2 }, ValueId::new(1));
         assert_eq!(kernel.body.ops.len(), 2);
         assert_eq!(
-            kernel
-                .blocks
-                .get(&BlockId::new(0))
-                .expect("entry block must exist before sync")
-                .ops
-                .len(),
-            0
+            kernel.get_block(BlockId::new(0)).expect("entry block must exist").ops.len(),
+            2,
+            "get_block(body.id) must reflect post-mutation state"
         );
+    }
 
-        kernel.sync_entry_block();
-        assert_eq!(
-            kernel
-                .blocks
-                .get(&BlockId::new(0))
-                .expect("entry block must exist after sync")
-                .ops
-                .len(),
-            2
-        );
-        let _ = Block::new(BlockId::new(1));
+    #[test]
+    fn iter_blocks_yields_body_then_nested() {
+        // `iter_blocks` is the canonical full-kernel walk: entry block
+        // first, then nested blocks.  Replaces the
+        // `body + kernel.blocks.values()` pattern that callers used to
+        // open-code, where it was easy to forget the body half.
+        let mut kernel = Kernel::new("iter");
+        kernel.body.push_op(Op::Const { value: 10 }, ValueId::new(0));
+        let mut nested = Block::new(BlockId::new(1));
+        nested.push_op(Op::Const { value: 20 }, ValueId::new(1));
+        kernel.add_block(nested);
+
+        let ids: Vec<u32> = kernel.iter_blocks().map(|b| b.id.as_u32()).collect();
+        assert_eq!(ids, vec![0, 1], "iter_blocks yields body first then nested");
     }
 
     #[test]

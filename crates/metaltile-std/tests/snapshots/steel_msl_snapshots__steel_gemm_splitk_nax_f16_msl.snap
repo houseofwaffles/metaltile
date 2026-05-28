@@ -51,7 +51,6 @@ kernel void mt_steel_gemm_splitk_nax(
     auto v20 = k_per_split;
     auto v_k_start = v_split * v20;
     auto v23 = k;
-    auto v_k_end = min((v_k_start + v20), v23);
     auto v25 = m;
     auto v27 = n;
     auto v_part_base = ((v_split * v25) * v27);
@@ -68,8 +67,8 @@ kernel void mt_steel_gemm_splitk_nax(
     uint v29 = 4u;
     auto v_x_m_row = v_lane_in_tg / v29;
     uint v31 = 3u;
-    auto v_x_k_quad = (v_lane_in_tg & v31);
     uint v33 = 8u;
+    auto v_x_k_quad = (v_lane_in_tg & v31);
     auto v_x_k_base = v_x_k_quad * v33;
     uint v35 = 36u;
     auto v36 = v_x_m_row * v35;
@@ -81,7 +80,6 @@ kernel void mt_steel_gemm_splitk_nax(
     uint v42 = 256u;
     auto v_sg_scratch_off = v_sg * v42;
     auto v_b_n = v_w_n_base + v_x_m_row;
-    uint v45 = 32u;
     auto v46 = v_x_m_base + v_x_m_row;
     auto v47 = v46 * v23;
     uint v50 = 0u;
@@ -90,6 +88,8 @@ kernel void mt_steel_gemm_splitk_nax(
     uint v58 = 0u;
     uint v59 = 8u;
     uint v60 = 1u;
+    auto v_k_end = min((v_k_start + v20), v23);
+    uint v45 = 32u;
     for (uint i_0 = v_k_start; i_0 < v_k_end; i_0 += v45) {
         auto v48 = v47 + i_0;
         auto v_a_row_dev_base = v48 + v_x_k_base;
@@ -120,17 +120,17 @@ kernel void mt_steel_gemm_splitk_nax(
     uint v69 = 2u;
     auto v_o_row = v_lane / v69;
     uint v71 = 1u;
-    auto v72 = (v_lane & v71);
     uint v73 = 8u;
+    auto v72 = (v_lane & v71);
     auto v_o_col_base = v72 * v73;
-    uint v75 = 0u;
-    uint v76 = 8u;
-    uint v77 = 1u;
     uint v79 = 16u;
     auto v80 = v_o_row * v79;
     auto v81 = v_sg_scratch_off + v80;
     auto v85 = (((v_x_m_base + v_sg_m_base) + v_o_row) * v27);
     auto v86 = v_part_base + v85;
+    uint v75 = 0u;
+    uint v76 = 8u;
+    uint v77 = 1u;
     for (uint i_3 = v75; i_3 < v76; i_3 += v77) {
         auto v_col = v_o_col_base + i_3;
         auto v82 = v81 + v_col;

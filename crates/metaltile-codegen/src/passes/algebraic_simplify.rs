@@ -83,6 +83,7 @@ impl super::Pass for AlgebraicSimplifyPass {
 
         simplify_block_fixpoint(&mut kernel.body);
 
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

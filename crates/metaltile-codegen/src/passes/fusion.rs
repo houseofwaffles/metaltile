@@ -133,6 +133,7 @@ impl super::Pass for FusionPass {
                 block.ops.iter().filter(|op| matches!(op, Op::FusedElementwise { .. })).count();
         }
         tracing::debug!(chains = total_chains, "fusion pass complete");
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

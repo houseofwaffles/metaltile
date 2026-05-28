@@ -47,8 +47,8 @@ kernel void aura_encode_int4(
     uint v16 = 31u;
     uint v18 = 32u;
     auto v_num_groups = ((v2 + v16) / v18);
-    uint v20 = 0u;
     uint v21 = 1u;
+    uint v20 = 0u;
     for (uint i_0 = v20; i_0 < v_num_groups; i_0 += v21) {
         auto v22 = __ml_total_norm_sq;
         auto v23 = shared_norm[i_0];
@@ -59,17 +59,17 @@ kernel void aura_encode_int4(
     auto v_norm_val = sqrt(v25);
     auto v27 = 0.00000001f;
     auto v29 = 1.0f;
-    auto v30 = v29 / v_norm_val;
     auto v31 = 0.0f;
+    auto v30 = v29 / v_norm_val;
     auto v_inv_norm = select(v31, v30, bool((v_norm_val > v27)));
     auto v_unit_val = v_val * v_inv_norm;
     shared_unit[v_d] = v_unit_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     auto v34 = 0.0f;
     auto __ml_rotated = v34;
+    auto v38 = v_d * v2;
     uint v35 = 0u;
     uint v36 = 1u;
-    auto v38 = v_d * v2;
     for (uint i_1 = v35; i_1 < v2; i_1 += v36) {
         auto v37 = __ml_rotated;
         auto v39 = v38 + i_1;
@@ -81,9 +81,9 @@ kernel void aura_encode_int4(
     }
     uint v44 = 0u;
     auto __ml_idx = v44;
+    uint v49 = 1u;
     uint v45 = 0u;
     uint v48 = 15u;
-    uint v49 = 1u;
     for (uint i_2 = v45; i_2 < v48; i_2 += v49) {
         auto v50 = __ml_idx;
         auto v51 = __ml_rotated;
@@ -99,8 +99,8 @@ kernel void aura_encode_int4(
     uint v60 = 31u;
     auto v_shift = (v_bit_offset & v60);
     auto v62 = __ml_idx;
-    uint v65 = 16u;
     uint v66 = 1u;
+    uint v65 = 16u;
     auto v67 = v65 - v66;
     auto v_masked = (v62 & v67);
     auto v69 = packed_width;
@@ -144,8 +144,8 @@ kernel void aura_encode_int4(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     auto v94 = 0.0f;
     auto __ml_total_recon_sq = v94;
-    uint v95 = 0u;
     uint v96 = 1u;
+    uint v95 = 0u;
     for (uint i_3 = v95; i_3 < v_num_groups; i_3 += v96) {
         auto v97 = __ml_total_recon_sq;
         auto v98 = shared_norm[i_3];
@@ -155,8 +155,8 @@ kernel void aura_encode_int4(
     auto v100 = __ml_total_recon_sq;
     auto v_recon_norm = sqrt(v100);
     auto v102 = 0.00000001f;
-    auto v103 = v_recon_norm > v102;
     auto v104 = v_norm_val / v_recon_norm;
+    auto v103 = v_recon_norm > v102;
     auto v_corrected_norm = bool(v103) ? v104 : v_norm_val;
     uint v106 = 0u;
     auto v107 = v_d == v106;

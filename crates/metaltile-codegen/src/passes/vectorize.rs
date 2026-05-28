@@ -81,6 +81,7 @@ impl super::Pass for VectorizePass {
             }
         }
         vectorize_block(&mut kernel.body, &params, None, &mut next_vid);
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }

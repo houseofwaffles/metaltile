@@ -237,6 +237,25 @@ impl DslBodyParser {
                     });
                     self.mut_locals.insert(var_name.clone());
                     // Don't bind to a ValueId; reads use GetLocal pattern via parse_path.
+                } else if var_name.starts_with('_') {
+                    // `let _<name> = expr;` is the Rust idiom for
+                    // "evaluate the expression but discard the
+                    // result" (e.g. read a constexpr param purely so
+                    // the param survives the kernel's
+                    // binding-table prune, without binding to a
+                    // usable identifier).  We still parsed `expr`
+                    // above — the IR ops are in the block — but we
+                    // skip the binding entry and the name-hint so
+                    // the value has no consumers, and DCE retires it
+                    // on its way out of the pipeline.  Matches the
+                    // Rust convention: `_ident` is allowed to be
+                    // unused and the compiler doesn't bind a usable
+                    // alias.  Pre-#209/6 the parser bound `_unused`
+                    // like any other identifier, then DSL authors
+                    // had to write `let _unused = conv_kernel;`
+                    // stubs to suppress `-Wunused-parameter` on
+                    // constexpr params they wanted in the signature
+                    // for documentation; the parser now elides those.
                 } else {
                     self.bindings.insert(var_name.clone(), init_vid);
                     self.push_name_value(init_vid, &var_name);

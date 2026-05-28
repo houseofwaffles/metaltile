@@ -112,6 +112,7 @@ impl super::Pass for CsePass {
             }
         }
 
+        super::dead_value_elim::eliminate_dead_values(kernel)?;
         Ok(())
     }
 }
@@ -393,6 +394,18 @@ mod tests {
             Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(0), rhs: ValueId::new(1) },
             ValueId::new(3),
         );
+        // Stores for BOTH BinOps so each is anchored against the
+        // per-pass DCE postcondition (#209/1).  Pre-#209/1 only `v3`
+        // (Mul) was anchored; `v2` (Add) had no consumer, so adding
+        // the DCE call to CsePass would have removed it on the way
+        // out — masking the "different BinOps don't collapse" check
+        // we're trying to make.
+        k.body.push_op_no_result(Op::Store {
+            dst: "out".into(),
+            indices: vec![],
+            value: ValueId::new(2),
+            mask: None,
+        });
         k.body.push_op_no_result(Op::Store {
             dst: "out".into(),
             indices: vec![],
