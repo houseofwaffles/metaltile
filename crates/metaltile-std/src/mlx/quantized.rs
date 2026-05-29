@@ -5819,6 +5819,330 @@ pub mod kernel_tests {
     fn test_affine_quantize_int8(dt: DType) -> TestSetup {
         quantize_setup(mt_affine_quantize_int8::kernel_ir_for(dt), 8, 64, 8, dt)
     }
+
+    // ── qmv / qmm matmul family (dequant-then-matmul oracle) ───────────────
+    //
+    // Every qmv/qmm variant (plain, BM-tiled, int8, simdgroup-matrix MMA)
+    // computes the same math — `out[m,n] = Σ_k (q·scale_g + bias_g)·x[m,k]`
+    // with `q` the affine-`bits` code unpacked from the packed `w`. The GPU
+    // tiling (K-blocks, BM tiles, MMA frags) is a performance detail that the
+    // CPU oracle is blind to: a faithful dequant-then-matmul reference pins MSL
+    // emit + dispatch wiring + index math against the IR (the same contract the
+    // legacy `qmm_gpu_correctness.rs` oracle checks). Inputs are kept small so
+    // outputs are O(1) and an absolute tolerance is meaningful, and are
+    // dtype-rounded so the oracle sees exactly what the kernel loads.
+
+    /// Deterministic packed int-`bits` weights for an `[n, k]` matrix, codes
+    /// packed little-endian along k (`pack_factor = 32/bits` codes per u32).
+    fn synth_packed_w(n: usize, k: usize, bits: u32) -> Vec<u32> {
+        let pack_factor = 32 / bits as usize;
+        let mask = (1u32 << bits) - 1;
+        let n_packs = n * k / pack_factor;
+        (0..n_packs)
+            .map(|p| {
+                let mut v = 0u32;
+                for s in 0..pack_factor as u32 {
+                    let code = (p as u32).wrapping_mul(2_654_435_761).wrapping_add(s) & mask;
+                    v |= code << (s * bits);
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// Dequant-then-matmul reference. `w` packs an `[n, k]` int-`bits` matrix,
+    /// `scales`/`biases` are `[n, k/group_size]`, `x` is `[m, k]`, output `[m, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn qmm_oracle(
+        w: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        x: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let pf = 32 / bits as usize;
+        let mask = (1u32 << bits) - 1;
+        let packs_per_row = k / pf;
+        let gs_per_row = k / group_size;
+        let mut out = vec![0.0f32; m * n];
+        for mr in 0..m {
+            for nc in 0..n {
+                let mut acc = 0.0f32;
+                for j in 0..k {
+                    let g = j / group_size;
+                    let word = w[nc * packs_per_row + j / pf];
+                    let q = ((word >> ((j % pf) as u32 * bits)) & mask) as f32;
+                    acc += (q * scales[nc * gs_per_row + g] + biases[nc * gs_per_row + g])
+                        * x[mr * k + j];
+                }
+                out[mr * n + nc] = acc;
+            }
+        }
+        out
+    }
+
+    /// Shared qmv/qmm setup. `has_n` toggles the `n` constexpr (qmv has only
+    /// `k` + `gs_per_row`; qmm adds `n`). `grid`/`tpg` carry each variant's
+    /// dispatch contract. All use Reduction mode (the `tgid_x`/`tgid_y`/`simd_*`
+    /// aliases the bodies reference).
+    #[allow(clippy::too_many_arguments)]
+    fn qx_setup(
+        kernel: Kernel,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        group_size: usize,
+        has_n: bool,
+        grid: [u32; 3],
+        tpg: [u32; 3],
+        dt: DType,
+    ) -> TestSetup {
+        let gspr = k / group_size;
+        let w = synth_packed_w(n, k, bits);
+        let scales_f: Vec<f32> = (0..n * gspr).map(|i| 0.004 + (i % 7) as f32 * 0.0008).collect();
+        let biases_f: Vec<f32> = (0..n * gspr).map(|i| ((i % 5) as f32 - 2.0) * 0.0009).collect();
+        let x_f: Vec<f32> = (0..m * k).map(|i| ((i % 11) as f32 - 5.0) * 0.01).collect();
+        let s = unpack_f32(&pack_f32(&scales_f, dt), dt);
+        let b = unpack_f32(&pack_f32(&biases_f, dt), dt);
+        let x = unpack_f32(&pack_f32(&x_f, dt), dt);
+        let expected = qmm_oracle(&w, &s, &b, &x, m, n, k, bits, group_size);
+        let mut su = TestSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("w", u32_bytes(&w), DType::U32))
+            .input(TestBuffer::from_vec("scales", pack_f32(&scales_f, dt), dt))
+            .input(TestBuffer::from_vec("biases", pack_f32(&biases_f, dt), dt))
+            .input(TestBuffer::from_vec("x", pack_f32(&x_f, dt), dt))
+            .input(TestBuffer::zeros("out", m * n, dt))
+            .constexpr("k", k as u32)
+            .constexpr("gs_per_row", gspr as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt));
+        if has_n {
+            su = su.constexpr("n", n as u32);
+        }
+        su.grid_3d(grid[0], grid[1], grid[2], tpg)
+    }
+
+    // qmv (int4 / int8): 8 output rows per TG, 2 SG × 32 lanes, m=1 x-vector.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmv(dt: DType) -> TestSetup {
+        qx_setup(mt_qmv::kernel_ir_for(dt), 1, 32, 512, 4, 64, false, [4, 1, 1], [64, 1, 1], dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmv_int8_fast(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmv_int8_fast::kernel_ir_for(dt),
+            1,
+            32,
+            512,
+            8,
+            64,
+            false,
+            [4, 1, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+
+    // qmm (int4): grid [n/8, m/bm, 1], tpg 64.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm(dt: DType) -> TestSetup {
+        qx_setup(mt_qmm::kernel_ir_for(dt), 8, 16, 512, 4, 64, true, [2, 8, 1], [64, 1, 1], dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_bm2(dt: DType) -> TestSetup {
+        qx_setup(mt_qmm_bm2::kernel_ir_for(dt), 8, 16, 512, 4, 64, true, [2, 4, 1], [64, 1, 1], dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_bm4(dt: DType) -> TestSetup {
+        qx_setup(mt_qmm_bm4::kernel_ir_for(dt), 8, 16, 512, 4, 64, true, [2, 2, 1], [64, 1, 1], dt)
+    }
+    // qmm (int8): same grid contract, byte-extracted codes.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_int8_fast(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_int8_fast::kernel_ir_for(dt),
+            8,
+            16,
+            512,
+            8,
+            64,
+            true,
+            [2, 8, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_bm2_int8_fast(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_bm2_int8_fast::kernel_ir_for(dt),
+            8,
+            16,
+            512,
+            8,
+            64,
+            true,
+            [2, 4, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_bm4_int8_fast(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_bm4_int8_fast::kernel_ir_for(dt),
+            8,
+            16,
+            512,
+            8,
+            64,
+            true,
+            [2, 2, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+
+    // qmm simdgroup-matrix MMA: grid [n/32, m/{32,16}, 1], tpg {128,64}.
+    // n, k multiples of 32; m a multiple of the BM tile.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_mma(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_mma::kernel_ir_for(dt),
+            32,
+            64,
+            512,
+            4,
+            64,
+            true,
+            [2, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_mma_m16(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_mma_m16::kernel_ir_for(dt),
+            16,
+            64,
+            512,
+            4,
+            64,
+            true,
+            [2, 1, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_mma_int8(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_mma_int8::kernel_ir_for(dt),
+            32,
+            64,
+            512,
+            8,
+            64,
+            true,
+            [2, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_mma_m16_int8(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_mma_m16_int8::kernel_ir_for(dt),
+            16,
+            64,
+            512,
+            8,
+            64,
+            true,
+            [2, 1, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_mma_int2(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_mma_int2::kernel_ir_for(dt),
+            32,
+            64,
+            512,
+            2,
+            64,
+            true,
+            [2, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+
+    // ── qvm (vecmat: W transposed to [K, N], groups along K) ───────────────
+    //
+    // Dual of qmv: output column `c` sums over K reading the transposed weight
+    // `W[k, c]` (8 int4 codes per u32 along N), with scales/biases laid out
+    // `[K/group_size, N]` (groups run along K). Its own oracle because the W
+    // layout and group axis differ from the qmv/qmm family.
+    fn qvm_oracle(
+        w: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        x: &[f32],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let packs_per_krow = n / 8; // 8 int4 codes per u32 along N
+        let mut out = vec![0.0f32; n];
+        for c in 0..n {
+            let mut acc = 0.0f32;
+            for d in 0..k {
+                let g = d / group_size;
+                let word = w[d * packs_per_krow + c / 8];
+                let q = ((word >> ((c % 8) as u32 * 4)) & 0xF) as f32;
+                acc += (q * scales[g * n + c] + biases[g * n + c]) * x[d];
+            }
+            out[c] = acc;
+        }
+        out
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qvm_int4_fast(dt: DType) -> TestSetup {
+        let (n, k, group_size) = (32usize, 512usize, 64usize);
+        let gs_per_col = k / group_size;
+        let w = synth_packed_w(k, n, 4); // [K, N] transposed: K rows of N codes
+        let scales_f: Vec<f32> =
+            (0..gs_per_col * n).map(|i| 0.004 + (i % 7) as f32 * 0.0008).collect();
+        let biases_f: Vec<f32> =
+            (0..gs_per_col * n).map(|i| ((i % 5) as f32 - 2.0) * 0.0009).collect();
+        let x_f: Vec<f32> = (0..k).map(|i| ((i % 11) as f32 - 5.0) * 0.01).collect();
+        let s = unpack_f32(&pack_f32(&scales_f, dt), dt);
+        let b = unpack_f32(&pack_f32(&biases_f, dt), dt);
+        let x = unpack_f32(&pack_f32(&x_f, dt), dt);
+        let expected = qvm_oracle(&w, &s, &b, &x, n, k, group_size);
+        TestSetup::new(mt_qvm_int4_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("w", u32_bytes(&w), DType::U32))
+            .input(TestBuffer::from_vec("scales", pack_f32(&scales_f, dt), dt))
+            .input(TestBuffer::from_vec("biases", pack_f32(&biases_f, dt), dt))
+            .input(TestBuffer::from_vec("x", pack_f32(&x_f, dt), dt))
+            .input(TestBuffer::zeros("out", n, dt))
+            .constexpr("k", k as u32)
+            .constexpr("n", n as u32)
+            .constexpr("gs_per_col", gs_per_col as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((n / 8) as u32, 1, 1, [64, 1, 1])
+    }
 }
 
 /// New-syntax benchmarks for the affine dequantize kernels.
@@ -5895,5 +6219,216 @@ pub mod kernel_benches {
     #[bench(name = "mlx/affine/quantize_int8", dtypes = [f32, f16, bf16])]
     fn bench_quant_int8(dt: DType) -> BenchSetup {
         qb(mt_affine_quantize_int8::kernel_ir_for(dt), 8, 64, 65536, dt)
+    }
+
+    // ── qmv / qmm matmul-family benches ────────────────────────────────────
+    // Representative production shape (n=k=4096, group_size=64). bytes_moved
+    // counts the packed weights (the dominant stream) plus scales/biases, x, y.
+    #[allow(clippy::too_many_arguments)]
+    fn qmb(
+        kernel: Kernel,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        group_size: usize,
+        has_n: bool,
+        grid: [u32; 3],
+        tpg: [u32; 3],
+        dt: DType,
+    ) -> BenchSetup {
+        let gspr = k / group_size;
+        let pf = 32 / bits as usize;
+        let sz = dt.size_bytes();
+        let bytes = n * k * bits as usize / 8 + 2 * n * gspr * sz + m * k * sz + m * n * sz;
+        let mut bs = BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("w", n * k / pf, DType::U32))
+            .buffer(BenchBuffer::random("scales", n * gspr, dt))
+            .buffer(BenchBuffer::random("biases", n * gspr, dt))
+            .buffer(BenchBuffer::random("x", m * k, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("k", k as u32)
+            .constexpr("gs_per_row", gspr as u32);
+        if has_n {
+            bs = bs.constexpr("n", n as u32);
+        }
+        bs.with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d(grid[0], grid[1], grid[2], tpg)
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/quantized/qmv", dtypes = [f32, f16, bf16])]
+    fn bench_qmv(dt: DType) -> BenchSetup {
+        qmb(mt_qmv::kernel_ir_for(dt), 1, 4096, 4096, 4, 64, false, [512, 1, 1], [64, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmv_int8_fast", dtypes = [f32, f16, bf16])]
+    fn bench_qmv_int8_fast(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmv_int8_fast::kernel_ir_for(dt),
+            1,
+            4096,
+            4096,
+            8,
+            64,
+            false,
+            [512, 1, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm", dtypes = [f32, f16, bf16])]
+    fn bench_qmm(dt: DType) -> BenchSetup {
+        qmb(mt_qmm::kernel_ir_for(dt), 4, 4096, 4096, 4, 64, true, [512, 4, 1], [64, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_bm2", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_bm2(dt: DType) -> BenchSetup {
+        qmb(mt_qmm_bm2::kernel_ir_for(dt), 8, 4096, 4096, 4, 64, true, [512, 4, 1], [64, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_bm4", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_bm4(dt: DType) -> BenchSetup {
+        qmb(mt_qmm_bm4::kernel_ir_for(dt), 8, 4096, 4096, 4, 64, true, [512, 2, 1], [64, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_int8_fast", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_int8_fast(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_int8_fast::kernel_ir_for(dt),
+            4,
+            4096,
+            4096,
+            8,
+            64,
+            true,
+            [512, 4, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_bm2_int8_fast", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_bm2_int8_fast(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_bm2_int8_fast::kernel_ir_for(dt),
+            8,
+            4096,
+            4096,
+            8,
+            64,
+            true,
+            [512, 4, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_bm4_int8_fast", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_bm4_int8_fast(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_bm4_int8_fast::kernel_ir_for(dt),
+            8,
+            4096,
+            4096,
+            8,
+            64,
+            true,
+            [512, 2, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_mma", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_mma::kernel_ir_for(dt),
+            32,
+            4096,
+            4096,
+            4,
+            64,
+            true,
+            [128, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_mma_m16", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_m16(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_mma_m16::kernel_ir_for(dt),
+            16,
+            4096,
+            4096,
+            4,
+            64,
+            true,
+            [128, 1, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_mma_int8", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_int8(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_mma_int8::kernel_ir_for(dt),
+            32,
+            4096,
+            4096,
+            8,
+            64,
+            true,
+            [128, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_mma_m16_int8", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_m16_int8(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_mma_m16_int8::kernel_ir_for(dt),
+            16,
+            4096,
+            4096,
+            8,
+            64,
+            true,
+            [128, 1, 1],
+            [64, 1, 1],
+            dt,
+        )
+    }
+    #[bench(name = "mlx/quantized/qmm_mma_int2", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_int2(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_mma_int2::kernel_ir_for(dt),
+            32,
+            4096,
+            4096,
+            2,
+            64,
+            true,
+            [128, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+
+    // qvm: transposed weight [K, N], 8 output columns per TG.
+    #[bench(name = "mlx/quantized/qvm_int4_fast", dtypes = [f32, f16, bf16])]
+    fn bench_qvm_int4_fast(dt: DType) -> BenchSetup {
+        let (n, k, group_size) = (4096usize, 4096usize, 64usize);
+        let gs_per_col = k / group_size;
+        let sz = dt.size_bytes();
+        let bytes = n * k / 2 + 2 * gs_per_col * n * sz + k * sz + n * sz;
+        BenchSetup::new(mt_qvm_int4_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("w", k * n / 8, DType::U32))
+            .buffer(BenchBuffer::random("scales", gs_per_col * n, dt))
+            .buffer(BenchBuffer::random("biases", gs_per_col * n, dt))
+            .buffer(BenchBuffer::random("x", k, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .constexpr("k", k as u32)
+            .constexpr("n", n as u32)
+            .constexpr("gs_per_col", gs_per_col as u32)
+            .with_shape_label(format!("n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d((n / 8) as u32, 1, 1, [64, 1, 1])
+            .bytes_moved(bytes as u64)
     }
 }
