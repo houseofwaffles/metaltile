@@ -11,9 +11,7 @@ use metaltile_codegen::passes::{
 use metaltile_std::{
     bench_types::{CorrectnessStatus, OpResult, set_result_reporter, validate_results},
     run_kernel::run_kernel_bench,
-    run_spec::run as run_spec,
     runner::GpuRunner,
-    spec::{BenchSpec, all_specs},
 };
 use serde_json::Value;
 
@@ -115,41 +113,12 @@ pub fn run(args: &BenchArgs) -> Result<(), crate::CliError> {
         };
         let _reporter = set_result_reporter(&mut report);
 
-        // Kernel names that have a new #[bench] registration. A legacy
-        // BenchSpec for one of these is tagged "(legacy)" so the old and new
-        // rows are visually distinct in the same table during migration.
-        let superseded: std::collections::HashSet<String> = metaltile_core::all_benches()
-            .map(|e| {
-                let b = e.bench();
-                let dt = b.dtypes().first().copied().unwrap_or(metaltile_core::DType::F32);
-                b.setup(dt).kernel().name.clone()
-            })
-            .collect();
-
-        // All ops — inventory-registered via #[kernel(bench(...))]
-        {
-            let mut specs: Vec<&BenchSpec> = all_specs().collect();
-            specs.sort_unstable_by_key(|s| (s.op, s.subop));
-            for spec in specs {
-                if matches_filter(filter.as_deref(), spec.op) {
-                    matched_filter = true;
-                    let is_legacy = superseded.contains(spec.kernel_name);
-                    for &dt in spec.dtypes {
-                        let _kspan =
-                            tracing::debug_span!("kernel", op = spec.op, dtype = %dt).entered();
-                        tracing::debug!(op = spec.op, dtype = %dt, "running benchmark");
-                        runner.flush_slc();
-                        all.extend(run_spec(spec, &runner, dt, is_legacy));
-                    }
-                }
-            }
-        }
-
-        // New-syntax benches — registered via #[bench]. Timed in-process with
-        // the same GpuRunner machinery (resident buffers, SLC flush, DVFS pin)
-        // as the legacy path and reported through the same reporter, so they
-        // render — and compare — in the same table as the legacy rows.
-        // (A later step moves this behind a spawned runner + protocol.)
+        // Benches are registered via #[bench] (the `kernel_benches` modules).
+        // Timed in-process with the GpuRunner machinery (resident buffers,
+        // SLC flush, DVFS pin) and reported through the shared reporter. The
+        // legacy `#[kernel(bench(...))]` / `all_specs()` path was retired once
+        // every kernel had a #[bench]; correctness now lives in the
+        // `#[test_kernel]` harness rather than the old MLX A/B comparison.
         for entry in metaltile_core::all_benches() {
             let b = entry.bench();
             if matches_filter(filter.as_deref(), b.name()) {
@@ -515,20 +484,16 @@ fn pct_style(pct: f64) -> Style {
 fn compute_profiles(filter: Option<&str>) -> HashMap<(String, String), ProfileRow> {
     // Key: (op_display, dtype_label), e.g. ("unary (acos)", "f32")
     let mut map = HashMap::new();
-    let mut specs: Vec<&BenchSpec> = all_specs().collect();
-    specs.sort_unstable_by_key(|s| (s.op, s.subop));
-    for spec in specs {
-        if !matches_filter(filter, spec.op) {
+    for entry in metaltile_core::all_benches() {
+        let b = entry.bench();
+        let name = b.name();
+        if !matches_filter(filter, name) {
             continue;
         }
-        let op_display = if spec.subop.is_empty() {
-            spec.op.to_string()
-        } else {
-            format!("{} ({})", spec.op, spec.subop)
-        };
-        for &dt in spec.dtypes {
-            let mut k = (spec.kernel_ir)(dt);
-            k.mode = spec.dispatch.default_mode(spec.shapes);
+        let op_display = name.to_string();
+        for &dt in b.dtypes() {
+            // Mode is already baked into the bench's setup IR.
+            let mut k = b.setup(dt).kernel().clone();
             if passes::run_passes(&mut k, &passes::standard_pipeline()).is_err() {
                 continue;
             }
