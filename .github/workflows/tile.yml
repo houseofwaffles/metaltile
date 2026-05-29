@@ -5,10 +5,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Slow macOS job: `tile build` + `tile bench` together take ~5-6 min
-# on the GitHub-hosted runner. Skip on PRs that can't affect kernel
-# emission, dispatch, or measurement — docs-only PRs, baseline-JSON
-# additions, README/CONTRIBUTING patches.
+# Slow macOS job: `tile build` + `tile bench` together. The bench
+# matrix has grown well past the original ~5-6 min and now approaches
+# the runner timeout; the limit below was bumped accordingly. Runtime
+# will drop again once the duplicate legacy `#[kernel(bench(...))]`
+# specs are deleted, but a higher ceiling is kept for headroom. Skip
+# on PRs that can't affect kernel emission, dispatch, or measurement —
+# docs-only PRs, baseline-JSON additions, README/CONTRIBUTING patches.
 on:
   push:
     branches: [main, dev]
@@ -42,7 +45,7 @@ jobs:
   tile:
     name: Suite
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v5.0.0
       # rust-toolchain.toml pins nightly (edition=2024); the action installs
