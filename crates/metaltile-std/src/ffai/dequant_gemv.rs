@@ -366,3 +366,259 @@ pub fn dequant_gemv_int4_fast<T>(
 pub fn dequant_gemv_wants_indirect(kernel_name: &str) -> bool {
     matches!(kernel_name, "dequant_gemv_int4_f16" | "dequant_gemv_int4_bf16")
 }
+
+/// New-syntax correctness tests for the `dequant_gemv_int{2,3,4,5,6,8}`
+/// family + the perf-tuned `dequant_gemv_int4_fast`. All are Reduction-mode
+/// (one threadgroup per output row, `reduce_sum` across the threadgroup).
+///
+/// Oracle: synthesize bit-stream-packed int-`bits` weights `[out_dim, in_dim]`
+/// (the same `lo | hi` two-word layout the kernel decodes — works for both the
+/// pack-strided pow2 widths and the odd widths), per-group scale/bias, then
+/// replay the dequant-then-dot `output[row] = Σ_d (q·scale_g + bias_g)·input[d]`
+/// in f32. Inputs are dtype-rounded so the GPU sees exactly what the oracle does.
+///
+/// Grid (scalar variants): `grid_3d(out_dim, 1, 1, [tpg, 1, 1])` — one TG per
+/// output row, tpg = 64 (≥32, multiple of 32). The `_fast` variant does 8 rows
+/// per TG so `grid_3d(out_dim/8, 1, 1, [64, 1, 1])`.
+pub mod kernel_tests {
+    use metaltile::{core::ir::Kernel, test::*, test_kernel};
+
+    use super::*;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// Bytes for a u32 slice (packed weights bind as a `DType::U32` buffer).
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    /// One threadgroup-row's worth of lanes. ≥ 32 and a multiple of 32 per the
+    /// Reduction dispatch contract; 64 lanes give a healthy `reduce_sum` tree.
+    const TPG: u32 = 64;
+
+    /// Synthesize bit-stream-packed int-`bits` weights for an `[out_dim, in_dim]`
+    /// matrix. Codes are written into the row's u32 bit-stream at bit offset
+    /// `d * bits`, spilling into the next word when they straddle a u32 boundary
+    /// — the exact layout the kernel's `lo | hi` decode (and the legacy test's
+    /// `quantize_row`) expects. Works for every supported bit width.
+    fn synth_bitstream_w(out_dim: usize, in_dim: usize, bits: u32) -> Vec<u32> {
+        let mask = (1u32 << bits) - 1;
+        let u32_per_row = in_dim * bits as usize / 32;
+        let mut packed = vec![0u32; out_dim * u32_per_row];
+        for row in 0..out_dim {
+            let row_base = row * u32_per_row;
+            for d in 0..in_dim {
+                // Deterministic, in-range code; varies per (row, d).
+                let code =
+                    ((row * in_dim + d) as u32).wrapping_mul(2_654_435_761).wrapping_add(d as u32)
+                        & mask;
+                let bit_off = (d * bits as usize) as u32;
+                let word = (bit_off / 32) as usize;
+                let in_w = bit_off & 31;
+                let bits_in_w0 = 32 - in_w;
+                if bits_in_w0 >= bits {
+                    packed[row_base + word] |= code << in_w;
+                } else {
+                    packed[row_base + word] |= code << in_w;
+                    packed[row_base + word + 1] |= code >> bits_in_w0;
+                }
+            }
+        }
+        packed
+    }
+
+    /// Dequant-then-dot reference (mirrors the legacy `naive_dequant_gemv`).
+    /// `weight` packs `[out_dim, in_dim]` int-`bits` codes, `scales`/`biases`
+    /// are `[out_dim, in_dim/group_size]`, `input` is `[in_dim]`, out `[out_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dequant_gemv_oracle(
+        weight: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        input: &[f32],
+        in_dim: usize,
+        group_size: usize,
+        bits: u32,
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let u32_per_row = in_dim * bits as usize / 32;
+        let n_groups = in_dim / group_size;
+        let mask: u64 = (1u64 << bits) - 1;
+        let mut out = vec![0.0f32; out_dim];
+        for row in 0..out_dim {
+            let mut acc = 0.0f32;
+            let row_w = &weight[row * u32_per_row..(row + 1) * u32_per_row];
+            for (d, &x_d) in input.iter().enumerate().take(in_dim) {
+                let g = d / group_size;
+                let bit_off = (d * bits as usize) as u32;
+                let word = (bit_off / 32) as usize;
+                let in_w = bit_off & 31;
+                let bits_in_w0 = 32 - in_w;
+                let q = if bits_in_w0 >= bits {
+                    ((row_w[word] as u64) >> in_w) & mask
+                } else {
+                    let lo_bits = bits_in_w0;
+                    let spill = bits - lo_bits;
+                    let lo = ((row_w[word] as u64) >> in_w) & ((1u64 << lo_bits) - 1);
+                    let hi = ((row_w[word + 1] as u64) & ((1u64 << spill) - 1)) << lo_bits;
+                    lo | hi
+                };
+                acc += ((q as f32) * scales[row * n_groups + g] + biases[row * n_groups + g]) * x_d;
+            }
+            out[row] = acc;
+        }
+        out
+    }
+
+    /// Shared setup for the scalar (one-row-per-TG) variants. `grid_rows` is the
+    /// number of x-groups dispatched (out_dim) and `tpg` the lanes per row.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_setup(
+        kernel: Kernel,
+        bits: u32,
+        out_dim: usize,
+        in_dim: usize,
+        group_size: usize,
+        grid_rows: u32,
+        tpg: u32,
+        dt: DType,
+    ) -> TestSetup {
+        let n_groups = in_dim / group_size;
+        let w = synth_bitstream_w(out_dim, in_dim, bits);
+        let scales_f: Vec<f32> =
+            (0..out_dim * n_groups).map(|i| 0.004 + (i % 7) as f32 * 0.0008).collect();
+        let biases_f: Vec<f32> =
+            (0..out_dim * n_groups).map(|i| ((i % 5) as f32 - 2.0) * 0.0009).collect();
+        let input_f: Vec<f32> = (0..in_dim).map(|i| ((i % 11) as f32 - 5.0) * 0.01).collect();
+        let s = unpack_f32(&pack_f32(&scales_f, dt), dt);
+        let b = unpack_f32(&pack_f32(&biases_f, dt), dt);
+        let x = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let expected = dequant_gemv_oracle(&w, &s, &b, &x, in_dim, group_size, bits, out_dim);
+        TestSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("weight", u32_bytes(&w), DType::U32))
+            .input(TestBuffer::from_vec("scales", pack_f32(&scales_f, dt), dt))
+            .input(TestBuffer::from_vec("biases", pack_f32(&biases_f, dt), dt))
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::zeros("output", out_dim, dt))
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("group_size", group_size as u32)
+            .expect(TestBuffer::from_vec("output", pack_f32(&expected, dt), dt))
+            .grid_3d(grid_rows, 1, 1, [tpg, 1, 1])
+    }
+
+    // ── Pack-strided (int2 / int4 / int8) ──────────────────────────────────
+    // in_dim a multiple of 32/bits; group_size 64; one TG per output row.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int2(dt: DType) -> TestSetup {
+        gemv_setup(dequant_gemv_int2::kernel_ir_for(dt), 2, 4, 256, 64, 4, TPG, dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int4(dt: DType) -> TestSetup {
+        gemv_setup(dequant_gemv_int4::kernel_ir_for(dt), 4, 4, 256, 64, 4, TPG, dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int8(dt: DType) -> TestSetup {
+        gemv_setup(dequant_gemv_int8::kernel_ir_for(dt), 8, 4, 256, 64, 4, TPG, dt)
+    }
+
+    // ── Element-strided odd widths (int3 / int5 / int6) ─────────────────────
+    // in_dim*bits must be a multiple of 32 (u32-aligned packed row):
+    //   int3: 64*3 = 192 = 6 u32; int5: 64*5 = 320 = 10 u32; int6: 64*6 = 384.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int3(dt: DType) -> TestSetup {
+        gemv_setup(dequant_gemv_int3::kernel_ir_for(dt), 3, 4, 64, 32, 4, TPG, dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int5(dt: DType) -> TestSetup {
+        gemv_setup(dequant_gemv_int5::kernel_ir_for(dt), 5, 4, 64, 32, 4, TPG, dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int6(dt: DType) -> TestSetup {
+        gemv_setup(dequant_gemv_int6::kernel_ir_for(dt), 6, 4, 64, 32, 4, TPG, dt)
+    }
+
+    // ── Perf-tuned int4_fast: 8 rows per TG ─────────────────────────────────
+    // in_dim a multiple of 512, out_dim a multiple of 8, group_size 64.
+    // Grid: [out_dim/8, 1, 1], TPG = 64.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_dequant_gemv_int4_fast(dt: DType) -> TestSetup {
+        let (out_dim, in_dim, group_size) = (8usize, 512usize, 64usize);
+        gemv_setup(
+            dequant_gemv_int4_fast::kernel_ir_for(dt),
+            4,
+            out_dim,
+            in_dim,
+            group_size,
+            (out_dim / 8) as u32,
+            64,
+            dt,
+        )
+    }
+}
+
+/// New-syntax benchmarks for the dequant GEMV family. Production-ish shapes
+/// (out_dim/in_dim 4096, group_size 64). bytes_moved counts the packed-weight
+/// stream (dominant) + scales/biases + input + output.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn gb(
+        kernel: Kernel,
+        bits: u32,
+        out_dim: usize,
+        in_dim: usize,
+        group_size: usize,
+        grid_rows: u32,
+        tpg: u32,
+        dt: DType,
+    ) -> BenchSetup {
+        let n_groups = in_dim / group_size;
+        let u32_per_row = in_dim * bits as usize / 32;
+        let sz = dt.size_bytes();
+        let bytes =
+            out_dim * u32_per_row * 4 + 2 * out_dim * n_groups * sz + in_dim * sz + out_dim * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("weight", out_dim * u32_per_row, DType::U32))
+            .buffer(BenchBuffer::random("scales", out_dim * n_groups, dt))
+            .buffer(BenchBuffer::random("biases", out_dim * n_groups, dt))
+            .buffer(BenchBuffer::random("input", in_dim, dt))
+            .buffer(BenchBuffer::zeros("output", out_dim, dt).output())
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("group_size", group_size as u32)
+            .grid_3d(grid_rows, 1, 1, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/dequant_gemv/int2", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int2(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int2::kernel_ir_for(dt), 2, 4096, 4096, 64, 4096, 64, dt)
+    }
+    #[bench(name = "ffai/dequant_gemv/int3", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int3(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int3::kernel_ir_for(dt), 3, 4096, 4096, 64, 4096, 64, dt)
+    }
+    #[bench(name = "ffai/dequant_gemv/int4", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int4(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int4::kernel_ir_for(dt), 4, 4096, 4096, 64, 4096, 64, dt)
+    }
+    #[bench(name = "ffai/dequant_gemv/int5", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int5(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int5::kernel_ir_for(dt), 5, 4096, 4096, 64, 4096, 64, dt)
+    }
+    #[bench(name = "ffai/dequant_gemv/int6", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int6(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int6::kernel_ir_for(dt), 6, 4096, 4096, 64, 4096, 64, dt)
+    }
+    #[bench(name = "ffai/dequant_gemv/int8", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int8(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int8::kernel_ir_for(dt), 8, 4096, 4096, 64, 4096, 64, dt)
+    }
+
+    // 8-rows-per-TG fast int4: grid [out_dim/8, 1, 1], TPG 64.
+    #[bench(name = "ffai/dequant_gemv/int4_fast", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_gemv_int4_fast(dt: DType) -> BenchSetup {
+        gb(dequant_gemv_int4_fast::kernel_ir_for(dt), 4, 4096, 4096, 64, 4096 / 8, 64, dt)
+    }
+}

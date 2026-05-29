@@ -6179,6 +6179,49 @@ pub mod kernel_benches {
         db(mt_affine_dequantize_int2::kernel_ir_for(dt), 2, 64, 65536, dt)
     }
 
+    // ── odd-bit dequant (int3/5/6) ─────────────────────────────────────────
+    // Byte-stream packing (not one code per uint32): `pack_factor` codes pack
+    // into `bytes_per_pack` bytes, one thread per pack. int3/int5 → 8 codes /
+    // 3,5 bytes; int6 → 4 codes / 3 bytes. The `w` buffer is sized in uint32s
+    // with a one-uint32 sentinel because the kernel always reads `w[u_idx0+1]`
+    // and the last pack can over-read up to 3 bytes (mirrors
+    // `run_affine_dequantize` in run_spec.rs). Grid: one thread per pack.
+    fn db_odd(
+        kernel: Kernel,
+        pack_factor: usize,
+        bytes_per_pack: usize,
+        group_size: usize,
+        n_groups: usize,
+        dt: DType,
+    ) -> BenchSetup {
+        let n_elem = n_groups * group_size;
+        let n_packs = n_elem / pack_factor;
+        // uint32-sized weight stream + one sentinel word (over-read guard).
+        let weight_u32s = (n_packs * bytes_per_pack).div_ceil(4) + 1;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("w", weight_u32s, DType::U32))
+            .buffer(BenchBuffer::random("scales", n_groups, dt))
+            .buffer(BenchBuffer::random("biases", n_groups, dt))
+            .buffer(BenchBuffer::zeros("out", n_elem, dt).output())
+            .constexpr("group_size", group_size as u32)
+            .grid_1d(n_packs, 64)
+            .bytes_moved((n_elem * dt.size_bytes()) as u64)
+    }
+
+    #[bench(name = "mlx/affine/dequantize_int3", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_int3(dt: DType) -> BenchSetup {
+        db_odd(mt_affine_dequantize_int3::kernel_ir_for(dt), 8, 3, 32, 65536, dt)
+    }
+    #[bench(name = "mlx/affine/dequantize_int5", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_int5(dt: DType) -> BenchSetup {
+        db_odd(mt_affine_dequantize_int5::kernel_ir_for(dt), 8, 5, 32, 65536, dt)
+    }
+    #[bench(name = "mlx/affine/dequantize_int6", dtypes = [f32, f16, bf16])]
+    fn bench_dequant_int6(dt: DType) -> BenchSetup {
+        db_odd(mt_affine_dequantize_int6::kernel_ir_for(dt), 4, 3, 32, 65536, dt)
+    }
+
     // ── affine quantize benches ───────────────────────────────────────────
     // One TG per group (tpg=32), `simd_min`/`simd_max` reduction → Reduction
     // mode. bytes_moved = input float stream + packed code output.
@@ -6430,5 +6473,164 @@ pub mod kernel_benches {
             .with_shape_label(format!("n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
             .grid_3d((n / 8) as u32, 1, 1, [64, 1, 1])
             .bytes_moved(bytes as u64)
+    }
+
+    // ── multi-bit-width qmv / qvm / qmm family (b3/b4/b5/b6/b8) ─────────────
+    //
+    // The generic `mt_q{mv,vm,mm}_b*` kernels (correctness-first scalar bodies)
+    // differ from the hand-unrolled int4 `qmb` path in two ways the helper must
+    // honour:
+    //   1. They take a `group_size` constexpr (not `gs_per_row`), and always
+    //      take `n` (`has_n` is implicitly true).
+    //   2. Weights are bit-stream packed at the kernel's bit-width, so the `w`
+    //      uint32 count is `n * k * bits / 32` — not `n * k / (32/bits)`, which
+    //      truncates for odd widths (3/5/6).
+    // Mode: Reduction, TG `[32,1,1]` (one simdgroup). Grid:
+    //   qmv/qvm → `[N, 1, 1]` (M=1); qmm → `[N, M, 1]`.
+    #[allow(clippy::too_many_arguments)]
+    fn qmb_gs(
+        kernel: Kernel,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        group_size: usize,
+        grid: [u32; 3],
+        dt: DType,
+    ) -> BenchSetup {
+        let gspr = k / group_size;
+        let sz = dt.size_bytes();
+        // Bit-stream weight words + scales/biases + x + out.
+        let w_words = n * k * bits as usize / 32;
+        let bytes = n * k * bits as usize / 8 + 2 * n * gspr * sz + m * k * sz + m * n * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("w", w_words, DType::U32))
+            .buffer(BenchBuffer::random("scales", n * gspr, dt))
+            .buffer(BenchBuffer::random("biases", n * gspr, dt))
+            .buffer(BenchBuffer::random("x", m * k, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("k", k as u32)
+            .constexpr("n", n as u32)
+            .constexpr("group_size", group_size as u32)
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d(grid[0], grid[1], grid[2], [32, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    // qmv (matvec, M=1): grid [N, 1, 1].
+    #[bench(name = "mlx/quantized/qmv_b3", dtypes = [f32, f16, bf16])]
+    fn bench_qmv_b3(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmv_b3::kernel_ir_for(dt), 1, 4096, 4096, 3, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmv_b4", dtypes = [f32, f16, bf16])]
+    fn bench_qmv_b4(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmv_b4::kernel_ir_for(dt), 1, 4096, 4096, 4, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmv_b5", dtypes = [f32, f16, bf16])]
+    fn bench_qmv_b5(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmv_b5::kernel_ir_for(dt), 1, 4096, 4096, 5, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmv_b6", dtypes = [f32, f16, bf16])]
+    fn bench_qmv_b6(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmv_b6::kernel_ir_for(dt), 1, 4096, 4096, 6, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmv_b8", dtypes = [f32, f16, bf16])]
+    fn bench_qmv_b8(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmv_b8::kernel_ir_for(dt), 1, 4096, 4096, 8, 64, [4096, 1, 1], dt)
+    }
+
+    // qvm (vecmat, M=1): W is [K, N]; grid [N, 1, 1]. Same buffer totals as
+    // qmv (n·k codes, n·gspr scales) — only the kernel's index math differs.
+    #[bench(name = "mlx/quantized/qvm_b3", dtypes = [f32, f16, bf16])]
+    fn bench_qvm_b3(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qvm_b3::kernel_ir_for(dt), 1, 4096, 4096, 3, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qvm_b4", dtypes = [f32, f16, bf16])]
+    fn bench_qvm_b4(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qvm_b4::kernel_ir_for(dt), 1, 4096, 4096, 4, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qvm_b5", dtypes = [f32, f16, bf16])]
+    fn bench_qvm_b5(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qvm_b5::kernel_ir_for(dt), 1, 4096, 4096, 5, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qvm_b6", dtypes = [f32, f16, bf16])]
+    fn bench_qvm_b6(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qvm_b6::kernel_ir_for(dt), 1, 4096, 4096, 6, 64, [4096, 1, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qvm_b8", dtypes = [f32, f16, bf16])]
+    fn bench_qvm_b8(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qvm_b8::kernel_ir_for(dt), 1, 4096, 4096, 8, 64, [4096, 1, 1], dt)
+    }
+
+    // qmm (batched matvec, M=4): grid [N, M, 1].
+    #[bench(name = "mlx/quantized/qmm_b3", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_b3(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmm_b3::kernel_ir_for(dt), 4, 4096, 4096, 3, 64, [4096, 4, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_b4", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_b4(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmm_b4::kernel_ir_for(dt), 4, 4096, 4096, 4, 64, [4096, 4, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_b5", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_b5(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmm_b5::kernel_ir_for(dt), 4, 4096, 4096, 5, 64, [4096, 4, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_b6", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_b6(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmm_b6::kernel_ir_for(dt), 4, 4096, 4096, 6, 64, [4096, 4, 1], dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_b8", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_b8(dt: DType) -> BenchSetup {
+        qmb_gs(mt_qmm_b8::kernel_ir_for(dt), 4, 4096, 4096, 8, 64, [4096, 4, 1], dt)
+    }
+
+    // ── qmm_mma multi-bit-width (b3/b5/b6) ─────────────────────────────────
+    //
+    // The cooperative-dequant MMA matmul. Takes `gs_per_row` (not
+    // `group_size`); grid `[N/32, M/32, 1]`, tpg `[128,1,1]` (4 SG × 32),
+    // M=32 — the same dispatch as the int4 `bench_qmm_mma`. Weights are
+    // bit-stream packed (`n * k * bits / 32` uint32s), so this can't reuse the
+    // int4 `qmb` helper (its `32/bits` truncates for odd widths).
+    #[allow(clippy::too_many_arguments)]
+    fn qmm_mma_b(
+        kernel: Kernel,
+        n: usize,
+        k: usize,
+        bits: u32,
+        gs: usize,
+        dt: DType,
+    ) -> BenchSetup {
+        let m = 32usize;
+        let gspr = k / gs;
+        let sz = dt.size_bytes();
+        let w_words = n * k * bits as usize / 32;
+        let bytes = n * k * bits as usize / 8 + 2 * n * gspr * sz + m * k * sz + m * n * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("w", w_words, DType::U32))
+            .buffer(BenchBuffer::random("scales", n * gspr, dt))
+            .buffer(BenchBuffer::random("biases", n * gspr, dt))
+            .buffer(BenchBuffer::random("x", m * k, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("k", k as u32)
+            .constexpr("n", n as u32)
+            .constexpr("gs_per_row", gspr as u32)
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d((n / 32) as u32, (m / 32) as u32, 1, [128, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/quantized/qmm_mma_b3", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_b3(dt: DType) -> BenchSetup {
+        qmm_mma_b(mt_qmm_mma_b3::kernel_ir_for(dt), 4096, 4096, 3, 64, dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_mma_b5", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_b5(dt: DType) -> BenchSetup {
+        qmm_mma_b(mt_qmm_mma_b5::kernel_ir_for(dt), 4096, 4096, 5, 64, dt)
+    }
+    #[bench(name = "mlx/quantized/qmm_mma_b6", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_b6(dt: DType) -> BenchSetup {
+        qmm_mma_b(mt_qmm_mma_b6::kernel_ir_for(dt), 4096, 4096, 6, 64, dt)
     }
 }

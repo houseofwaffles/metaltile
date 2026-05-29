@@ -315,3 +315,73 @@ define_moe_down_swiglu_accum_chain8!(
     }),
     (gate_7, up_7, exp_7, sw_7, we_7, se_7, rpo_7, rgo_7, {}),
 );
+
+/// New-syntax benchmark for the fused MoE decode kernel
+/// (`ffai_moe_down_swiglu_accum_int4_chain8`). Bench-only: the 8-way
+/// SwiGLU + indexed int4 down-projection + scalar-FMA-chain fusion has no
+/// clean single-stage oracle — its end-to-end correctness is validated in
+/// FFAI integration tests and `tests/moe_down_swiglu_accum_gpu_correctness.rs`
+/// against the unfused 3-stage chain.
+///
+/// Geometry: one threadgroup per down-projection output row.
+/// Grid (Reduction): `grid_3d(out_dim, 1, 1, [lsize,1,1])` (lsize = 128).
+/// ABI: 8 × (gate, up) activation tensors, `expert_indices[8]`,
+/// `slot_weights[8]`, stacked int4 weights/scales/biases, `output[out_dim]`
+/// + `{in_dim, out_dim, group_size}`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_moe_down_swiglu_accum_int4_chain8;
+
+    /// Lanes per threadgroup — the caller-picked `lsize` (typically 128).
+    const LSIZE: u32 = 128;
+    /// Top-k slot count this kernel fuses (8-way chain).
+    const N_SLOTS: usize = 8;
+
+    #[bench(name = "ffai/moe_down_swiglu_accum/int4_chain8", dtypes = [f32, f16, bf16])]
+    fn bench_moe_down_swiglu_accum_int4_chain8(dt: DType) -> BenchSetup {
+        // Qwen3.6-A3B-ish: hidden=2048 (out_dim), moeIntermediate=768 (in_dim).
+        let n_experts = 128usize;
+        let in_dim = 768usize;
+        let out_dim = 2048usize;
+        let group_size = 64usize;
+        let n_groups = in_dim / group_size;
+        let packs_per_row = in_dim / 8;
+        let sz = dt.size_bytes();
+        // Active stream per token: 8 × (gate + up) inner reads, the touched
+        // experts' weight slab (approximate with full slab), scales/biases,
+        // and the single output row. Weight slab dominates.
+        let bytes = (2 * N_SLOTS * in_dim) * sz
+            + n_experts * out_dim * packs_per_row * 4
+            + 2 * n_experts * out_dim * n_groups * sz
+            + out_dim * sz;
+
+        let mut bs = BenchSetup::new(ffai_moe_down_swiglu_accum_int4_chain8::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction);
+        // 8 gate/up activation pairs.
+        for k in 0..N_SLOTS {
+            bs = bs
+                .buffer(BenchBuffer::random(&format!("gate_{k}"), in_dim, dt))
+                .buffer(BenchBuffer::random(&format!("up_{k}"), in_dim, dt));
+        }
+        bs.buffer(BenchBuffer::zeros("expert_indices", N_SLOTS, DType::U32))
+            .buffer(BenchBuffer::random("slot_weights", N_SLOTS, dt))
+            .buffer(BenchBuffer::random(
+                "weights_stacked",
+                n_experts * out_dim * packs_per_row,
+                DType::U32,
+            ))
+            .buffer(BenchBuffer::random("scales_stacked", n_experts * out_dim * n_groups, dt))
+            .buffer(BenchBuffer::random("biases_stacked", n_experts * out_dim * n_groups, dt))
+            .buffer(BenchBuffer::zeros("output", out_dim, dt).output())
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("out_dim", out_dim as u32)
+            .constexpr("group_size", group_size as u32)
+            .with_shape_label(format!(
+                "in{in_dim} out{out_dim} E{n_experts} k{N_SLOTS} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(out_dim as u32, 1, 1, [LSIZE, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}

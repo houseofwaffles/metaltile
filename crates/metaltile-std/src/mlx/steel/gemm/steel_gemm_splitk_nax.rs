@@ -181,6 +181,86 @@ pub fn mt_steel_gemm_splitk_accum_nax<T>(
     store(out[idx], acc.cast::<T>());
 }
 
+/// New-syntax benches for the two-kernel NAX split-K steel GEMM.
+///
+/// Pass 1 (`splitk_nax`) — `m = n = k = 4096` (multiples of 32),
+/// `N_SPLITS = 4`, `k_per_split = k / N_SPLITS = 1024` (multiple of 32).
+/// NAX geometry fixed: `BM = BN = BK = 32`, `tpg = 128`.
+/// `KernelMode::Reduction`: grid is threadgroup counts
+/// `(n/32, m/32, n_splits)` — `tgid_z` selects the K-split. Constexprs
+/// are `m`, `k`, `n`, `k_per_split` (the kernel param order — note `k`
+/// precedes `n`). The `partials` slab is fp32, `[split, M, N]`.
+///
+/// Pass 2 (`splitk_accum_nax`) — also `Reduction` (the kernel reads
+/// `tgid_x` as the flat element index): grid `(m*n, 1, 1)`, one
+/// threadgroup per `[M, N]` element. Constexprs `m`, `n`, `n_splits`.
+///
+/// `bytes_moved` counts the dominant streams. Bench-only — correctness
+/// stays on `steel_gemm_splitk_nax_gpu_correctness.rs`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{mt_steel_gemm_splitk_accum_nax, mt_steel_gemm_splitk_nax};
+
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+    const N_SPLITS: u32 = 4;
+    /// Per-split K extent (`n_splits * k_per_split >= k`, multiple of 32).
+    const K_PER_SPLIT: u32 = K / N_SPLITS;
+    /// Fixed NAX tile dim and threads-per-group.
+    const TILE: u32 = 32;
+    const TPG: u32 = 128;
+
+    // ── Pass 1 — NAX split-K partial GEMM (Reduction, 3-D grid) ────────────
+    #[bench(name = "mlx/steel_gemm/splitk_nax", dtypes = [f32, f16, bf16])]
+    fn bench_splitk_nax(dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let f32_sz = DType::F32.size_bytes();
+        let bytes = (m * k + k * n) * sz + N_SPLITS as usize * m * n * f32_sz;
+        BenchSetup::new(mt_steel_gemm_splitk_nax::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            .buffer(BenchBuffer::zeros("partials", N_SPLITS as usize * m * n, DType::F32).output())
+            // Kernel param order: m, k, n, k_per_split.
+            .constexpr("m", M)
+            .constexpr("k", K)
+            .constexpr("n", N)
+            .constexpr("k_per_split", K_PER_SPLIT)
+            .with_shape_label(format!(
+                "m{M} n{N} k{K} split{N_SPLITS} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(N / TILE, M / TILE, N_SPLITS, [TPG, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    // ── Pass 2 — NAX partial-sum reduction (one TG per output element) ─────
+    #[bench(name = "mlx/steel_gemm/splitk_accum_nax", dtypes = [f32, f16, bf16])]
+    fn bench_splitk_accum_nax(dt: DType) -> BenchSetup {
+        let (m, n) = (M as usize, N as usize);
+        let sz = dt.size_bytes();
+        let f32_sz = DType::F32.size_bytes();
+        let bytes = N_SPLITS as usize * m * n * f32_sz + m * n * sz;
+        BenchSetup::new(mt_steel_gemm_splitk_accum_nax::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("partials", N_SPLITS as usize * m * n, DType::F32))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("n_splits", N_SPLITS)
+            .with_shape_label(format!(
+                "m{M} n{N} split{N_SPLITS} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            // One threadgroup per [M, N] element — grid (m*n, 1, 1).
+            .grid_3d((m * n) as u32, 1, 1, [1, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;

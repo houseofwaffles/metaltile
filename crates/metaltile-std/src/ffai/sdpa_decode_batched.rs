@@ -1485,3 +1485,149 @@ mod tests {
         }
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::sdpa_decode_batched_q2;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    // Dense SDPA for a single Q slot: `[n_q_heads, head_dim]` query,
+    // K/V `[n_kv_heads, kv_stride, head_dim]`. Returns `[n_q_heads,
+    // head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_sdpa_one(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_kv: usize,
+        kv_stride: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let gqa = n_q_heads / n_kv_heads;
+        let mut out = vec![0.0f32; n_q_heads * head_dim];
+        for qh in 0..n_q_heads {
+            let kvh = qh / gqa;
+            let q_off = qh * head_dim;
+            let kv_slab = kvh * kv_stride * head_dim;
+            let mut scores = vec![0.0f32; n_kv];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let k_off = kv_slab + t * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[q_off + d] * k[k_off + d];
+                }
+                *score = dot * scale;
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                sum += *s;
+            }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (t, s) in scores.iter().enumerate() {
+                    acc += *s * inv * v[kv_slab + t * head_dim + d];
+                }
+                out[q_off + d] = acc;
+            }
+        }
+        out
+    }
+
+    fn ramp(n: usize, step: f32, start: f32) -> Vec<f32> {
+        (0..n).map(|i| ((start + i as f32 * step) % 2.0) - 1.0).collect()
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_sdpa_decode_batched_q2(dt: DType) -> TestSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (8usize, 4usize, 128usize);
+        let (n_kv, kv_stride) = (64usize, 64usize);
+        let batch_q = 2usize;
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Two independent Q slots; interleave into [n_q_heads, batch_q, head_dim].
+        let q_a = unpack_f32(&pack_f32(&ramp(n_q_heads * head_dim, 0.013, -0.4), dt), dt);
+        let q_b = unpack_f32(&pack_f32(&ramp(n_q_heads * head_dim, 0.017, -0.2), dt), dt);
+        let k =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.011, -0.5), dt), dt);
+        let v =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
+
+        let mut q = Vec::with_capacity(n_q_heads * batch_q * head_dim);
+        for h in 0..n_q_heads {
+            q.extend_from_slice(&q_a[h * head_dim..(h + 1) * head_dim]);
+            q.extend_from_slice(&q_b[h * head_dim..(h + 1) * head_dim]);
+        }
+
+        let out_a =
+            naive_sdpa_one(&q_a, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale);
+        let out_b =
+            naive_sdpa_one(&q_b, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale);
+        let mut expected = Vec::with_capacity(n_q_heads * batch_q * head_dim);
+        for h in 0..n_q_heads {
+            expected.extend_from_slice(&out_a[h * head_dim..(h + 1) * head_dim]);
+            expected.extend_from_slice(&out_b[h * head_dim..(h + 1) * head_dim]);
+        }
+
+        TestSetup::new(sdpa_decode_batched_q2::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
+            .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
+            .input(TestBuffer::from_vec("v", pack_f32(&v, dt), dt))
+            .input(TestBuffer::zeros("out", n_q_heads * batch_q * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_kv", n_kv as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(n_q_heads as u32, 1, 1, [1024, 1, 1])
+    }
+}
+
+/// New-syntax benchmarks for the batched-Q decode family (q2/q4/q8,
+/// `class=GenericEmpty`). Q/out layout `[n_q_heads, batch_q, head_dim]`;
+/// Reduction mode, one threadgroup per Q head, tpg=1024.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{sdpa_decode_batched_q2, sdpa_decode_batched_q4, sdpa_decode_batched_q8};
+
+    fn setup(ir: metaltile::core::ir::Kernel, batch_q: usize, dt: DType) -> BenchSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 128usize);
+        let (n_kv, kv_stride) = (4096usize, 4096usize);
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let bytes = (2 * n_q_heads * batch_q * head_dim + 2 * n_kv_heads * n_kv * head_dim)
+            * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", n_q_heads * batch_q * head_dim, dt))
+            .buffer(BenchBuffer::random("k", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_q_heads * batch_q * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_kv", n_kv as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .grid_3d(n_q_heads as u32, 1, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_batched_q2", dtypes = [f32, f16, bf16])]
+    fn bench_q2(dt: DType) -> BenchSetup { setup(sdpa_decode_batched_q2::kernel_ir_for(dt), 2, dt) }
+
+    #[bench(name = "ffai/sdpa_decode_batched_q4", dtypes = [f32, f16, bf16])]
+    fn bench_q4(dt: DType) -> BenchSetup { setup(sdpa_decode_batched_q4::kernel_ir_for(dt), 4, dt) }
+
+    #[bench(name = "ffai/sdpa_decode_batched_q8", dtypes = [f32, f16, bf16])]
+    fn bench_q8(dt: DType) -> BenchSetup { setup(sdpa_decode_batched_q8::kernel_ir_for(dt), 8, dt) }
+}

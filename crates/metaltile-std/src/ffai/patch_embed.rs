@@ -97,3 +97,145 @@ pub fn patch_embed<T>(
     }
     store(out[idx], acc.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::patch_embed;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Explicit unfold + projection oracle (NCHW single image, flat
+    /// `[hidden, patch_dim]` weight, `[num_patches, hidden]` output). f32.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_patch_embed(
+        image: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        patch_h: usize,
+        patch_w: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let patches_h = in_h / patch_h;
+        let patches_w = in_w / patch_w;
+        let num_patches = patches_h * patches_w;
+        let patch_dim = in_ch * patch_h * patch_w;
+        let input_plane = in_h * in_w;
+        let mut out = vec![0.0f32; num_patches * hidden];
+        for ph in 0..patches_h {
+            for pw in 0..patches_w {
+                let patch = ph * patches_w + pw;
+                for h in 0..hidden {
+                    let mut acc = bias[h];
+                    for ic in 0..in_ch {
+                        for py in 0..patch_h {
+                            for px in 0..patch_w {
+                                let img_y = ph * patch_h + py;
+                                let img_x = pw * patch_w + px;
+                                let img_idx = ic * input_plane + img_y * in_w + img_x;
+                                let col = ic * patch_h * patch_w + py * patch_w + px;
+                                acc += image[img_idx] * weight[h * patch_dim + col];
+                            }
+                        }
+                    }
+                    out[patch * hidden + h] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn patch_embed_setup(
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        patch_h: usize,
+        patch_w: usize,
+        hidden: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let num_patches = (in_h / patch_h) * (in_w / patch_w);
+        let patch_dim = in_ch * patch_h * patch_w;
+        let n_out = num_patches * hidden;
+        let image_f = ramp(in_ch * in_h * in_w, 13, 6.0);
+        let weight_f = ramp(hidden * patch_dim, 11, 4.0);
+        let bias_f = ramp(hidden, 5, 2.0);
+        let image = unpack_f32(&pack_f32(&image_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let bias = unpack_f32(&pack_f32(&bias_f, dt), dt);
+        let expected =
+            naive_patch_embed(&image, &weight, &bias, in_ch, in_h, in_w, patch_h, patch_w, hidden);
+        TestSetup::new(patch_embed::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("image", pack_f32(&image_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::from_vec("bias", pack_f32(&bias_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("patch_h", patch_h as u32)
+            .constexpr("patch_w", patch_w as u32)
+            .constexpr("hidden", hidden as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_out, 256)
+    }
+
+    // SigLIP / Qwen-VL: 14×14 patch, 3 channels, 28×42 image → 2×3 grid.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_patch_embed_patch14(dt: DType) -> TestSetup {
+        patch_embed_setup(3, 28, 42, 14, 14, 32, dt)
+    }
+
+    // CLIP / Gemma-VL: 16×16 patch.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_patch_embed_patch16(dt: DType) -> TestSetup {
+        patch_embed_setup(3, 32, 48, 16, 16, 24, dt)
+    }
+
+    // Small 8×8 patch — a tighter K reduction for the lower-noise path.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_patch_embed_patch8(dt: DType) -> TestSetup {
+        patch_embed_setup(2, 16, 16, 8, 8, 12, dt)
+    }
+}
+
+/// New-syntax bench for `patch_embed` (ViT-L SigLIP stem shape).
+/// Grid3D, `grid_1d(num_patches * hidden, 256)`; bytes_moved = output stream.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::patch_embed;
+
+    #[bench(name = "ffai/patch_embed/patch_embed", dtypes = [f32, f16, bf16])]
+    fn bench_patch_embed(dt: DType) -> BenchSetup {
+        // SigLIP-L: 14×14 patch, 3 channels, 224×224 → 16×16=256 patches,
+        // hidden 1024.
+        let (in_ch, in_h, in_w, patch_h, patch_w, hidden) =
+            (3usize, 224usize, 224usize, 14usize, 14usize, 1024usize);
+        let num_patches = (in_h / patch_h) * (in_w / patch_w);
+        let patch_dim = in_ch * patch_h * patch_w;
+        let n_out = num_patches * hidden;
+        BenchSetup::new(patch_embed::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("image", in_ch * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", hidden * patch_dim, dt))
+            .buffer(BenchBuffer::random("bias", hidden, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("patch_h", patch_h as u32)
+            .constexpr("patch_w", patch_w as u32)
+            .constexpr("hidden", hidden as u32)
+            .grid_1d(n_out, 256)
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+}

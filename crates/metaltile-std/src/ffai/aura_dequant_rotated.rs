@@ -171,3 +171,124 @@ aura_dequant_rotated_clean!(aura_dequant_rotated_int4, 4u32, "dequant_rotated_in
 aura_dequant_rotated_clean!(aura_dequant_rotated_int8, 8u32, "dequant_rotated_int8");
 aura_dequant_rotated_odd!(aura_dequant_rotated_int3, 3u32, "dequant_rotated_int3");
 aura_dequant_rotated_odd!(aura_dequant_rotated_int6, 6u32, "dequant_rotated_int6");
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::aura_dequant_rotated_int4;
+    use crate::utils::pack_f32;
+
+    /// Bit-pack a flat `[bh, t, dim]` int4 index array into
+    /// `[bh, t, packed_width]` u32 words — what `aura_encode` produces.
+    fn pack_int4_indices(indices: &[u32], bh: usize, tokens: usize, dim: usize) -> Vec<u32> {
+        let bits = 4;
+        let packed_width = (dim * bits).div_ceil(32);
+        let mut packed = vec![0u32; bh * tokens * packed_width];
+        for b in 0..bh {
+            for t in 0..tokens {
+                for d in 0..dim {
+                    let idx = indices[(b * tokens + t) * dim + d];
+                    let bit_offset = d * bits;
+                    let word_idx = bit_offset / 32;
+                    let shift = bit_offset & 31;
+                    packed[(b * tokens + t) * packed_width + word_idx] |= (idx & 0xf) << shift;
+                }
+            }
+        }
+        packed
+    }
+
+    fn pack_u32(words: &[u32]) -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 1e-1)]
+    fn test_aura_dequant_rotated_int4(dt: DType) -> TestSetup {
+        // bits=4, dim=128, packed_width=16, 2 heads × 3 tokens.
+        let (dim, bh, tokens) = (128usize, 2usize, 3usize);
+        let packed_width = (dim * 4).div_ceil(32);
+        // 16-level symmetric codebook in [-1, 1] (always f32).
+        let codebook: Vec<f32> = (0..16).map(|i| -1.0 + 2.0 * i as f32 / 15.0).collect();
+        let indices: Vec<u32> = (0..bh * tokens * dim).map(|i| ((i * 7 + 3) % 16) as u32).collect();
+        let packed = pack_int4_indices(&indices, bh, tokens, dim);
+        let norms: Vec<f32> = (0..bh * tokens).map(|i| 0.5 + 0.1 * i as f32).collect();
+
+        // Oracle (built in f32, then rounded through the output dtype so the
+        // expectation matches the kernel's store-cast).
+        let expected: Vec<f32> = (0..bh * tokens * dim)
+            .map(|i| codebook[indices[i] as usize] * norms[i / dim])
+            .collect();
+
+        TestSetup::new(aura_dequant_rotated_int4::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("packed", pack_u32(&packed), DType::U32))
+            .input(TestBuffer::from_vec("norms", pack_f32(&norms, DType::F32), DType::F32))
+            .input(TestBuffer::from_vec("codebook", pack_f32(&codebook, DType::F32), DType::F32))
+            .input(TestBuffer::zeros("out", bh * tokens * dim, dt))
+            .constexpr("dim", dim as u32)
+            .constexpr("packed_width", packed_width as u32)
+            .constexpr("tokens", tokens as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            // tpg=1 → total threads == group counts == (packed_width, tokens, B*H).
+            .grid_3d(packed_width as u32, tokens as u32, bh as u32, [1, 1, 1])
+    }
+}
+
+/// New-syntax benchmarks for the AURA bulk-dequant family (int2/3/4/6/8) —
+/// MLX-less Grid3D kernels. Shape: head_dim 128, 64 tokens, 8 KV heads.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        aura_dequant_rotated_int2,
+        aura_dequant_rotated_int3,
+        aura_dequant_rotated_int4,
+        aura_dequant_rotated_int6,
+        aura_dequant_rotated_int8,
+    };
+
+    fn setup(
+        s: BenchSetup,
+        dim: usize,
+        bits: usize,
+        bh: usize,
+        tokens: usize,
+        dt: DType,
+    ) -> BenchSetup {
+        let packed_width = (dim * bits).div_ceil(32);
+        let levels = 1usize << bits;
+        s.mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("packed", bh * tokens * packed_width, DType::U32))
+            .buffer(BenchBuffer::random("norms", bh * tokens, DType::F32))
+            .buffer(BenchBuffer::random("codebook", levels, DType::F32))
+            .buffer(BenchBuffer::zeros("out", bh * tokens * dim, dt).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("packed_width", packed_width as u32)
+            .constexpr("tokens", tokens as u32)
+            .bytes_moved((bh * tokens * dim * dt.size_bytes()) as u64)
+            .grid_3d(packed_width as u32, tokens as u32, bh as u32, [1, 1, 1])
+    }
+
+    #[bench(name = "ffai/aura_dequant_rotated_int2", dtypes = [f32, f16, bf16])]
+    fn bench_int2(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_dequant_rotated_int2::kernel_ir_for(dt)), 128, 2, 8, 64, dt)
+    }
+
+    #[bench(name = "ffai/aura_dequant_rotated_int3", dtypes = [f32, f16, bf16])]
+    fn bench_int3(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_dequant_rotated_int3::kernel_ir_for(dt)), 128, 3, 8, 64, dt)
+    }
+
+    #[bench(name = "ffai/aura_dequant_rotated_int4", dtypes = [f32, f16, bf16])]
+    fn bench_int4(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_dequant_rotated_int4::kernel_ir_for(dt)), 128, 4, 8, 64, dt)
+    }
+
+    #[bench(name = "ffai/aura_dequant_rotated_int6", dtypes = [f32, f16, bf16])]
+    fn bench_int6(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_dequant_rotated_int6::kernel_ir_for(dt)), 128, 6, 8, 64, dt)
+    }
+
+    #[bench(name = "ffai/aura_dequant_rotated_int8", dtypes = [f32, f16, bf16])]
+    fn bench_int8(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_dequant_rotated_int8::kernel_ir_for(dt)), 128, 8, 8, 64, dt)
+    }
+}

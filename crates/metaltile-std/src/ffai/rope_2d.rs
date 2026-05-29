@@ -97,3 +97,89 @@ pub fn ffai_rope_2d<T>(
     store(out[c1], (xc1 * cos_c - xc2 * sin_c).cast::<T>());
     store(out[c2], (xc1 * sin_c + xc2 * cos_c).cast::<T>());
 }
+
+/// New-syntax correctness + bench for `ffai_rope_2d` (vision 2D positional
+/// RoPE). Grid3D, grid `[n_tokens, n_heads, quarter_dim]`, tpg `[1,1,1]`.
+/// Oracle rotates the row-half by the token's row position and the col-half by
+/// its col position.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_rope_2d;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 5e-2])]
+    fn test_rope_2d(dt: DType) -> TestSetup {
+        let (n_tokens, n_heads, head_dim) = (4usize, 2usize, 64usize);
+        let half = head_dim / 2;
+        let quarter = head_dim / 4;
+        let theta_base = 10_000.0f32;
+        let qk_f: Vec<f32> =
+            (0..n_tokens * n_heads * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        // Per-token (row, col) grid positions.
+        let positions: Vec<u32> = (0..n_tokens).flat_map(|t| [t as u32, (t * 2) as u32]).collect();
+        let qk = unpack_f32(&pack_f32(&qk_f, dt), dt);
+        let mut exp = vec![0.0f32; n_tokens * n_heads * head_dim];
+        for tok in 0..n_tokens {
+            let (row, col) = (positions[tok * 2] as f32, positions[tok * 2 + 1] as f32);
+            for h in 0..n_heads {
+                for j in 0..quarter {
+                    let invf = (-2.0 * j as f32 * theta_base.log2() / half as f32).exp2();
+                    let (cr, sr) = ((row * invf).cos(), (row * invf).sin());
+                    let (cc, sc) = ((col * invf).cos(), (col * invf).sin());
+                    let hb = tok * n_heads * head_dim + h * head_dim;
+                    let (xr1, xr2) = (qk[hb + j], qk[hb + j + quarter]);
+                    exp[hb + j] = xr1 * cr - xr2 * sr;
+                    exp[hb + j + quarter] = xr1 * sr + xr2 * cr;
+                    let (xc1, xc2) = (qk[hb + half + j], qk[hb + half + j + quarter]);
+                    exp[hb + half + j] = xc1 * cc - xc2 * sc;
+                    exp[hb + half + j + quarter] = xc1 * sc + xc2 * cc;
+                }
+            }
+        }
+        TestSetup::new(ffai_rope_2d::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("qk", pack_f32(&qk_f, dt), dt))
+            .input(TestBuffer::from_vec("positions", u32_bytes(&positions), DType::U32))
+            .input(TestBuffer::zeros("out", n_tokens * n_heads * head_dim, dt))
+            .constexpr("n_heads", n_heads as u32)
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("quarter_dim", quarter as u32)
+            .constexpr("theta_base", theta_base)
+            .expect(TestBuffer::from_vec("out", pack_f32(&exp, dt), dt))
+            .grid_3d(n_tokens as u32, n_heads as u32, quarter as u32, [1, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_rope_2d`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_rope_2d;
+
+    #[bench(name = "ffai/rope/rope_2d", dtypes = [f32, f16, bf16])]
+    fn bench_rope_2d(dt: DType) -> BenchSetup {
+        let (n_tokens, n_heads, head_dim) = (1024usize, 16usize, 64usize);
+        let half = head_dim / 2;
+        let quarter = head_dim / 4;
+        BenchSetup::new(ffai_rope_2d::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("qk", n_tokens * n_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("positions", n_tokens * 2, DType::U32))
+            .buffer(BenchBuffer::zeros("out", n_tokens * n_heads * head_dim, dt).output())
+            .constexpr("n_heads", n_heads as u32)
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("quarter_dim", quarter as u32)
+            .constexpr("theta_base", 10_000.0f32)
+            .with_shape_label(format!(
+                "tok{n_tokens} h{n_heads} d{head_dim} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(n_tokens as u32, n_heads as u32, quarter as u32, [1, 1, 1])
+            .bytes_moved((2 * n_tokens * n_heads * head_dim * dt.size_bytes()) as u64)
+    }
+}

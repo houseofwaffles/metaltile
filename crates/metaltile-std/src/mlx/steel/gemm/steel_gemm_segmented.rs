@@ -195,3 +195,74 @@ steel_gemm_segmented_kernel!(
     128u32,
     "bm32_bn32_bk16_wm2_wn2"
 );
+
+/// New-syntax benches for the segmented (ragged-K batched) steel GEMM.
+///
+/// `m = n = 2048`, `total_k = 4096`, split into `N_SEG = 4` contiguous
+/// K-segments of `total_k / N_SEG = 1024` each (multiple of 16 — the BK
+/// contract). `SimdGroup2D` 3-D dispatch: grid is tile-group counts
+/// `(n/BN, m/BM, n_segments)` — `program_id<2>` selects the segment. The
+/// `segments` descriptor (length `2 * N_SEG`, `u32`) is supplied via
+/// `from_vec` so each segment's `[k_start, k_end)` is the correct
+/// in-bounds range; without it the kernel would read OOB. `bytes_moved`
+/// counts the per-segment A/B K-slices plus the `[N_SEG, M, N]` output.
+/// Bench-only — correctness stays on the legacy GPU tests.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    const M: u32 = 2048;
+    const N: u32 = 2048;
+    const TOTAL_K: u32 = 4096;
+    const N_SEG: u32 = 4;
+    /// Per-segment K extent (contiguous, multiple of 16).
+    const K_PER_SEG: u32 = TOTAL_K / N_SEG;
+
+    /// Encode the `[k_start, k_end)` descriptor for the `N_SEG` contiguous
+    /// segments as little-endian `u32` bytes for the `segments` buffer.
+    fn segments_bytes() -> Vec<u8> {
+        let mut v = Vec::with_capacity((2 * N_SEG as usize) * 4);
+        for s in 0..N_SEG {
+            let k_start = s * K_PER_SEG;
+            let k_end = k_start + K_PER_SEG;
+            v.extend_from_slice(&k_start.to_le_bytes());
+            v.extend_from_slice(&k_end.to_le_bytes());
+        }
+        v
+    }
+
+    /// Build a segmented steel-GEMM bench. `bm` / `bn` are the
+    /// output-block dims; the grid z-axis spans `N_SEG` segments.
+    fn sb(kernel: Kernel, bm: u32, bn: u32, tpg: u32, dt: DType) -> BenchSetup {
+        let (m, n, total_k) = (M as usize, N as usize, TOTAL_K as usize);
+        let sz = dt.size_bytes();
+        // Each segment reads its K-slice of A / B; summed over all segments
+        // the A / B streams total the full [M, total_k] / [total_k, N].
+        let bytes = (m * total_k + total_k * n + N_SEG as usize * m * n) * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::SimdGroup2D)
+            .buffer(BenchBuffer::random("a", m * total_k, dt))
+            .buffer(BenchBuffer::random("b", total_k * n, dt))
+            .buffer(BenchBuffer::from_vec("segments", segments_bytes(), DType::U32))
+            .buffer(BenchBuffer::zeros("out", N_SEG as usize * m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("total_k", TOTAL_K)
+            .with_shape_label(format!(
+                "m{M} n{N} k{TOTAL_K} seg{N_SEG} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(N / bn, M / bm, N_SEG, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/steel_gemm_segmented/bm64_bn64_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_segmented_64x64x16_2x2(dt: DType) -> BenchSetup {
+        sb(mt_steel_gemm_segmented_64x64x16_2x2::kernel_ir_for(dt), 64, 64, 128, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_segmented/bm32_bn32_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_segmented_32x32x16_2x2(dt: DType) -> BenchSetup {
+        sb(mt_steel_gemm_segmented_32x32x16_2x2::kernel_ir_for(dt), 32, 32, 128, dt)
+    }
+}

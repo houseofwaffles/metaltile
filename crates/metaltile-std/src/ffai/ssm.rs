@@ -268,3 +268,235 @@ pub fn mt_ssm_step<T>(
         store(out[n * dh + d_idx], (total + x_val * d_val).cast::<T>());
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{conv1d_causal_step, ssm_step};
+    use crate::utils::pack_f32;
+
+    // ── conv1d_causal_step ──────────────────────────────────────────────
+
+    /// CPU oracle: `y[d] = b[d] + w[K-1][d]·x[d] + Σ_{k<K-1} w[k][d]·state[k][d]`,
+    /// then shift state up and append `x`. Returns `(y, shifted_state)`.
+    fn conv1d_oracle(
+        x: &[f32],
+        w: &[f32],
+        b: &[f32],
+        state_in: &[f32],
+        n_channels: usize,
+        kernel_size: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut y = vec![0.0_f32; n_channels];
+        let mut state = state_in.to_vec();
+        let k_last = kernel_size - 1;
+        for d in 0..n_channels {
+            let mut acc = b[d] + w[k_last * n_channels + d] * x[d];
+            for k in 0..k_last {
+                acc += w[k * n_channels + d] * state_in[k * n_channels + d];
+            }
+            y[d] = acc;
+        }
+        for d in 0..n_channels {
+            for k in 0..kernel_size.saturating_sub(2) {
+                state[k * n_channels + d] = state_in[(k + 1) * n_channels + d];
+            }
+            if kernel_size >= 2 {
+                state[(kernel_size - 2) * n_channels + d] = x[d];
+            }
+        }
+        (y, state)
+    }
+
+    fn conv1d_setup(n_channels: usize, kernel_size: usize, dt: DType) -> TestSetup {
+        let x: Vec<f32> = (0..n_channels).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let w: Vec<f32> =
+            (0..kernel_size * n_channels).map(|i| 0.1 + ((i as f32) * 0.019).cos() * 0.2).collect();
+        let b: Vec<f32> = (0..n_channels).map(|i| (i as f32) * 0.001 - 0.05).collect();
+        let state_in: Vec<f32> =
+            (0..(kernel_size - 1) * n_channels).map(|i| ((i as f32) * 0.007).sin() * 0.5).collect();
+
+        let (y_exp, state_exp) = conv1d_oracle(&x, &w, &b, &state_in, n_channels, kernel_size);
+
+        TestSetup::new(conv1d_causal_step::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("w", pack_f32(&w, dt), dt))
+            .input(TestBuffer::from_vec("b", pack_f32(&b, dt), dt))
+            .input(TestBuffer::from_vec("state", pack_f32(&state_in, dt), dt))
+            .input(TestBuffer::zeros("y", n_channels, dt))
+            .constexpr("n_channels", n_channels as u32)
+            .constexpr("kernel_size", kernel_size as u32)
+            .expect(TestBuffer::from_vec("y", pack_f32(&y_exp, dt), dt))
+            .expect(TestBuffer::from_vec("state", pack_f32(&state_exp, dt), dt))
+            .grid_3d(n_channels as u32, 1, 1, [1, 1, 1])
+    }
+
+    // Mamba 2 short-conv: kernel_size=4. One thread per channel.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-5, 5e-3, 5e-2])]
+    fn test_conv1d_causal_step(dt: DType) -> TestSetup { conv1d_setup(128, 4, dt) }
+
+    // ── ssm_step ────────────────────────────────────────────────────────
+
+    /// CPU oracle for the scalar-A selective-scan decode step. `h` is f32;
+    /// returns `(y, h_new)`.
+    #[allow(clippy::too_many_arguments)]
+    fn ssm_step_oracle(
+        x: &[f32],
+        a: &[f32],
+        b_vec: &[f32],
+        c_vec: &[f32],
+        dt_in: &[f32],
+        h_state: &[f32],
+        n_heads: usize,
+        head_dim: usize,
+        state_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut y = vec![0.0_f32; n_heads * head_dim];
+        let mut h = h_state.to_vec();
+        for hh in 0..n_heads {
+            let decay = (a[hh] * dt_in[hh]).exp();
+            let h_base = hh * state_dim * head_dim;
+            for d in 0..head_dim {
+                let x_d = x[hh * head_dim + d];
+                let mut y_d = 0.0_f32;
+                for n in 0..state_dim {
+                    let h_idx = h_base + n * head_dim + d;
+                    let new_h = decay * h_state[h_idx] + dt_in[hh] * b_vec[n] * x_d;
+                    h[h_idx] = new_h;
+                    y_d += c_vec[n] * new_h;
+                }
+                y[hh * head_dim + d] = y_d;
+            }
+        }
+        (y, h)
+    }
+
+    fn ssm_step_setup(n_heads: usize, head_dim: usize, state_dim: usize, dt: DType) -> TestSetup {
+        let x: Vec<f32> =
+            (0..n_heads * head_dim).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+        let a: Vec<f32> = (0..n_heads).map(|i| -0.5 - (i as f32) * 0.1).collect();
+        let b_vec: Vec<f32> = (0..state_dim).map(|i| 0.1 + (i as f32) * 0.05).collect();
+        let c_vec: Vec<f32> = (0..state_dim).map(|i| 0.2 - (i as f32) * 0.02).collect();
+        let dt_in: Vec<f32> = (0..n_heads).map(|i| 0.01 + (i as f32) * 0.003).collect();
+        let h_state: Vec<f32> =
+            (0..n_heads * state_dim * head_dim).map(|i| ((i as f32) * 0.011).cos() * 0.1).collect();
+
+        let (y_exp, h_exp) =
+            ssm_step_oracle(&x, &a, &b_vec, &c_vec, &dt_in, &h_state, n_heads, head_dim, state_dim);
+
+        // `h` is always f32 in the kernel signature; `y` carries the tested dt.
+        TestSetup::new(ssm_step::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("a", pack_f32(&a, dt), dt))
+            .input(TestBuffer::from_vec("b", pack_f32(&b_vec, dt), dt))
+            .input(TestBuffer::from_vec("c", pack_f32(&c_vec, dt), dt))
+            .input(TestBuffer::from_vec("dt", pack_f32(&dt_in, dt), dt))
+            .input(TestBuffer::from_vec("h", pack_f32(&h_state, DType::F32), DType::F32))
+            .input(TestBuffer::zeros("y", n_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("state_dim", state_dim as u32)
+            .expect(TestBuffer::from_vec("y", pack_f32(&y_exp, dt), dt))
+            .expect(TestBuffer::from_vec("h", pack_f32(&h_exp, DType::F32), DType::F32))
+            .grid_3d((n_heads * head_dim) as u32, 1, 1, [1, 1, 1])
+    }
+
+    // One thread per (head, d). `y` tolerance loosens for f16/bf16; `h` is
+    // f32 so it must track tightly across all dtype runs.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-5, 5e-3, 5e-2])]
+    fn test_ssm_step(dt: DType) -> TestSetup { ssm_step_setup(4, 16, 8, dt) }
+}
+
+/// New-syntax benchmarks for all four `ffai::ssm` kernels. `conv1d_causal_step`
+/// and `ssm_step` are also correctness-tested above; `ssm_step_a2d` (2-D
+/// per-(channel,state) A_log) and `mt_ssm_step` (MLX-aligned reduction form)
+/// are bench-only — both carry recurrent state with no clean one-step oracle
+/// inside this harness. All MLX-less (`class=GenericEmpty`), `Ref(GB/s)` blank.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{conv1d_causal_step, mt_ssm_step, ssm_step, ssm_step_a2d};
+
+    // Mamba 2 short-conv at a realistic channel count, K=4. One thread/channel.
+    #[bench(name = "ffai/conv1d_causal_step", dtypes = [f32, f16, bf16])]
+    fn bench_conv1d_causal_step(dt: DType) -> BenchSetup {
+        let (n_channels, kernel_size) = (1536usize, 4usize);
+        BenchSetup::new(conv1d_causal_step::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("x", n_channels, dt))
+            .buffer(BenchBuffer::random("w", kernel_size * n_channels, dt))
+            .buffer(BenchBuffer::random("b", n_channels, dt))
+            .buffer(BenchBuffer::random("state", (kernel_size - 1) * n_channels, dt).output())
+            .buffer(BenchBuffer::zeros("y", n_channels, dt).output())
+            .constexpr("n_channels", n_channels as u32)
+            .constexpr("kernel_size", kernel_size as u32)
+            .grid_3d(n_channels as u32, 1, 1, [1, 1, 1])
+            .bytes_moved((kernel_size * n_channels * dt.size_bytes()) as u64)
+    }
+
+    // Scalar-A selective-scan decode. One thread per (head, d).
+    #[bench(name = "ffai/ssm_step", dtypes = [f32, f16, bf16])]
+    fn bench_ssm_step(dt: DType) -> BenchSetup {
+        let (n_heads, head_dim, state_dim) = (32usize, 64usize, 16usize);
+        BenchSetup::new(ssm_step::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("x", n_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("a", n_heads, dt))
+            .buffer(BenchBuffer::random("b", state_dim, dt))
+            .buffer(BenchBuffer::random("c", state_dim, dt))
+            .buffer(BenchBuffer::random("dt", n_heads, dt))
+            .buffer(BenchBuffer::random("h", n_heads * state_dim * head_dim, DType::F32).output())
+            .buffer(BenchBuffer::zeros("y", n_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("state_dim", state_dim as u32)
+            .grid_3d((n_heads * head_dim) as u32, 1, 1, [1, 1, 1])
+            .bytes_moved((n_heads * state_dim * head_dim * 2 * 4) as u64)
+    }
+
+    // Mamba 1 (Jamba) 2-D A_log variant. `a_log` is [n_heads*head_dim, state_dim].
+    #[bench(name = "ffai/ssm_step_a2d", dtypes = [f32, f16, bf16])]
+    fn bench_ssm_step_a2d(dt: DType) -> BenchSetup {
+        let (n_heads, head_dim, state_dim) = (32usize, 64usize, 16usize);
+        let channels = n_heads * head_dim;
+        BenchSetup::new(ssm_step_a2d::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("x", channels, dt))
+            .buffer(BenchBuffer::random("a_log", channels * state_dim, dt))
+            .buffer(BenchBuffer::random("b", state_dim, dt))
+            .buffer(BenchBuffer::random("c", state_dim, dt))
+            .buffer(BenchBuffer::random("dt", n_heads, dt))
+            .buffer(BenchBuffer::random("h", n_heads * state_dim * head_dim, DType::F32).output())
+            .buffer(BenchBuffer::zeros("y", channels, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("state_dim", state_dim as u32)
+            .grid_3d(channels as u32, 1, 1, [1, 1, 1])
+            .bytes_moved((channels * state_dim * 4) as u64)
+    }
+
+    // MLX-aligned reduction form: one simdgroup per (d_idx, n) reduces the
+    // state axis via simd_sum. Grid `[dh, n_heads*batch, 1]`, TG `[32,1,1]`.
+    #[bench(name = "ffai/mt_ssm_step", dtypes = [f32, f16, bf16])]
+    fn bench_mt_ssm_step(dt: DType) -> BenchSetup {
+        let (n_heads, heads_per_group, batch, dh, ds) = (8usize, 2usize, 2usize, 64usize, 32usize);
+        let n_total = n_heads * batch;
+        let groups = n_total / heads_per_group;
+        BenchSetup::new(mt_ssm_step::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", n_total * dh, dt))
+            .buffer(BenchBuffer::random("a_log", n_heads, dt))
+            .buffer(BenchBuffer::random("b_mat", groups * ds, dt))
+            .buffer(BenchBuffer::random("c_mat", groups * ds, dt))
+            .buffer(BenchBuffer::random("d_skip", n_heads, dt))
+            .buffer(BenchBuffer::random("dt", n_total, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * dh * ds, dt))
+            .buffer(BenchBuffer::zeros("state_out", n_total * dh * ds, dt).output())
+            .buffer(BenchBuffer::zeros("out", n_total * dh, dt).output())
+            .constexpr("dh", dh as u32)
+            .constexpr("ds", ds as u32)
+            .constexpr("n_heads", n_heads as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .grid_3d(dh as u32, n_total as u32, 1, [32, 1, 1])
+            .bytes_moved((n_total * dh * ds * 2 * dt.size_bytes()) as u64)
+    }
+}

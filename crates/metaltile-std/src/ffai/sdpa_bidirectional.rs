@@ -654,3 +654,176 @@ pub fn ffai_sdpa_bidirectional_d96<T>(
         store(out[out_off + 2u32], so2.cast::<T>());
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{ffai_sdpa_bidirectional_d64, ffai_sdpa_bidirectional_d96};
+    use crate::utils::{pack_f32, unpack_f32};
+
+    // Per (query, q_head): softmax(Q·Kᵀ·scale)·V over `[0, base_kv +
+    // n_query)`. Q/out layout `[n_query, n_q_heads, head_dim]`, K/V layout
+    // `[n_kv_heads, kv_stride, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_sdpa_bidirectional(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        base_kv: usize,
+        n_query: usize,
+        kv_stride: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let gqa = n_q_heads / n_kv_heads;
+        let n_kv = base_kv + n_query;
+        let mut out = vec![0.0f32; n_query * n_q_heads * head_dim];
+        for r in 0..n_query {
+            for qh in 0..n_q_heads {
+                let kvh = qh / gqa;
+                let q_off = (r * n_q_heads + qh) * head_dim;
+                let kv_slab = kvh * kv_stride * head_dim;
+                let mut scores = vec![0.0f32; n_kv];
+                for (t, score) in scores.iter_mut().enumerate() {
+                    let k_off = kv_slab + t * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] * k[k_off + d];
+                    }
+                    *score = dot * scale;
+                }
+                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    sum += *s;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (t, s) in scores.iter().enumerate() {
+                        acc += *s * inv * v[kv_slab + t * head_dim + d];
+                    }
+                    out[q_off + d] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    fn ramp(n: usize, step: f32, start: f32) -> Vec<f32> {
+        (0..n).map(|i| ((start + i as f32 * step) % 2.0) - 1.0).collect()
+    }
+
+    // Shared shape (small): base_kv=56, n_query=8 → kv_stride=64.
+    fn setup(ir: metaltile::core::ir::Kernel, head_dim: usize, dt: DType) -> TestSetup {
+        let (n_q_heads, n_kv_heads) = (8usize, 4usize);
+        let (base_kv, n_query) = (56usize, 8usize);
+        let kv_stride = base_kv + n_query;
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let q = unpack_f32(&pack_f32(&ramp(n_query * n_q_heads * head_dim, 0.013, -0.4), dt), dt);
+        let k =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.011, -0.5), dt), dt);
+        let v =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
+        let expected = naive_sdpa_bidirectional(
+            &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, scale,
+        );
+
+        TestSetup::new(ir)
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
+            .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
+            .input(TestBuffer::from_vec("v", pack_f32(&v, dt), dt))
+            .input(TestBuffer::zeros("out", n_query * n_q_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_q_heads", n_q_heads as u32)
+            .constexpr("base_kv", base_kv as u32)
+            .constexpr("n_query", n_query as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_bidirectional_d64(dt: DType) -> TestSetup {
+        setup(ffai_sdpa_bidirectional_d64::kernel_ir_for(dt), 64, dt)
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_bidirectional_d96(dt: DType) -> TestSetup {
+        setup(ffai_sdpa_bidirectional_d96::kernel_ir_for(dt), 96, dt)
+    }
+}
+
+/// New-syntax benchmarks for the bidirectional SDPA family (all head dims,
+/// `class=GenericEmpty`). Vision-tower decode shape: base_kv=4096 prefix,
+/// 8-query block, GQA fan-out 4.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        ffai_sdpa_bidirectional_d32,
+        ffai_sdpa_bidirectional_d64,
+        ffai_sdpa_bidirectional_d72,
+        ffai_sdpa_bidirectional_d80,
+        ffai_sdpa_bidirectional_d96,
+    };
+
+    fn setup(ir: metaltile::core::ir::Kernel, head_dim: usize, dt: DType) -> BenchSetup {
+        let (n_q_heads, n_kv_heads) = (32usize, 8usize);
+        let (base_kv, n_query) = (4096usize, 8usize);
+        let kv_stride = base_kv + n_query;
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let n_kv = base_kv + n_query;
+        let bytes = (2 * n_query * n_q_heads * head_dim + 2 * n_kv_heads * n_kv * head_dim)
+            * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", n_query * n_q_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("k", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_query * n_q_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_q_heads", n_q_heads as u32)
+            .constexpr("base_kv", base_kv as u32)
+            .constexpr("n_query", n_query as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/sdpa_bidirectional_d32", dtypes = [f32, f16, bf16])]
+    fn bench_d32(dt: DType) -> BenchSetup {
+        setup(ffai_sdpa_bidirectional_d32::kernel_ir_for(dt), 32, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_bidirectional_d64", dtypes = [f32, f16, bf16])]
+    fn bench_d64(dt: DType) -> BenchSetup {
+        setup(ffai_sdpa_bidirectional_d64::kernel_ir_for(dt), 64, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_bidirectional_d72", dtypes = [f32, f16, bf16])]
+    fn bench_d72(dt: DType) -> BenchSetup {
+        setup(ffai_sdpa_bidirectional_d72::kernel_ir_for(dt), 72, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_bidirectional_d80", dtypes = [f32, f16, bf16])]
+    fn bench_d80(dt: DType) -> BenchSetup {
+        setup(ffai_sdpa_bidirectional_d80::kernel_ir_for(dt), 80, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_bidirectional_d96", dtypes = [f32, f16, bf16])]
+    fn bench_d96(dt: DType) -> BenchSetup {
+        setup(ffai_sdpa_bidirectional_d96::kernel_ir_for(dt), 96, dt)
+    }
+}

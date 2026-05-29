@@ -266,3 +266,165 @@ pub fn mt_gated_delta_chunk<T>(
         store(state_out[state_base + s_idx], stack_load("state_reg", i).cast::<T>());
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::mt_gated_delta_step;
+    use crate::utils::pack_f32;
+
+    /// CPU oracle: mirrors `_gated_delta_step_ops` from
+    /// `mlx_lm/models/gated_delta.py` (see the legacy
+    /// `tests/gated_delta_gpu_correctness.rs::naive_gated_delta_step`).
+    /// Returns `(y, state_out)` flattened.
+    #[allow(clippy::too_many_arguments)]
+    fn oracle(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        state_in: &[f32],
+        b: usize,
+        hv: usize,
+        hk: usize,
+        dv: usize,
+        dk: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut y = vec![0.0_f32; b * hv * dv];
+        let mut state_out = vec![0.0_f32; b * hv * dv * dk];
+        let hk_per_hv = hv / hk;
+        for batch in 0..b {
+            for hv_idx in 0..hv {
+                let n = batch * hv + hv_idx;
+                let hk_idx = hv_idx / hk_per_hv;
+                let g_val = g[n];
+                let beta_val = beta[n];
+                let qk_base = (batch * hk + hk_idx) * dk;
+                for dv_idx in 0..dv {
+                    let v_val = v[n * dv + dv_idx];
+                    let s_base = n * dv * dk + dv_idx * dk;
+                    let mut kv_mem = 0.0_f32;
+                    let mut decayed = vec![0.0_f32; dk];
+                    for s_idx in 0..dk {
+                        let s = state_in[s_base + s_idx] * g_val;
+                        decayed[s_idx] = s;
+                        kv_mem += s * k[qk_base + s_idx];
+                    }
+                    let delta = (v_val - kv_mem) * beta_val;
+                    let mut out = 0.0_f32;
+                    for s_idx in 0..dk {
+                        let s_new = decayed[s_idx] + k[qk_base + s_idx] * delta;
+                        state_out[s_base + s_idx] = s_new;
+                        out += s_new * q[qk_base + s_idx];
+                    }
+                    y[n * dv + dv_idx] = out;
+                }
+            }
+        }
+        (y, state_out)
+    }
+
+    /// Small GDN shape: dk a multiple of 32 (lane contract), Hv divisible
+    /// by Hk (GQA). Grid `[dv, b*hv, 1]`, TG `[32,1,1]`, Reduction.
+    fn setup(b: usize, hv: usize, hk: usize, dv: usize, dk: usize, dt: DType) -> TestSetup {
+        let n_total = b * hv;
+        // Smooth deterministic inputs, dtype-rounded so the oracle sees the
+        // same precision the GPU loads.
+        let q: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.0173).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..b * hk * dk).map(|i| ((i as f32) * 0.0211).cos() * 0.5).collect();
+        let v: Vec<f32> = (0..n_total * dv).map(|i| ((i as f32) * 0.029).sin() * 0.3).collect();
+        let g: Vec<f32> = (0..n_total).map(|i| 0.9 - (i as f32) * 0.01).collect();
+        let beta: Vec<f32> = (0..n_total).map(|i| 0.5 + (i as f32) * 0.01).collect();
+        let state_in: Vec<f32> =
+            (0..n_total * dv * dk).map(|i| ((i as f32) * 0.011).sin() * 0.1).collect();
+
+        let (y_exp, state_exp) = oracle(&q, &k, &v, &g, &beta, &state_in, b, hv, hk, dv, dk);
+
+        TestSetup::new(mt_gated_delta_step::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
+            .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
+            .input(TestBuffer::from_vec("v", pack_f32(&v, dt), dt))
+            .input(TestBuffer::from_vec("g", pack_f32(&g, dt), dt))
+            .input(TestBuffer::from_vec("beta", pack_f32(&beta, dt), dt))
+            .input(TestBuffer::from_vec("state_in", pack_f32(&state_in, dt), dt))
+            .input(TestBuffer::zeros("state_out", state_in.len(), dt))
+            .input(TestBuffer::zeros("y", n_total * dv, dt))
+            .constexpr("dk", dk as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("hv", hv as u32)
+            .constexpr("hk", hk as u32)
+            .expect(TestBuffer::from_vec("y", pack_f32(&y_exp, dt), dt))
+            .expect(TestBuffer::from_vec("state_out", pack_f32(&state_exp, dt), dt))
+            .grid_3d(dv as u32, n_total as u32, 1, [32, 1, 1])
+    }
+
+    // GQA (Hv = 2*Hk), full recurrence path. f16/bf16 dependent reductions
+    // (kv_mem → delta → update → out) widen the band.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-5, 5e-2, 2e-1])]
+    fn test_mt_gated_delta_step_gqa(dt: DType) -> TestSetup { setup(2, 4, 2, 8, 64, dt) }
+
+    // Hv == Hk (no key-sharing) at the minimum dk=32, single batch.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-5, 5e-2, 2e-1])]
+    fn test_mt_gated_delta_step_no_gqa(dt: DType) -> TestSetup { setup(1, 4, 4, 4, 32, dt) }
+}
+
+/// New-syntax benchmarks for the GDN decode + chunked-prefill kernels.
+/// `mt_gated_delta_step` (decode) and `mt_gated_delta_chunk` (multi-token
+/// prefill) — both MLX-less reduction kernels (`class=GenericEmpty`), so
+/// `Ref(GB/s)` is blank. The chunk kernel is bench-only here (its
+/// correctness is recurrent-state, pinned by the legacy oracle test).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{mt_gated_delta_chunk, mt_gated_delta_step};
+
+    // Decode step at Qwen3.6-class head_dim (dk=dv=256-ish kept small for the
+    // in-process runner): one simdgroup per (dv, b*hv) element.
+    #[bench(name = "ffai/gated_delta_step", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_step(dt: DType) -> BenchSetup {
+        let (b, hv, hk, dv, dk) = (2usize, 4usize, 2usize, 64usize, 256usize);
+        let n_total = b * hv;
+        BenchSetup::new(mt_gated_delta_step::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", b * hk * dk, dt))
+            .buffer(BenchBuffer::random("k", b * hk * dk, dt))
+            .buffer(BenchBuffer::random("v", n_total * dv, dt))
+            .buffer(BenchBuffer::random("g", n_total, dt))
+            .buffer(BenchBuffer::random("beta", n_total, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * dv * dk, dt))
+            .buffer(BenchBuffer::zeros("state_out", n_total * dv * dk, dt).output())
+            .buffer(BenchBuffer::zeros("y", n_total * dv, dt).output())
+            .constexpr("dk", dk as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("hv", hv as u32)
+            .constexpr("hk", hk as u32)
+            .grid_3d(dv as u32, n_total as u32, 1, [32, 1, 1])
+            .bytes_moved((n_total * dv * dk * 2 * dt.size_bytes()) as u64)
+    }
+
+    // Chunked prefill over T tokens; `t_len` is a runtime u32 scalar buffer.
+    #[bench(name = "ffai/gated_delta_chunk", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_chunk(dt: DType) -> BenchSetup {
+        let (b, t, hv, hk, dv, dk) = (1usize, 64usize, 4usize, 2usize, 8usize, 64usize);
+        let n_total = b * hv;
+        BenchSetup::new(mt_gated_delta_chunk::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", b * t * hk * dk, dt))
+            .buffer(BenchBuffer::random("k", b * t * hk * dk, dt))
+            .buffer(BenchBuffer::random("v", b * t * hv * dv, dt))
+            .buffer(BenchBuffer::random("g", b * t * hv, dt))
+            .buffer(BenchBuffer::random("beta", b * t * hv, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * dv * dk, dt))
+            .buffer(BenchBuffer::zeros("state_out", n_total * dv * dk, dt).output())
+            .buffer(BenchBuffer::zeros("y", b * t * hv * dv, dt).output())
+            .buffer(BenchBuffer::from_vec("t_len", (t as u32).to_le_bytes().to_vec(), DType::U32))
+            .constexpr("dk", dk as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("hv", hv as u32)
+            .constexpr("hk", hk as u32)
+            .grid_3d(dv as u32, n_total as u32, 1, [32, 1, 1])
+            .bytes_moved((b * t * hv * dv * dt.size_bytes()) as u64)
+    }
+}

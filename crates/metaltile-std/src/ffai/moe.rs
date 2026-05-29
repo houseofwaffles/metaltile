@@ -3614,3 +3614,496 @@ pub fn mt_moe_gather_qmm_mma_int8<T>(
         sub_offset = sub_end;
     }
 }
+
+/// New-syntax correctness tests for the MoE grouped-gather quantized matmul
+/// family. Only the int4 scalar variants have a clean
+/// dequant-then-grouped-matmul oracle keyed by per-row expert routing
+/// (`mt_moe_gather_qmm_int4` + the `m8` multi-cell sibling). The wider
+/// bit-width variants are covered by the legacy bit-width tests, and the MMA
+/// variants are validated against the scalar m1 path via cosine in the legacy
+/// GPU tests — both are bench-only here.
+///
+/// Oracle (mirrors `tests/moe_gather_qmm_gpu_correctness.rs`): resolve each
+/// row's expert via the CSR `expert_offsets` array (first `e` where
+/// `row < expert_offsets[e+1]`), dequant that expert's int4 weight row
+/// (8 nibbles per u32, per-group scale/bias), and dot against the row's input.
+/// Inputs are dtype-rounded so the GPU sees exactly what the oracle computes.
+///
+/// Grid (Reduction mode, one simdgroup per TG):
+///   - int4 scalar: `grid_3d(m_out, T, 1, [32,1,1])`
+///   - int4 m8:     `grid_3d(m_out/8, T, 1, [32,1,1])`
+pub mod kernel_tests {
+    use metaltile::{core::ir::Kernel, test::*, test_kernel};
+
+    use super::*;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    /// Pack a row of int4 codes into u32s (8 nibbles per u32, LSB-first).
+    fn pack_int4_row(weights: &[u32]) -> Vec<u32> {
+        weights
+            .chunks_exact(8)
+            .map(|chunk| {
+                let mut packed = 0u32;
+                for (i, &q) in chunk.iter().enumerate() {
+                    packed |= (q & 0xf) << (i * 4);
+                }
+                packed
+            })
+            .collect()
+    }
+
+    /// CSR-routed dequant-then-matmul reference. `weight_packed` stacks
+    /// `[n_experts, m_out, k_in/8]` int4 codes; `scales`/`biases` stack
+    /// `[n_experts, m_out, k_in/group_size]`. `expert_offsets` is the
+    /// `[n_experts+1]` CSR row-offset array — row `t`'s expert is the first
+    /// `e` with `t < expert_offsets[e+1]`.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_gather_qmm_int4(
+        x: &[f32],
+        weight_packed: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        expert_offsets: &[u32],
+        t_rows: usize,
+        k_in: usize,
+        m_out: usize,
+        n_experts: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let weight_stride_m = k_in / 8;
+        let groups_per_row = k_in / group_size;
+        let mut out = vec![0.0f32; t_rows * m_out];
+        for row in 0..t_rows {
+            // Resolve expert: first e where row < expert_offsets[e+1].
+            let mut expert = 0usize;
+            for e in 0..n_experts {
+                if (row as u32) < expert_offsets[e + 1] {
+                    expert = e;
+                    break;
+                }
+            }
+            for m in 0..m_out {
+                let weight_row_base = expert * m_out * weight_stride_m + m * weight_stride_m;
+                let scale_row_base = expert * m_out * groups_per_row + m * groups_per_row;
+                let x_row_base = row * k_in;
+                let mut acc = 0.0f32;
+                for pack_idx in 0..(k_in / 8) {
+                    let packed = weight_packed[weight_row_base + pack_idx];
+                    let k_first = pack_idx * 8;
+                    let g = k_first / group_size;
+                    let scale = scales[scale_row_base + g];
+                    let bias = biases[scale_row_base + g];
+                    for nib in 0..8 {
+                        let q = ((packed >> (nib * 4)) & 0xf) as f32;
+                        let w = q * scale + bias;
+                        acc += w * x[x_row_base + k_first + nib];
+                    }
+                }
+                out[row * m_out + m] = acc;
+            }
+        }
+        out
+    }
+
+    /// Shared setup for the int4 scalar / m8 variants. `grid_x` carries each
+    /// variant's m-tiling (`m_out` for scalar, `m_out/8` for m8). All share
+    /// the same ABI + CSR oracle.
+    fn int4_setup(kernel: Kernel, grid_x: u32, dt: DType) -> TestSetup {
+        // Small 3-expert case, mirrors the legacy oracle test. m_out=8 is a
+        // multiple of 8 so the m8 variant tiles cleanly; k_in=64 a multiple
+        // of 32; group_size 32 → 2 groups per row.
+        let n_experts = 3usize;
+        let k_in = 64usize;
+        let m_out = 8usize;
+        let group_size = 32usize;
+        let t_rows = 6usize;
+        // Rows [0..2)→e0, [2..5)→e1, [5..6)→e2.
+        let expert_offsets: Vec<u32> = vec![0, 2, 5, 6];
+
+        let mut weight_unpacked = vec![0u32; n_experts * m_out * k_in];
+        for (i, w) in weight_unpacked.iter_mut().enumerate() {
+            *w = ((i as u32) * 7 + 3) & 0xf;
+        }
+        let weight_packed: Vec<u32> =
+            weight_unpacked.chunks_exact(k_in).flat_map(pack_int4_row).collect();
+
+        let n_groups = k_in / group_size;
+        let scales_f: Vec<f32> =
+            (0..n_experts * m_out * n_groups).map(|i| 0.01 + 0.001 * (i as f32)).collect();
+        let biases_f: Vec<f32> =
+            (0..n_experts * m_out * n_groups).map(|i| -0.05 + 0.002 * (i as f32)).collect();
+        let x_f: Vec<f32> = (0..t_rows * k_in).map(|i| 0.1 * ((i as f32 * 0.17).sin())).collect();
+
+        // Dtype-round the operands the kernel casts through T.
+        let s = unpack_f32(&pack_f32(&scales_f, dt), dt);
+        let b = unpack_f32(&pack_f32(&biases_f, dt), dt);
+        let x = unpack_f32(&pack_f32(&x_f, dt), dt);
+        let expected = cpu_gather_qmm_int4(
+            &x,
+            &weight_packed,
+            &s,
+            &b,
+            &expert_offsets,
+            t_rows,
+            k_in,
+            m_out,
+            n_experts,
+            group_size,
+        );
+
+        TestSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("x", pack_f32(&x_f, dt), dt))
+            .input(TestBuffer::from_vec("weight_packed", u32_bytes(&weight_packed), DType::U32))
+            .input(TestBuffer::from_vec("scales", pack_f32(&scales_f, dt), dt))
+            .input(TestBuffer::from_vec("biases", pack_f32(&biases_f, dt), dt))
+            .input(TestBuffer::from_vec("expert_offsets", u32_bytes(&expert_offsets), DType::U32))
+            .input(TestBuffer::zeros("out", t_rows * m_out, dt))
+            .constexpr("k_in", k_in as u32)
+            .constexpr("m_out", m_out as u32)
+            .constexpr("n_experts", n_experts as u32)
+            .constexpr("group_size", group_size as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(grid_x, t_rows as u32, 1, [32, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_moe_gather_qmm_int4(dt: DType) -> TestSetup {
+        int4_setup(mt_moe_gather_qmm_int4::kernel_ir_for(dt), 8, dt)
+    }
+
+    // m8: grid_x = m_out / 8 = 8 / 8 = 1 TG of 8 m-cells per x row.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_moe_gather_qmm_int4_m8(dt: DType) -> TestSetup {
+        int4_setup(mt_moe_gather_qmm_int4_m8::kernel_ir_for(dt), 1, dt)
+    }
+}
+
+/// New-syntax benchmarks for the full MoE kernel family. Production-ish
+/// Qwen3.6-A3B-ish shapes. All Reduction mode; grids mirror each kernel's
+/// DISPATCH INVARIANTS (group counts, never total threads).
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    // ── Grouped-gather scalar/CSR family (int4 + b{3,5,6,8}) ──────────────
+    // ABI: x, weight_packed, scales, biases, expert_offsets, out +
+    // {k_in, m_out, n_experts, group_size}. Grid [m_out / m_cells, T, 1],
+    // tpg [32,1,1]. `bits` selects the packed-weight word count.
+    #[allow(clippy::too_many_arguments)]
+    fn csr_bench(
+        kernel: Kernel,
+        bits: u32,
+        m_cells: u32,
+        t_rows: usize,
+        k_in: usize,
+        m_out: usize,
+        n_experts: usize,
+        group_size: usize,
+        dt: DType,
+    ) -> BenchSetup {
+        let groups_per_row = k_in / group_size;
+        let words_per_row = k_in * bits as usize / 32;
+        let sz = dt.size_bytes();
+        // Active stream: weight slab for the touched experts + scales/biases +
+        // x + out. Approximate with the full expert slab (worst case).
+        let bytes = n_experts * m_out * words_per_row * 4
+            + 2 * n_experts * m_out * groups_per_row * sz
+            + t_rows * k_in * sz
+            + t_rows * m_out * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", t_rows * k_in, dt))
+            .buffer(BenchBuffer::random("weight_packed", n_experts * m_out * words_per_row, DType::U32))
+            .buffer(BenchBuffer::random("scales", n_experts * m_out * groups_per_row, dt))
+            .buffer(BenchBuffer::random("biases", n_experts * m_out * groups_per_row, dt))
+            // CSR offsets must be a sane monotone array; zeros is fine for timing
+            // (resolves every row to expert 0) — the walk cost is constexpr-bounded.
+            .buffer(BenchBuffer::zeros("expert_offsets", n_experts + 1, DType::U32))
+            .buffer(BenchBuffer::zeros("out", t_rows * m_out, dt).output())
+            .constexpr("k_in", k_in as u32)
+            .constexpr("m_out", m_out as u32)
+            .constexpr("n_experts", n_experts as u32)
+            .constexpr("group_size", group_size as u32)
+            .with_shape_label(format!(
+                "T{t_rows} m{m_out} k{k_in} E{n_experts} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(m_out as u32 / m_cells, t_rows as u32, 1, [32, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/moe/gather_qmm_int4", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_int4(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_int4::kernel_ir_for(dt), 4, 1, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_int4_m8", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_int4_m8(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_int4_m8::kernel_ir_for(dt), 4, 8, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_int4_m16", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_int4_m16(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_int4_m16::kernel_ir_for(dt), 4, 16, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_int4_m32", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_int4_m32(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_int4_m32::kernel_ir_for(dt), 4, 32, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_b8", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_b8(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_b8::kernel_ir_for(dt), 8, 1, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_b3", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_b3(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_b3::kernel_ir_for(dt), 3, 1, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_b5", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_b5(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_b5::kernel_ir_for(dt), 5, 1, 64, 2048, 256, 128, 64, dt)
+    }
+    #[bench(name = "ffai/moe/gather_qmm_b6", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_b6(dt: DType) -> BenchSetup {
+        csr_bench(mt_moe_gather_qmm_b6::kernel_ir_for(dt), 6, 1, 64, 2048, 256, 128, 64, dt)
+    }
+
+    // ── Tiled-MMA family (per-row `indices`, no CSR offsets) ──────────────
+    // ABI: x, w, scales, biases, indices, out + {m_total, n_out, k_in,
+    // group_size}. `bits` selects the packed word count; `bm`/`tpg` carry
+    // each variant's tile geometry. Grid [n_out/bn, ceil(m_total/bm), 1].
+    #[allow(clippy::too_many_arguments)]
+    fn mma_bench(
+        kernel: Kernel,
+        bits: u32,
+        bn: u32,
+        bm: u32,
+        tpg: u32,
+        m_total: usize,
+        n_out: usize,
+        k_in: usize,
+        n_experts: usize,
+        group_size: usize,
+        dt: DType,
+    ) -> BenchSetup {
+        let groups_per_row = k_in / group_size;
+        let words_per_row = k_in * bits as usize / 32;
+        let sz = dt.size_bytes();
+        let bytes = n_experts * n_out * words_per_row * 4
+            + 2 * n_experts * n_out * groups_per_row * sz
+            + m_total * k_in * sz
+            + m_total * n_out * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", m_total * k_in, dt))
+            .buffer(BenchBuffer::random("w", n_experts * n_out * words_per_row, DType::U32))
+            .buffer(BenchBuffer::random("scales", n_experts * n_out * groups_per_row, dt))
+            .buffer(BenchBuffer::random("biases", n_experts * n_out * groups_per_row, dt))
+            .buffer(BenchBuffer::zeros("indices", m_total, DType::U32))
+            .buffer(BenchBuffer::zeros("out", m_total * n_out, dt).output())
+            .constexpr("m_total", m_total as u32)
+            .constexpr("n_out", n_out as u32)
+            .constexpr("k_in", k_in as u32)
+            .constexpr("group_size", group_size as u32)
+            .with_shape_label(format!(
+                "M{m_total} N{n_out} K{k_in} E{n_experts} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(n_out as u32 / bn, (m_total as u32).div_ceil(bm), 1, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    // BM=32 4-SG variants (int4 / b{3,5,6,8} / int8): grid [N/32, ceil(M/32), 1], tpg 128.
+    #[bench(name = "ffai/moe/gather_qmm_mma_int4", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_int4(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_int4::kernel_ir_for(dt),
+            4,
+            32,
+            32,
+            128,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+    #[bench(name = "ffai/moe/gather_qmm_mma_b3", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_b3(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_b3::kernel_ir_for(dt),
+            3,
+            32,
+            32,
+            128,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+    #[bench(name = "ffai/moe/gather_qmm_mma_b5", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_b5(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_b5::kernel_ir_for(dt),
+            5,
+            32,
+            32,
+            128,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+    #[bench(name = "ffai/moe/gather_qmm_mma_b6", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_b6(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_b6::kernel_ir_for(dt),
+            6,
+            32,
+            32,
+            128,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+    #[bench(name = "ffai/moe/gather_qmm_mma_b8", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_b8(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_b8::kernel_ir_for(dt),
+            8,
+            32,
+            32,
+            128,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+    #[bench(name = "ffai/moe/gather_qmm_mma_int8", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_int8(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_int8::kernel_ir_for(dt),
+            8,
+            32,
+            32,
+            128,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+    // BM=16 2-SG variant: grid [N/32, ceil(M/16), 1], tpg 64.
+    #[bench(name = "ffai/moe/gather_qmm_mma_int4_bm16", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_int4_bm16(dt: DType) -> BenchSetup {
+        mma_bench(
+            mt_moe_gather_qmm_mma_int4_bm16::kernel_ir_for(dt),
+            4,
+            32,
+            16,
+            64,
+            1024,
+            256,
+            2048,
+            128,
+            64,
+            dt,
+        )
+    }
+
+    // ── router_topk — data-dependent argmax, bench-only ───────────────────
+    // ABI: router_logits, indices_out, weights_out + {n_experts, k,
+    // norm_topk_prob}. Grid [B*T, 1, 1], tpg [32,1,1] (pinned in the doc).
+    #[bench(name = "ffai/moe/router_topk", dtypes = [f32, f16, bf16])]
+    fn bench_moe_router_topk(dt: DType) -> BenchSetup {
+        let n_rows = 4096usize; // B*T
+        let n_experts = 128usize;
+        let k = 8usize;
+        let sz = dt.size_bytes();
+        let bytes = n_rows * n_experts * sz + n_rows * k * 4 + n_rows * k * sz;
+        BenchSetup::new(mt_moe_router_topk::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("router_logits", n_rows * n_experts, dt))
+            .buffer(BenchBuffer::zeros("indices_out", n_rows * k, DType::U32).output())
+            .buffer(BenchBuffer::zeros("weights_out", n_rows * k, dt).output())
+            .constexpr("n_experts", n_experts as u32)
+            .constexpr("k", k as u32)
+            .constexpr("norm_topk_prob", 1u32)
+            .with_shape_label(format!(
+                "BT{n_rows} E{n_experts} k{k} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(n_rows as u32, 1, 1, [32, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    // ── permute — pure gather, bench-only ─────────────────────────────────
+    // ABI: tokens, sort_token_idx, permuted + {hidden}. Grid [k*B*T, 1, 1],
+    // tpg [128,1,1].
+    #[bench(name = "ffai/moe/permute", dtypes = [f32, f16, bf16])]
+    fn bench_moe_permute(dt: DType) -> BenchSetup {
+        let bt = 512usize;
+        let k = 8usize;
+        let hidden = 2048usize;
+        let rows = k * bt;
+        let sz = dt.size_bytes();
+        // Reads `rows` source rows (worst case all distinct) + writes `rows`.
+        let bytes = 2 * rows * hidden * sz;
+        BenchSetup::new(mt_moe_permute::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("tokens", bt * hidden, dt))
+            .buffer(BenchBuffer::zeros("sort_token_idx", rows, DType::U32))
+            .buffer(BenchBuffer::zeros("permuted", rows * hidden, dt).output())
+            .constexpr("hidden", hidden as u32)
+            .with_shape_label(format!(
+                "rows{rows} h{hidden} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(rows as u32, 1, 1, [128, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    // ── unpermute — weighted scatter-combine, bench-only ──────────────────
+    // ABI: expert_outputs, inv_perm, top_k_weights, out + {hidden, k}.
+    // Grid [B*T, 1, 1], tpg [128,1,1].
+    #[bench(name = "ffai/moe/unpermute", dtypes = [f32, f16, bf16])]
+    fn bench_moe_unpermute(dt: DType) -> BenchSetup {
+        let bt = 512usize;
+        let k = 8usize;
+        let hidden = 2048usize;
+        let sz = dt.size_bytes();
+        let bytes = k * bt * hidden * sz + bt * k * 4 + bt * k * sz + bt * hidden * sz;
+        BenchSetup::new(mt_moe_unpermute::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("expert_outputs", k * bt * hidden, dt))
+            .buffer(BenchBuffer::zeros("inv_perm", bt * k, DType::U32))
+            .buffer(BenchBuffer::random("top_k_weights", bt * k, dt))
+            .buffer(BenchBuffer::zeros("out", bt * hidden, dt).output())
+            .constexpr("hidden", hidden as u32)
+            .constexpr("k", k as u32)
+            .with_shape_label(format!(
+                "BT{bt} h{hidden} k{k} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(bt as u32, 1, 1, [128, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}

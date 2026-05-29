@@ -77,3 +77,93 @@ pub fn ffai_rms_norm_rope<T>(
     store(out[rs + lid], (normed_a * cos_t - normed_b * sin_t).cast::<T>());
     store(out[rs + lid + half], (normed_a * sin_t + normed_b * cos_t).cast::<T>());
 }
+
+/// New-syntax correctness for `ffai_rms_norm_rope` (Reduction mode, one
+/// threadgroup per row, `tpg = axis_size/2` — `axis_size` a multiple of 64,
+/// `axis_size ≤ 2048`). Per-row oracle replays the whole-row RMSNorm scale,
+/// the per-row position `pos = offset + (row / n_heads) mod seq_len`, and the
+/// paired-layout rotation on dtype-rounded `x` / `w` (`inv_freqs` stays f32).
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_rms_norm_rope;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// Small, deterministic inverse-frequency table (length `half`).
+    fn inv_freq_table(half: usize) -> Vec<f32> {
+        (0..half).map(|i| 1.0 / 10000.0_f32.powf(i as f32 / half as f32)).collect()
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 1e-2, 1e-1])]
+    fn test_ffai_rms_norm_rope(dt: DType) -> TestSetup {
+        let (axis, n_heads, seq_len, offset, eps) = (128usize, 4usize, 8usize, 5usize, 1e-5f32);
+        let rows = n_heads * seq_len; // one batch
+        let half = axis / 2;
+        let x_raw: Vec<f32> = (0..rows * axis).map(|i| ((i % 53) as f32) * 0.07 - 1.8).collect();
+        let w_raw: Vec<f32> = (0..axis).map(|i| 1.0 + 0.02 * ((i % 11) as f32 - 5.0)).collect();
+        let inv_freqs = inv_freq_table(half);
+        let x = unpack_f32(&pack_f32(&x_raw, dt), dt);
+        let w = unpack_f32(&pack_f32(&w_raw, dt), dt);
+
+        let mut expected = vec![0.0f32; rows * axis];
+        for r in 0..rows {
+            let base = r * axis;
+            let ssq: f32 = (0..axis).map(|i| x[base + i] * x[base + i]).sum();
+            let inv_rms = 1.0 / (ssq / axis as f32 + eps).sqrt();
+            let pos = (offset + (r / n_heads) % seq_len) as f32;
+            for lid in 0..half {
+                let theta = pos * inv_freqs[lid];
+                let (s, c) = theta.sin_cos();
+                let na = x[base + lid] * w[lid] * inv_rms;
+                let nb = x[base + lid + half] * w[lid + half] * inv_rms;
+                expected[base + lid] = na * c - nb * s;
+                expected[base + lid + half] = na * s + nb * c;
+            }
+        }
+        TestSetup::new(ffai_rms_norm_rope::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("x", pack_f32(&x_raw, dt), dt))
+            .input(TestBuffer::from_vec("w", pack_f32(&w_raw, dt), dt))
+            .input(TestBuffer::from_vec("inv_freqs", pack_f32(&inv_freqs, DType::F32), DType::F32))
+            .input(TestBuffer::zeros("out", rows * axis, dt))
+            .input(TestBuffer::from_vec("eps_buf", eps.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("axis_size", axis as u32)
+            .constexpr("offset", offset as u32)
+            .constexpr("n_heads", n_heads as u32)
+            .constexpr("seq_len", seq_len as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(rows as u32, 1, 1, [(axis / 2) as u32, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_rms_norm_rope` (fused RMSNorm + RoPE, one
+/// `(batch, seq, head)` row per threadgroup, axis_size=128, tpg=64).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_rms_norm_rope;
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    #[bench(name = "ffai/rms_norm_rope/rms_norm_rope", dtypes = [f32, f16, bf16])]
+    fn bench_rms_norm_rope(dt: DType) -> BenchSetup {
+        let (axis, n_heads, seq_len) = (128usize, 32usize, 128usize);
+        let rows = n_heads * seq_len;
+        let half = axis / 2;
+        let inv_freqs: Vec<f32> =
+            (0..half).map(|i| 1.0 / 10000.0_f32.powf(i as f32 / half as f32)).collect();
+        BenchSetup::new(ffai_rms_norm_rope::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", rows * axis, dt))
+            .buffer(BenchBuffer::random("w", axis, dt))
+            .buffer(BenchBuffer::from_vec("inv_freqs", f32_bytes(&inv_freqs), DType::F32))
+            .buffer(BenchBuffer::zeros("out", rows * axis, dt).output())
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("axis_size", axis as u32)
+            .constexpr("offset", 0u32)
+            .constexpr("n_heads", n_heads as u32)
+            .constexpr("seq_len", seq_len as u32)
+            .grid_3d(rows as u32, 1, 1, [(axis / 2) as u32, 1, 1])
+            .bytes_moved((2 * rows * axis * dt.size_bytes()) as u64)
+    }
+}

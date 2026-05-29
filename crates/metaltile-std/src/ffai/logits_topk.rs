@@ -55,3 +55,57 @@ pub fn logits_topk_mask<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] threshol
     let masked = select(v >= threshold, v, neg_inf);
     store(out[i], masked.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::logits_topk_mask;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// K-th largest value (descending) — how callers pre-compute the cutoff.
+    fn kth_largest(logits: &[f32], k: usize) -> f32 {
+        let mut sorted: Vec<f32> = logits.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        sorted[k - 1]
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.0)]
+    fn test_logits_topk_mask(dt: DType) -> TestSetup {
+        let (n, k) = (1024usize, 50usize);
+        // `sin` produces distinct floats so there are no ties at the
+        // threshold; after dtype rounding the threshold is recomputed on
+        // the rounded values so the keep test stays exact.
+        let logits: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0173).sin() * 5.0).collect();
+        let rounded = unpack_f32(&pack_f32(&logits, dt), dt);
+        let threshold = kth_largest(&rounded, k);
+        let expected: Vec<f32> =
+            rounded.iter().map(|&v| if v >= threshold { v } else { f32::NEG_INFINITY }).collect();
+        TestSetup::new(logits_topk_mask::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("inp", pack_f32(&logits, dt), dt))
+            .input(TestBuffer::zeros("out", n, dt))
+            .constexpr("threshold", threshold)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n, 256)
+    }
+}
+
+/// New-syntax benchmark for `logits_topk_mask` at Qwen3 vocab scale
+/// (Grid3D, one thread per vocab position).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::logits_topk_mask;
+
+    #[bench(name = "ffai/logits_processors/topk_mask", dtypes = [f32, f16, bf16])]
+    fn bench_logits_topk_mask(dt: DType) -> BenchSetup {
+        let n = 152_064usize;
+        BenchSetup::new(logits_topk_mask::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("inp", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .constexpr("threshold", 0.0f32)
+            .grid_1d(n, 256)
+            .bytes_moved((2 * n * dt.size_bytes()) as u64)
+    }
+}

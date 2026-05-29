@@ -297,3 +297,172 @@ pub fn conv3d_mma<T>(
         simdgroup_elem_load(c_f11, 1).cast::<T>(),
     );
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::conv3d_mma;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Direct 3D conv oracle, voxel-major output `[n_voxels, out_ch]`.
+    /// stride=1, dilation=1, pad=0, no bias. f32.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_conv3d_mma(
+        input: &[f32],
+        weight: &[f32],
+        batch: usize,
+        in_ch: usize,
+        in_d: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kd: usize,
+        kh: usize,
+        kw: usize,
+    ) -> Vec<f32> {
+        let out_d = in_d - kd + 1;
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let out_hw = out_h * out_w;
+        let out_dhw = out_d * out_hw;
+        let n_voxels = batch * out_dhw;
+        let in_plane = in_h * in_w;
+        let in_vol = in_d * in_plane;
+        let mut out = vec![0.0f32; n_voxels * out_ch];
+        for n in 0..batch {
+            for od in 0..out_d {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let voxel = n * out_dhw + od * out_hw + oh * out_w + ow;
+                        for oc in 0..out_ch {
+                            let mut acc = 0.0f32;
+                            for ic in 0..in_ch {
+                                for kz in 0..kd {
+                                    for ky in 0..kh {
+                                        for kx in 0..kw {
+                                            let id = od + kz;
+                                            let ih = oh + ky;
+                                            let iw = ow + kx;
+                                            let in_idx = n * in_ch * in_vol
+                                                + ic * in_vol
+                                                + id * in_plane
+                                                + ih * in_w
+                                                + iw;
+                                            let w_idx = oc * in_ch * kd * kh * kw
+                                                + ic * kd * kh * kw
+                                                + kz * kh * kw
+                                                + ky * kw
+                                                + kx;
+                                            acc += input[in_idx] * weight[w_idx];
+                                        }
+                                    }
+                                }
+                            }
+                            out[voxel * out_ch + oc] = acc;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mma_setup(
+        batch: usize,
+        in_ch: usize,
+        in_d: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kd: usize,
+        kh: usize,
+        kw: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let out_d = in_d - kd + 1;
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let n_voxels = batch * out_d * out_h * out_w;
+        assert_eq!(out_ch % 32, 0, "out_ch must be a multiple of 32 for the MMA tile");
+        assert_eq!(n_voxels % 32, 0, "n_voxels must be a multiple of 32 for the MMA tile");
+        let n_out = n_voxels * out_ch;
+        let input_f = ramp(batch * in_ch * in_d * in_h * in_w, 13, 2.0);
+        let weight_f = ramp(out_ch * in_ch * kd * kh * kw, 11, 2.0);
+        let input = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let expected =
+            naive_conv3d_mma(&input, &weight, batch, in_ch, in_d, in_h, in_w, out_ch, kd, kh, kw);
+        TestSetup::new(conv3d_mma::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_d", in_d as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kd", kd as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((out_ch / 32) as u32, (n_voxels / 32) as u32, 1, [128, 1, 1])
+    }
+
+    // 1×1×1 conv: in 8×8×8 → n_voxels=512 (16 tiles), out_ch=32.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv3d_mma_1x1x1(dt: DType) -> TestSetup { mma_setup(1, 2, 8, 8, 8, 32, 1, 1, 1, dt) }
+
+    // Multi-batch 1×1×1: batch=4, 4×4×4 → n_voxels=256 (8 tiles), out_ch=32.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv3d_mma_multi_batch(dt: DType) -> TestSetup {
+        mma_setup(4, 4, 4, 4, 4, 32, 1, 1, 1, dt)
+    }
+}
+
+/// New-syntax bench for `conv3d_mma` (volumetric 1×1×1 projection).
+/// Reduction mode, `grid_3d(out_ch/32, n_voxels/32, 1, [128,1,1])`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::conv3d_mma;
+
+    #[bench(name = "ffai/conv3d/mma", dtypes = [f32, f16, bf16])]
+    fn bench_conv3d_mma(dt: DType) -> BenchSetup {
+        // 1×1×1 conv on a 16×16×16 volume → n_voxels=4096, out_ch=256.
+        let (batch, in_ch, in_d, in_h, in_w, out_ch) =
+            (1usize, 64usize, 16usize, 16usize, 16usize, 256usize);
+        let (kd, kh, kw) = (1usize, 1usize, 1usize);
+        let out_d = in_d - kd + 1;
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let n_voxels = batch * out_d * out_h * out_w;
+        let n_out = n_voxels * out_ch;
+        BenchSetup::new(conv3d_mma::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("input", batch * in_ch * in_d * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", out_ch * in_ch * kd * kh * kw, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_d", in_d as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kd", kd as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .grid_3d((out_ch / 32) as u32, (n_voxels / 32) as u32, 1, [128, 1, 1])
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+}

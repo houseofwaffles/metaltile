@@ -201,3 +201,56 @@ steel_gemm_masked_kernel!(
     128u32,
     "bm32_bn32_bk16_wm2_wn2"
 );
+
+/// New-syntax benches for the block-masked steel GEMM.
+///
+/// Canonical 4096³ problem. `SimdGroup2D` dispatch: grid is tile-group
+/// counts `(n/BN, m/BM, 1)`, `tpg = [WM*WN*32, 1, 1]`. The two `T`-typed
+/// masks are sized per the dispatch contract: `out_mask` length
+/// `(m/BM)*(n/BN)` and `op_mask` length `(m/BM)*(n/BN)*(k/16)`. Masks are
+/// seeded random (any non-zero value scales; the bench exercises the
+/// fully-active path with overwhelming probability). `bytes_moved`
+/// counts the three dominant matmul streams plus the mask reads.
+/// Bench-only — correctness stays on the legacy GPU tests.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+    const BK: u32 = 16;
+
+    /// Build a block-masked steel-GEMM bench. `bm` / `bn` are the
+    /// output-block dims (mask lengths derive from `m/bm`, `n/bn`, `k/16`).
+    fn mb(kernel: Kernel, bm: u32, bn: u32, tpg: u32, dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let n_out_blocks = (m / bm as usize) * (n / bn as usize);
+        let n_op_entries = n_out_blocks * (k / BK as usize);
+        let bytes = (m * k + k * n + m * n) * sz + (n_out_blocks + n_op_entries) * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::SimdGroup2D)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            .buffer(BenchBuffer::random("out_mask", n_out_blocks, dt))
+            .buffer(BenchBuffer::random("op_mask", n_op_entries, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("k", K)
+            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d(N / bn, M / bm, 1, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/steel_gemm_masked/bm64_bn64_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_masked_64x64x16_2x2(dt: DType) -> BenchSetup {
+        mb(mt_steel_gemm_masked_64x64x16_2x2::kernel_ir_for(dt), 64, 64, 128, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_masked/bm32_bn32_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_masked_32x32x16_2x2(dt: DType) -> BenchSetup {
+        mb(mt_steel_gemm_masked_32x32x16_2x2::kernel_ir_for(dt), 32, 32, 128, dt)
+    }
+}

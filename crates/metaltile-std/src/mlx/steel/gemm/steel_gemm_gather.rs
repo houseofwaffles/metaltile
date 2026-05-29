@@ -195,3 +195,55 @@ steel_gemm_gather_kernel!(
     128u32,
     "bm32_bn32_bk16_wm2_wn2"
 );
+
+/// New-syntax benches for the gather steel GEMM (MoE `gather_mm`).
+///
+/// Canonical 4096³ problem. `SimdGroup2D` dispatch: grid is tile-group
+/// counts `(n/BN, m/BM, 1)`, `tpg = [WM*WN*32, 1, 1]`. Two index buffers
+/// route the gather: `lhs_indices` (length `m`, one gathered A-row per
+/// output row) and `rhs_indices` (length `n/BN`, one B-matrix per
+/// N-block). `bytes_moved` counts the three dominant matmul streams plus
+/// the index reads. Bench-only — correctness stays on the legacy GPU
+/// tests.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+
+    /// Build a gather steel-GEMM bench. `bn` is the output N-block dim
+    /// (so `rhs_indices` has `n/bn` entries); `bm` the M-block dim.
+    fn gb(kernel: Kernel, bm: u32, bn: u32, tpg: u32, dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let n_blocks = n / bn as usize;
+        let bytes = (m * k + k * n + m * n) * sz + (m + n_blocks) * DType::U32.size_bytes();
+        BenchSetup::new(kernel)
+            .mode(KernelMode::SimdGroup2D)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            // Index buffers must be in-range; zeros (gather row/matrix 0)
+            // are valid and keep the bench deterministic.
+            .buffer(BenchBuffer::zeros("lhs_indices", m, DType::U32))
+            .buffer(BenchBuffer::zeros("rhs_indices", n_blocks, DType::U32))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("k", K)
+            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d(N / bn, M / bm, 1, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/steel_gemm_gather/bm64_bn64_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_gather_64x64x16_2x2(dt: DType) -> BenchSetup {
+        gb(mt_steel_gemm_gather_64x64x16_2x2::kernel_ir_for(dt), 64, 64, 128, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_gather/bm32_bn32_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_gather_32x32x16_2x2(dt: DType) -> BenchSetup {
+        gb(mt_steel_gemm_gather_32x32x16_2x2::kernel_ir_for(dt), 32, 32, 128, dt)
+    }
+}

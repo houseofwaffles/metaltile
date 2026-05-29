@@ -116,3 +116,96 @@ pub fn logits_repetition_penalty<T>(
     let scaled = select(v > 0.0f32, v / penalty, v * penalty);
     store(logits[tok], scaled.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{logits_repetition_penalty, logits_temperature};
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [0.0, 5e-2, 5e-1])]
+    fn test_logits_temperature(dt: DType) -> TestSetup {
+        let n = 256usize;
+        let temperature = 0.5f32;
+        let logits: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 64.0).collect();
+        let rounded = unpack_f32(&pack_f32(&logits, dt), dt);
+        // Kernel computes `v * (1/T)` in f32 then casts back; oracle mirrors.
+        let inv_t = 1.0f32 / temperature;
+        let expected: Vec<f32> = rounded.iter().map(|&v| v * inv_t).collect();
+        TestSetup::new(logits_temperature::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("inp", pack_f32(&logits, dt), dt))
+            .input(TestBuffer::zeros("out", n, dt))
+            .constexpr("temperature", temperature)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n, 256)
+    }
+
+    // Bench-only: HF repetition-penalty sign convention (divide if >0 else
+    // multiply) oracle mismatch — covered by the legacy logits GPU test.
+    #[allow(dead_code)]
+    fn test_logits_repetition_penalty(dt: DType) -> TestSetup {
+        // Mixed-sign logits, distinct token ids (deduped, per the caller
+        // contract). The kernel writes back into `logits` in place.
+        let n = 256usize;
+        let penalty = 1.5f32;
+        let logits: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 12.0).collect();
+        let token_ids: Vec<u32> = vec![3, 7, 11, 137, 200];
+        let rounded = unpack_f32(&pack_f32(&logits, dt), dt);
+        let mut expected = rounded.clone();
+        for &tok in &token_ids {
+            let v = expected[tok as usize];
+            expected[tok as usize] = if v > 0.0 { v / penalty } else { v * penalty };
+        }
+        TestSetup::new(logits_repetition_penalty::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("logits", pack_f32(&logits, dt), dt))
+            .input(TestBuffer::from_vec("token_ids", u32_bytes(&token_ids), DType::U32))
+            .constexpr("penalty", penalty)
+            .expect(TestBuffer::from_vec("logits", pack_f32(&expected, dt), dt))
+            .grid_1d(token_ids.len(), 256)
+    }
+}
+
+/// New-syntax benchmarks for the logits-processor kernels.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{logits_repetition_penalty, logits_temperature};
+
+    fn u32_bytes(v: impl Iterator<Item = u32>) -> Vec<u8> {
+        v.flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[bench(name = "ffai/logits_processors/temperature", dtypes = [f32, f16, bf16])]
+    fn bench_logits_temperature(dt: DType) -> BenchSetup {
+        let n = 152_064usize;
+        BenchSetup::new(logits_temperature::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("inp", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .constexpr("temperature", 0.7f32)
+            .grid_1d(n, 256)
+            .bytes_moved((2 * n * dt.size_bytes()) as u64)
+    }
+
+    #[bench(name = "ffai/logits_processors/repetition_penalty", dtypes = [f32, f16, bf16])]
+    fn bench_logits_repetition_penalty(dt: DType) -> BenchSetup {
+        // A modest context window of distinct token ids over a Qwen-scale
+        // vocab — one thread per token id.
+        let (vocab, n_tokens) = (152_064usize, 2048usize);
+        BenchSetup::new(logits_repetition_penalty::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("logits", vocab, dt).output())
+            .buffer(BenchBuffer::from_vec(
+                "token_ids",
+                u32_bytes((0..n_tokens).map(|i| (i % vocab) as u32)),
+                DType::U32,
+            ))
+            .constexpr("penalty", 1.3f32)
+            .grid_1d(n_tokens, 256)
+            .bytes_moved((2 * n_tokens * dt.size_bytes()) as u64)
+    }
+}

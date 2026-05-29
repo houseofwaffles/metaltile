@@ -284,3 +284,206 @@ pub fn ffai_gated_rms_norm_qgemv_int4_fast<T>(
         }
     }
 }
+
+mod oracle {
+    use crate::{bench_types::DType, utils::pack_f32};
+
+    /// Per-row affine int4 quantize, 8 nibbles per u32 — same packing the
+    /// kernel decodes. Returns (packed_weight, scales, biases) for one row.
+    pub fn quantize_int4_row(row: &[f32], group_size: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let in_dim = row.len();
+        let n_groups = in_dim / group_size;
+        let mut packed = vec![0u32; in_dim / 8];
+        let mut scales = vec![0.0_f32; n_groups];
+        let mut biases = vec![0.0_f32; n_groups];
+        for g in 0..n_groups {
+            let gs = &row[g * group_size..(g + 1) * group_size];
+            let mn = gs.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = gs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = mx - mn;
+            let scale = if range.abs() < 1e-10 { 1.0 } else { range / 15.0 };
+            scales[g] = scale;
+            biases[g] = mn;
+            for (i, &v) in gs.iter().enumerate() {
+                let q = ((v - mn) / scale).round().clamp(0.0, 15.0) as u32;
+                let d = g * group_size + i;
+                packed[d / 8] |= q << ((d % 8) * 4);
+            }
+        }
+        (packed, scales, biases)
+    }
+
+    /// Deterministic xorshift source, matching the legacy test's generator.
+    pub fn source(n: usize, seed: u64, scale: f32, off: f32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s % 20_000) as f32 / 20_000.0 - 0.5) * scale + off
+            })
+            .collect()
+    }
+
+    pub fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    /// CPU oracle: per-row gated RMSNorm (`silu(z)` gate) → int4 GEMV.
+    /// Mirrors `tests/gated_rms_norm_qgemv_int4_gpu_correctness.rs::naive`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn naive(
+        y: &[f32],
+        z: &[f32],
+        norm_weight: &[f32],
+        weight: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        hv: usize,
+        dv: usize,
+        out_dim: usize,
+        group_size: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let in_dim = hv * dv;
+        let mut inner = vec![0.0_f32; in_dim];
+        for r in 0..hv {
+            let base = r * dv;
+            let row = &y[base..base + dv];
+            let ssq: f32 = row.iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (ssq / dv as f32 + eps).sqrt();
+            for d in 0..dv {
+                let g = z[base + d] / (1.0 + (-z[base + d]).exp());
+                inner[base + d] = y[base + d] * inv_rms * norm_weight[d] * g;
+            }
+        }
+        let u32_per_row = in_dim / 8;
+        let n_groups = in_dim / group_size;
+        (0..out_dim)
+            .map(|row| {
+                let rw = &weight[row * u32_per_row..(row + 1) * u32_per_row];
+                let rs = &scales[row * n_groups..(row + 1) * n_groups];
+                let rb = &biases[row * n_groups..(row + 1) * n_groups];
+                let mut acc = 0.0_f32;
+                for d in 0..in_dim {
+                    let q = (rw[d / 8] >> ((d % 8) * 4)) & 0xf;
+                    let g = d / group_size;
+                    let w_real = q as f32 * rs[g] + rb[g];
+                    acc += w_real * inner[d];
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// Round f32 vals through `dt` (so the CPU oracle sees the GPU's load
+    /// precision) and re-pack to f32 for the oracle. Used for z/scales/etc.
+    pub fn round(v: &[f32], dt: DType) -> Vec<f32> {
+        crate::utils::unpack_f32(&pack_f32(v, dt), dt)
+    }
+}
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{
+        ffai_gated_rms_norm_qgemv_int4_fast,
+        oracle::{naive, quantize_int4_row, round, source, u32_bytes},
+    };
+    use crate::utils::pack_f32;
+
+    /// Build the test for one dtype. Fast-variant constraints: `in_dim =
+    /// hv*dv` a multiple of 512, `out_dim` a multiple of 8, `group_size = 64`,
+    /// `dv` a multiple of 32, `hv` even.
+    fn setup(hv: usize, dv: usize, out_dim: usize, group_size: usize, dt: DType) -> TestSetup {
+        let in_dim = hv * dv;
+        let eps = 1e-5_f32;
+        // `y` stays fp32 (GDN recurrence output crosses the boundary in fp32).
+        let y: Vec<f32> = source(in_dim, 0xA1, 2.0, 0.1);
+        let z: Vec<f32> = round(&source(in_dim, 0xD4, 1.5, 0.0), dt);
+        let norm_weight: Vec<f32> = round(&source(dv, 0xB2, 0.4, 1.0), dt);
+        let w_rows = source(out_dim * in_dim, 0xC3, 3.0, 0.0);
+
+        let mut weight = Vec::new();
+        let mut scales = Vec::new();
+        let mut biases = Vec::new();
+        for row in 0..out_dim {
+            let (w, s, b) =
+                quantize_int4_row(&w_rows[row * in_dim..(row + 1) * in_dim], group_size);
+            weight.extend(w);
+            scales.extend(s);
+            biases.extend(b);
+        }
+        let scales_r = round(&scales, dt);
+        let biases_r = round(&biases, dt);
+
+        let expected = naive(
+            &y,
+            &z,
+            &norm_weight,
+            &weight,
+            &scales_r,
+            &biases_r,
+            hv,
+            dv,
+            out_dim,
+            group_size,
+            eps,
+        );
+
+        TestSetup::new(ffai_gated_rms_norm_qgemv_int4_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("y", pack_f32(&y, DType::F32), DType::F32))
+            .input(TestBuffer::from_vec("z", pack_f32(&z, dt), dt))
+            .input(TestBuffer::from_vec("norm_weight", pack_f32(&norm_weight, dt), dt))
+            .input(TestBuffer::from_vec("eps_buf", eps.to_le_bytes().to_vec(), DType::F32))
+            .input(TestBuffer::from_vec("q_weight", u32_bytes(&weight), DType::U32))
+            .input(TestBuffer::from_vec("q_scales", pack_f32(&scales, dt), dt))
+            .input(TestBuffer::from_vec("q_biases", pack_f32(&biases, dt), dt))
+            .input(TestBuffer::zeros("out", out_dim, dt))
+            .constexpr("hv", hv as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("out_dim", out_dim as u32)
+            .constexpr("group_size", group_size as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((out_dim / 8) as u32, 1, 1, [64, 1, 1])
+    }
+
+    // Small shape: hv=4, dv=128, in_dim=512, out_dim=512, group_size=64.
+    // int4 quant + dependent reductions → relative-tolerance bands per dtype.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 3e-2, 6e-2])]
+    fn test_gated_rms_norm_qgemv_int4_fast(dt: DType) -> TestSetup { setup(4, 128, 512, 64, dt) }
+}
+
+/// New-syntax benchmark for `ffai_gated_rms_norm_qgemv_int4_fast` at the
+/// Qwen3.6-A3B production shape (hv=16, dv=128, in_dim=2048, out_dim=2048).
+/// MLX-less reduction kernel (`class=GenericEmpty`), so `Ref(GB/s)` blank.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_gated_rms_norm_qgemv_int4_fast;
+
+    #[bench(name = "ffai/gated_rms_norm_qgemv_int4_fast", dtypes = [f32, f16, bf16])]
+    fn bench_gated_rms_norm_qgemv_int4_fast(dt: DType) -> BenchSetup {
+        let (hv, dv, out_dim, group_size) = (16usize, 128usize, 2048usize, 64usize);
+        let in_dim = hv * dv;
+        let u32_per_row = in_dim / 8;
+        let n_groups = in_dim / group_size;
+        BenchSetup::new(ffai_gated_rms_norm_qgemv_int4_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("y", in_dim, DType::F32))
+            .buffer(BenchBuffer::random("z", in_dim, dt))
+            .buffer(BenchBuffer::random("norm_weight", dv, dt))
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .buffer(BenchBuffer::random("q_weight", out_dim * u32_per_row, DType::U32))
+            .buffer(BenchBuffer::random("q_scales", out_dim * n_groups, dt))
+            .buffer(BenchBuffer::random("q_biases", out_dim * n_groups, dt))
+            .buffer(BenchBuffer::zeros("out", out_dim, dt).output())
+            .constexpr("hv", hv as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("out_dim", out_dim as u32)
+            .constexpr("group_size", group_size as u32)
+            .grid_3d((out_dim / 8) as u32, 1, 1, [64, 1, 1])
+            // Weight matrix dominates traffic: out_dim*in_dim int4 = bytes/2.
+            .bytes_moved((out_dim * in_dim / 2) as u64)
+    }
+}

@@ -149,6 +149,47 @@ pub fn mt_steel_gemm_fused_nax<T>(
     }
 }
 
+/// New-syntax bench for the NAX (cooperative-tensor) fused steel GEMM.
+///
+/// Canonical 4096³ problem (`m = n = k = 4096`, multiples of 32). NAX
+/// geometry is fixed: `BM = BN = BK = 32`, `tpg = 128` (4 SG × 32). The
+/// kernel is `KernelMode::Reduction` — `tgid_*` lower to threadgroup
+/// indices — so the grid is **threadgroup counts** `(n/32, m/32, 1)`
+/// (`tgid_x` = N-block, `tgid_y` = M-block) with `tpg = [128, 1, 1]`.
+/// Constexprs are `k`, `n` (the kernel param order). `bytes_moved` counts
+/// the three dominant matmul streams. Bench-only — correctness stays on
+/// `steel_gemm_fused_nax_gpu_correctness.rs`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_steel_gemm_fused_nax;
+
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+    /// Fixed NAX tile dim (BM = BN = BK) and threads-per-group.
+    const TILE: u32 = 32;
+    const TPG: u32 = 128;
+
+    #[bench(name = "mlx/steel_gemm/fused_nax", dtypes = [f32, f16, bf16])]
+    fn bench_fused_nax(dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let bytes = (m * k + k * n + m * n) * sz;
+        BenchSetup::new(mt_steel_gemm_fused_nax::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("k", K)
+            .constexpr("n", N)
+            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::bench_types::dtype_label(dt)))
+            // Reduction grid is threadgroup counts: (n/32, m/32, 1).
+            .grid_3d(N / TILE, M / TILE, 1, [TPG, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;

@@ -75,3 +75,107 @@ pub fn ffai_rope_llama<T>(
     store(out[i1], o1.cast::<T>());
     store(out[i2], o2.cast::<T>());
 }
+
+/// New-syntax correctness + bench for `ffai_rope_llama` (per-token decode RoPE
+/// with Llama-3 banding). Grid3D, grid `[n_heads, half_dim, 1]`, tpg `[1,1,1]`
+/// (one thread per (head, i); each writes the rotation pair i / i+half_dim).
+/// Oracle replays the exact banded-inv_freq + rotation math in f32.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_rope_llama;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// Llama-3 banded inverse frequency for pair index `i` (mirrors the kernel).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn band_inv_freq(
+        i: usize,
+        half: usize,
+        theta_base: f32,
+        scale_factor: f32,
+        low_ff: f32,
+        high_ff: f32,
+        orig_max: f32,
+    ) -> f32 {
+        let inv_base = (-(i as f32) * theta_base.log2() / half as f32).exp2();
+        let two_pi = std::f32::consts::TAU;
+        let wavelen = two_pi / inv_base;
+        let low_wl = orig_max / low_ff;
+        let high_wl = orig_max / high_ff;
+        let scaled = inv_base / scale_factor;
+        let s = (orig_max / wavelen - low_ff) / (high_ff - low_ff);
+        let smoothed = (1.0 - s) * scaled + s * inv_base;
+        if wavelen > low_wl {
+            scaled
+        } else if wavelen < high_wl {
+            inv_base
+        } else {
+            smoothed
+        }
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 5e-2])]
+    fn test_rope_llama(dt: DType) -> TestSetup {
+        let (n_heads, head_dim) = (4usize, 64usize);
+        let half = head_dim / 2;
+        let (theta_base, position) = (500_000.0f32, 100u32);
+        // Scaling OFF (Llama-3 banding disabled): high-freq branch selected.
+        let (sf, lf, hf, omp) = (1.0f32, 1.0f32, 1.0f32, 1.0e9f32);
+        let qk_f: Vec<f32> =
+            (0..n_heads * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let qk = unpack_f32(&pack_f32(&qk_f, dt), dt);
+        let mut exp = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            for i in 0..half {
+                let invf = band_inv_freq(i, half, theta_base, sf, lf, hf, omp);
+                let th = position as f32 * invf;
+                let (c, s) = (th.cos(), th.sin());
+                let base = h * head_dim;
+                let (x1, x2) = (qk[base + i], qk[base + i + half]);
+                exp[base + i] = x1 * c - x2 * s;
+                exp[base + i + half] = x1 * s + x2 * c;
+            }
+        }
+        TestSetup::new(ffai_rope_llama::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("qk", pack_f32(&qk_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("position", position)
+            .constexpr("theta_base", theta_base)
+            .constexpr("scale_factor", sf)
+            .constexpr("low_freq_factor", lf)
+            .constexpr("high_freq_factor", hf)
+            .constexpr("original_max_position", omp)
+            .expect(TestBuffer::from_vec("out", pack_f32(&exp, dt), dt))
+            .grid_3d(n_heads as u32, half as u32, 1, [1, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_rope_llama` (decode RoPE, head_dim 128).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_rope_llama;
+
+    #[bench(name = "ffai/rope/rope_llama", dtypes = [f32, f16, bf16])]
+    fn bench_rope_llama(dt: DType) -> BenchSetup {
+        let (n_heads, head_dim) = (32usize, 128usize);
+        let half = head_dim / 2;
+        BenchSetup::new(ffai_rope_llama::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("qk", n_heads * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("position", 1000u32)
+            .constexpr("theta_base", 500_000.0f32)
+            .constexpr("scale_factor", 8.0f32)
+            .constexpr("low_freq_factor", 1.0f32)
+            .constexpr("high_freq_factor", 4.0f32)
+            .constexpr("original_max_position", 8192.0f32)
+            .grid_3d(n_heads as u32, half as u32, 1, [1, 1, 1])
+            .bytes_moved((2 * n_heads * head_dim * dt.size_bytes()) as u64)
+    }
+}

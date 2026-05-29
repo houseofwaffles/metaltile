@@ -524,3 +524,258 @@ flash_quantized_sdpa_float_mask_kernel!(
     8u32,
     "float_mask_b8_d256"
 );
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    // Decode-class shape: 32 Q heads, GQA fan-out 4, 512-token cache.
+    const Q_HEADS: usize = 32;
+    const KV_HEADS: usize = 8;
+    const TOKENS: usize = 512;
+
+    fn group_size(dim: usize) -> usize { if dim.is_multiple_of(64) { 64 } else { 32 } }
+
+    // Base (causal-only) flash quantized SDPA bench.
+    fn base(ir: metaltile::core::ir::Kernel, dim: usize, bits: usize, dt: DType) -> BenchSetup {
+        let g = group_size(dim);
+        let pack_factor = 32 / bits;
+        let words_per_token = dim / pack_factor;
+        let n_groups = dim / g;
+        let repeat = Q_HEADS / KV_HEADS;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let kv_rows = KV_HEADS * TOKENS;
+        let bytes = (Q_HEADS * dim
+            + kv_rows * words_per_token * 4 * 2
+            + kv_rows * n_groups * 2 * 2
+            + Q_HEADS * dim)
+            * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("queries", Q_HEADS * dim, dt))
+            .buffer(BenchBuffer::random("k_packed", kv_rows * words_per_token, DType::U32))
+            .buffer(BenchBuffer::random("k_scales", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("k_biases", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("v_packed", kv_rows * words_per_token, DType::U32))
+            .buffer(BenchBuffer::random("v_scales", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("v_biases", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("sinks", Q_HEADS, DType::F32))
+            .buffer(BenchBuffer::zeros("out", Q_HEADS * dim, dt).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("tokens", TOKENS as u32)
+            .constexpr("repeat_count", repeat as u32)
+            .constexpr("group_size", g as u32)
+            .constexpr("num_q_heads", Q_HEADS as u32)
+            .constexpr("has_sinks", 0u32)
+            .constexpr("window_size", 0u32)
+            .constexpr("scale", scale)
+            .grid_3d(1, Q_HEADS as u32, 1, [32, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    // Mask variant bench — inserts the extra mask buffer (`mask_bool` u32 or
+    // `mask_float` T) between `sinks` and `out`.
+    fn masked(
+        ir: metaltile::core::ir::Kernel,
+        dim: usize,
+        bits: usize,
+        mask_name: &str,
+        mask_dt: DType,
+        dt: DType,
+    ) -> BenchSetup {
+        let g = group_size(dim);
+        let pack_factor = 32 / bits;
+        let words_per_token = dim / pack_factor;
+        let n_groups = dim / g;
+        let repeat = Q_HEADS / KV_HEADS;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let kv_rows = KV_HEADS * TOKENS;
+        let bytes = (Q_HEADS * dim
+            + kv_rows * words_per_token * 4 * 2
+            + kv_rows * n_groups * 2 * 2
+            + Q_HEADS * TOKENS
+            + Q_HEADS * dim)
+            * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("queries", Q_HEADS * dim, dt))
+            .buffer(BenchBuffer::random("k_packed", kv_rows * words_per_token, DType::U32))
+            .buffer(BenchBuffer::random("k_scales", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("k_biases", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("v_packed", kv_rows * words_per_token, DType::U32))
+            .buffer(BenchBuffer::random("v_scales", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("v_biases", kv_rows * n_groups, dt))
+            .buffer(BenchBuffer::random("sinks", Q_HEADS, DType::F32))
+            .buffer(BenchBuffer::random(mask_name, Q_HEADS * TOKENS, mask_dt))
+            .buffer(BenchBuffer::zeros("out", Q_HEADS * dim, dt).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("tokens", TOKENS as u32)
+            .constexpr("repeat_count", repeat as u32)
+            .constexpr("group_size", g as u32)
+            .constexpr("num_q_heads", Q_HEADS as u32)
+            .constexpr("has_sinks", 0u32)
+            .constexpr("window_size", 0u32)
+            .constexpr("scale", scale)
+            .grid_3d(1, Q_HEADS as u32, 1, [32, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    macro_rules! base_bench {
+        ($fn:ident, $kernel:ident, $name:literal, $dim:literal, $bits:literal) => {
+            #[bench(name = $name, dtypes = [f32, f16, bf16])]
+            fn $fn(dt: DType) -> BenchSetup {
+                base(super::$kernel::kernel_ir_for(dt), $dim, $bits, dt)
+            }
+        };
+    }
+
+    base_bench!(b_b4_d64, flash_quantized_sdpa_b4_d64, "ffai/flash_quantized_sdpa_b4_d64", 64, 4);
+    base_bench!(b_b4_d96, flash_quantized_sdpa_b4_d96, "ffai/flash_quantized_sdpa_b4_d96", 96, 4);
+    base_bench!(
+        b_b4_d128,
+        flash_quantized_sdpa_b4_d128,
+        "ffai/flash_quantized_sdpa_b4_d128",
+        128,
+        4
+    );
+    base_bench!(
+        b_b4_d256,
+        flash_quantized_sdpa_b4_d256,
+        "ffai/flash_quantized_sdpa_b4_d256",
+        256,
+        4
+    );
+    base_bench!(
+        b_b4_d512,
+        flash_quantized_sdpa_b4_d512,
+        "ffai/flash_quantized_sdpa_b4_d512",
+        512,
+        4
+    );
+    base_bench!(b_b8_d64, flash_quantized_sdpa_b8_d64, "ffai/flash_quantized_sdpa_b8_d64", 64, 8);
+    base_bench!(b_b8_d96, flash_quantized_sdpa_b8_d96, "ffai/flash_quantized_sdpa_b8_d96", 96, 8);
+    base_bench!(
+        b_b8_d128,
+        flash_quantized_sdpa_b8_d128,
+        "ffai/flash_quantized_sdpa_b8_d128",
+        128,
+        8
+    );
+    base_bench!(
+        b_b8_d256,
+        flash_quantized_sdpa_b8_d256,
+        "ffai/flash_quantized_sdpa_b8_d256",
+        256,
+        8
+    );
+    base_bench!(
+        b_b8_d512,
+        flash_quantized_sdpa_b8_d512,
+        "ffai/flash_quantized_sdpa_b8_d512",
+        512,
+        8
+    );
+
+    macro_rules! bool_bench {
+        ($fn:ident, $kernel:ident, $name:literal, $dim:literal, $bits:literal) => {
+            #[bench(name = $name, dtypes = [f32, f16, bf16])]
+            fn $fn(dt: DType) -> BenchSetup {
+                masked(super::$kernel::kernel_ir_for(dt), $dim, $bits, "mask_bool", DType::U32, dt)
+            }
+        };
+    }
+
+    bool_bench!(
+        bm_b4_d64,
+        flash_quantized_sdpa_bool_mask_b4_d64,
+        "ffai/flash_quantized_sdpa_bool_mask_b4_d64",
+        64,
+        4
+    );
+    bool_bench!(
+        bm_b4_d128,
+        flash_quantized_sdpa_bool_mask_b4_d128,
+        "ffai/flash_quantized_sdpa_bool_mask_b4_d128",
+        128,
+        4
+    );
+    bool_bench!(
+        bm_b4_d256,
+        flash_quantized_sdpa_bool_mask_b4_d256,
+        "ffai/flash_quantized_sdpa_bool_mask_b4_d256",
+        256,
+        4
+    );
+    bool_bench!(
+        bm_b8_d64,
+        flash_quantized_sdpa_bool_mask_b8_d64,
+        "ffai/flash_quantized_sdpa_bool_mask_b8_d64",
+        64,
+        8
+    );
+    bool_bench!(
+        bm_b8_d128,
+        flash_quantized_sdpa_bool_mask_b8_d128,
+        "ffai/flash_quantized_sdpa_bool_mask_b8_d128",
+        128,
+        8
+    );
+    bool_bench!(
+        bm_b8_d256,
+        flash_quantized_sdpa_bool_mask_b8_d256,
+        "ffai/flash_quantized_sdpa_bool_mask_b8_d256",
+        256,
+        8
+    );
+
+    macro_rules! float_bench {
+        ($fn:ident, $kernel:ident, $name:literal, $dim:literal, $bits:literal) => {
+            #[bench(name = $name, dtypes = [f32, f16, bf16])]
+            fn $fn(dt: DType) -> BenchSetup {
+                masked(super::$kernel::kernel_ir_for(dt), $dim, $bits, "mask_float", dt, dt)
+            }
+        };
+    }
+
+    float_bench!(
+        fm_b4_d64,
+        flash_quantized_sdpa_float_mask_b4_d64,
+        "ffai/flash_quantized_sdpa_float_mask_b4_d64",
+        64,
+        4
+    );
+    float_bench!(
+        fm_b4_d128,
+        flash_quantized_sdpa_float_mask_b4_d128,
+        "ffai/flash_quantized_sdpa_float_mask_b4_d128",
+        128,
+        4
+    );
+    float_bench!(
+        fm_b4_d256,
+        flash_quantized_sdpa_float_mask_b4_d256,
+        "ffai/flash_quantized_sdpa_float_mask_b4_d256",
+        256,
+        4
+    );
+    float_bench!(
+        fm_b8_d64,
+        flash_quantized_sdpa_float_mask_b8_d64,
+        "ffai/flash_quantized_sdpa_float_mask_b8_d64",
+        64,
+        8
+    );
+    float_bench!(
+        fm_b8_d128,
+        flash_quantized_sdpa_float_mask_b8_d128,
+        "ffai/flash_quantized_sdpa_float_mask_b8_d128",
+        128,
+        8
+    );
+    float_bench!(
+        fm_b8_d256,
+        flash_quantized_sdpa_float_mask_b8_d256,
+        "ffai/flash_quantized_sdpa_float_mask_b8_d256",
+        256,
+        8
+    );
+}

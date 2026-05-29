@@ -148,6 +148,48 @@ pub fn mt_steel_gemm_gather_nax<T>(
     }
 }
 
+/// New-syntax bench for the NAX gather steel GEMM (MoE `gather_mm`).
+///
+/// Canonical 4096³ problem (multiples of 32). NAX geometry fixed at
+/// `BM = BN = BK = 32`, `tpg = 128`. `KernelMode::Reduction`: grid is
+/// threadgroup counts `(n/32, m/32, 1)`. `lhs_indices` (length `m`) and
+/// `rhs_indices` (length `n/32`) route the gather; both are seeded zero
+/// (gather row / matrix 0 — in-bounds and deterministic). `b` is a
+/// single `[K, N]` matrix here (one expert). `bytes_moved` counts the
+/// three matmul streams plus the index reads. Bench-only — correctness
+/// stays on `steel_gemm_gather_nax_gpu_correctness.rs`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_steel_gemm_gather_nax;
+
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+    const TILE: u32 = 32;
+    const TPG: u32 = 128;
+
+    #[bench(name = "mlx/steel_gemm/gather_nax", dtypes = [f32, f16, bf16])]
+    fn bench_gather_nax(dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let n_blocks = n / TILE as usize;
+        let bytes = (m * k + k * n + m * n) * sz + (m + n_blocks) * DType::U32.size_bytes();
+        BenchSetup::new(mt_steel_gemm_gather_nax::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            .buffer(BenchBuffer::zeros("lhs_indices", m, DType::U32))
+            .buffer(BenchBuffer::zeros("rhs_indices", n_blocks, DType::U32))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("k", K)
+            .constexpr("n", N)
+            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d(N / TILE, M / TILE, 1, [TPG, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;

@@ -749,6 +749,115 @@ pub mod kernel_benches {
     ubench!(bench_softplus, "mlx/unary/softplus", mt_softplus);
     ubench!(bench_erf, "mlx/unary/erf", mt_erf);
     ubench!(bench_erfinv, "mlx/unary/erfinv", mt_erfinv);
+
+    // ── Fused / cast variants ─────────────────────────────────────────────
+    // These have signatures the `ub` helper can't cover (f32 output, scalar
+    // broadcast buffers, multi-input FMA chains, or a reduction). One thread
+    // per output element (Elementwise) unless noted.
+
+    // cast / silu-cast: read model dtype `T`, write f32.
+    fn cast_b(kernel: Kernel, dt: DType) -> BenchSetup {
+        let n = 64 * 1024 * 1024usize;
+        BenchSetup::new(kernel)
+            .buffer(BenchBuffer::random("input", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, DType::F32).output())
+            .grid_1d(n, 256)
+            .bytes_moved((n * (dt.size_bytes() + DType::F32.size_bytes())) as u64)
+    }
+
+    #[bench(name = "mlx/unary/cast_to_f32", dtypes = [f32, f16, bf16])]
+    fn bench_cast_to_f32(dt: DType) -> BenchSetup { cast_b(mt_cast_to_f32::kernel_ir_for(dt), dt) }
+    #[bench(name = "mlx/unary/silu_cast_to_f32", dtypes = [f16, bf16])]
+    fn bench_silu_cast_to_f32(dt: DType) -> BenchSetup {
+        cast_b(mt_silu_cast_to_f32::kernel_ir_for(dt), dt)
+    }
+
+    // sigmoid_mul: out[i] = a[i] * sigmoid(b[i]). Two full-length inputs.
+    #[bench(name = "mlx/unary/sigmoid_mul", dtypes = [f32, f16, bf16])]
+    fn bench_sigmoid_mul(dt: DType) -> BenchSetup {
+        let n = 64 * 1024 * 1024usize;
+        BenchSetup::new(mt_sigmoid_mul::kernel_ir_for(dt))
+            .buffer(BenchBuffer::random("a", n, dt))
+            .buffer(BenchBuffer::random("b", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .grid_1d(n, 256)
+            .bytes_moved((3 * n * dt.size_bytes()) as u64)
+    }
+
+    // scalar_fma: out[i] = base[i] + scalar[0] * value[i]. `scalar` is a
+    // 1-element broadcast buffer; `value` + `base` are full-length.
+    #[bench(name = "mlx/unary/scalar_fma", dtypes = [f32, f16, bf16])]
+    fn bench_scalar_fma(dt: DType) -> BenchSetup {
+        let n = 64 * 1024 * 1024usize;
+        BenchSetup::new(mt_scalar_fma::kernel_ir_for(dt))
+            .buffer(BenchBuffer::random("scalar", 1, dt))
+            .buffer(BenchBuffer::random("value", n, dt))
+            .buffer(BenchBuffer::random("base", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .grid_1d(n, 256)
+            .bytes_moved((3 * n * dt.size_bytes()) as u64)
+    }
+
+    // sigmoid_scalar_fma: out[i] = base[i] + sigmoid(gate[0]) * value[i].
+    #[bench(name = "mlx/unary/sigmoid_scalar_fma", dtypes = [f32, f16, bf16])]
+    fn bench_sigmoid_scalar_fma(dt: DType) -> BenchSetup {
+        let n = 64 * 1024 * 1024usize;
+        BenchSetup::new(mt_sigmoid_scalar_fma::kernel_ir_for(dt))
+            .buffer(BenchBuffer::random("gate", 1, dt))
+            .buffer(BenchBuffer::random("value", n, dt))
+            .buffer(BenchBuffer::random("base", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .grid_1d(n, 256)
+            .bytes_moved((3 * n * dt.size_bytes()) as u64)
+    }
+
+    // sigmoid_scalar_fma_residual: out = residual + base + sigmoid(gate[0])·value.
+    #[bench(name = "mlx/unary/sigmoid_scalar_fma_residual", dtypes = [f32, f16, bf16])]
+    fn bench_sigmoid_scalar_fma_residual(dt: DType) -> BenchSetup {
+        let n = 64 * 1024 * 1024usize;
+        BenchSetup::new(mt_sigmoid_scalar_fma_residual::kernel_ir_for(dt))
+            .buffer(BenchBuffer::random("gate", 1, dt))
+            .buffer(BenchBuffer::random("value", n, dt))
+            .buffer(BenchBuffer::random("base", n, dt))
+            .buffer(BenchBuffer::random("residual", n, dt))
+            .buffer(BenchBuffer::zeros("out", n, dt).output())
+            .grid_1d(n, 256)
+            .bytes_moved((4 * n * dt.size_bytes()) as u64)
+    }
+
+    // scalar_fma_chain8: out[i] = sum_{k=0..8} scalar_k[0] * value_k[i].
+    // Eight 1-element scalar buffers + eight full-length value buffers.
+    #[bench(name = "mlx/unary/scalar_fma_chain8", dtypes = [f32, f16, bf16])]
+    fn bench_scalar_fma_chain8(dt: DType) -> BenchSetup {
+        let n = 16 * 1024 * 1024usize;
+        let mut s = BenchSetup::new(mt_scalar_fma_chain8::kernel_ir_for(dt));
+        for k in 0..8 {
+            s = s
+                .buffer(BenchBuffer::random(&format!("scalar{k}"), 1, dt))
+                .buffer(BenchBuffer::random(&format!("value{k}"), n, dt));
+        }
+        s.buffer(BenchBuffer::zeros("out", n, dt).output())
+            .grid_1d(n, 256)
+            .bytes_moved((9 * n * dt.size_bytes()) as u64)
+    }
+
+    // add_rms_norm: Reduction, one threadgroup per row, N = tpg*4. Fused
+    // residual-add (a+b) + RMSNorm with two outputs (residual + normed).
+    #[bench(name = "mlx/unary/add_rms_norm", dtypes = [f32, f16, bf16])]
+    fn bench_add_rms_norm(dt: DType) -> BenchSetup {
+        let (rows, n) = (4096usize, 4096usize);
+        BenchSetup::new(mt_add_rms_norm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("a", rows * n, dt))
+            .buffer(BenchBuffer::random("b", rows * n, dt))
+            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .buffer(BenchBuffer::zeros("residual_out", rows * n, dt).output())
+            .buffer(BenchBuffer::zeros("normed_out", rows * n, dt).output())
+            .constexpr("n", n as u32)
+            .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
+            .bytes_moved((4 * rows * n * dt.size_bytes()) as u64)
+    }
 }
 
 // Numerically-stable softplus: softplus(x) = max(x, 0) + log1p(exp(-|x|)).

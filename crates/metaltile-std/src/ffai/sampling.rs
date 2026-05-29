@@ -140,3 +140,58 @@ pub fn softmax_categorical_sample<T>(
         store(out[0], found_idx);
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::softmax_categorical_sample;
+    use crate::utils::pack_f32;
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.5)]
+    fn test_softmax_categorical_sample(dt: DType) -> TestSetup {
+        // A dominant spike: exp(spike) ≫ Σ of the rest, so the CDF jumps
+        // from ~0 to ~total at `idx`. The smallest index whose cumulative
+        // softmax ≥ uniform·total is therefore `idx` for any uniform in
+        // (0, 1) — pick 0.5 as the deterministic draw.
+        let (n, idx, spike) = (1024usize, 813usize, 30.0f32);
+        let mut logits = vec![0.0f32; n];
+        logits[idx] = spike;
+        TestSetup::new(softmax_categorical_sample::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("inp", pack_f32(&logits, dt), dt))
+            .input(TestBuffer::zeros("out", 1, DType::U32))
+            .input(TestBuffer::from_vec("temperature_in", pack_f32(&[1.0], DType::F32), DType::F32))
+            .input(TestBuffer::from_vec("uniform_in", pack_f32(&[0.5], DType::F32), DType::F32))
+            .constexpr("n", n as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&[idx as f32], DType::U32), DType::U32))
+            .grid_3d(1, 1, 1, [256, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `softmax_categorical_sample` at Qwen3 vocab
+/// scale (Reduction, single threadgroup; cooperative max + scan + CDF
+/// walk). Random logits, fixed temperature and uniform draw.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::softmax_categorical_sample;
+    use crate::utils::pack_f32;
+
+    #[bench(name = "ffai/sampling/softmax_categorical_sample", dtypes = [f32, f16, bf16])]
+    fn bench_softmax_categorical_sample(dt: DType) -> BenchSetup {
+        let n = 152_064usize;
+        BenchSetup::new(softmax_categorical_sample::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("inp", n, dt))
+            .buffer(BenchBuffer::zeros("out", 1, DType::U32).output())
+            .buffer(BenchBuffer::from_vec(
+                "temperature_in",
+                pack_f32(&[1.0], DType::F32),
+                DType::F32,
+            ))
+            .buffer(BenchBuffer::from_vec("uniform_in", pack_f32(&[0.5], DType::F32), DType::F32))
+            .constexpr("n", n as u32)
+            .grid_3d(1, 1, 1, [256, 1, 1])
+            .bytes_moved((n * dt.size_bytes()) as u64)
+    }
+}

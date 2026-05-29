@@ -235,3 +235,37 @@ mod tests {
         println!("===== BEGIN MSL =====\n{}\n===== END MSL =====", msl);
     }
 }
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_gated_delta_prep_step;
+
+    // Grid `[dv, b*hv, 1]`, TG `[32,1,1]`, Reduction — identical geometry to
+    // `mt_gated_delta_step`. conv_out is the fused q|k|v slab of width
+    // `2·Hk·Dk + Hv·Dv`.
+    #[bench(name = "ffai/gated_delta_prep_step", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_prep_step(dt: DType) -> BenchSetup {
+        let (b, hv, hk, dv, dk) = (2usize, 4usize, 2usize, 64usize, 64usize);
+        let n_total = b * hv;
+        let conv_w = 2 * hk * dk + hv * dv;
+        BenchSetup::new(mt_gated_delta_prep_step::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("conv_out", b * conv_w, dt))
+            .buffer(BenchBuffer::random("a_log", hv, dt))
+            .buffer(BenchBuffer::random("dt_bias", hv, dt))
+            .buffer(BenchBuffer::random("a_raw", n_total, dt))
+            .buffer(BenchBuffer::random("b_raw", n_total, dt))
+            .buffer(BenchBuffer::random("q_norm_weight", hk * dk, dt))
+            .buffer(BenchBuffer::random("k_norm_weight", hk * dk, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * dv * dk, dt))
+            .buffer(BenchBuffer::zeros("state_out", n_total * dv * dk, dt).output())
+            .buffer(BenchBuffer::zeros("y", n_total * dv, dt).output())
+            .constexpr("dk", dk as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("hv", hv as u32)
+            .constexpr("hk", hk as u32)
+            .grid_3d(dv as u32, n_total as u32, 1, [32, 1, 1])
+            .bytes_moved((n_total * dv * dk * 2 * dt.size_bytes()) as u64)
+    }
+}

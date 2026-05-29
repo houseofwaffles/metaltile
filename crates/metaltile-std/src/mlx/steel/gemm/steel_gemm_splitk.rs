@@ -265,3 +265,114 @@ pub fn mt_steel_gemm_splitk_accum_axpby<T>(
     let res = alpha * acc + beta * prev;
     store(out[idx], res.cast::<T>());
 }
+
+/// New-syntax benches for the two-kernel split-K steel GEMM.
+///
+/// Pass 1 (`splitk_*`) — `m = n = 4096`, `k = 4096`, `N_SPLITS = 4`,
+/// `k_per_split = k / N_SPLITS = 1024` (multiple of 16). `SimdGroup2D`
+/// 3-D dispatch: grid is tile-group counts `(n/BN, m/BM, n_splits)` —
+/// `program_id<2>` selects the K-split — with `tpg = [WM*WN*32, 1, 1]`.
+/// The `partials` slab is fp32, length `n_splits*m*n` (`[split, M, N]`).
+///
+/// Pass 2 (`accum` / `accum_axpby`) — `Elementwise`, one thread per
+/// `[M, N]` output element: grid `m*n / tpg`. `accum` is a straight sum;
+/// `accum_axpby` adds a `c_in` residual scaled by `α` / `β`.
+///
+/// `bytes_moved` counts the dominant streams (A/B + partials write for
+/// pass 1; partials read + out for pass 2). Bench-only — correctness
+/// stays on the legacy GPU tests.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+    const N_SPLITS: u32 = 4;
+    /// Per-split K extent (`n_splits * k_per_split == k`, multiple of 16).
+    const K_PER_SPLIT: u32 = K / N_SPLITS;
+    /// Threads per group for the elementwise accum pass.
+    const ACCUM_TPG: u32 = 256;
+
+    // ── Pass 1 — split-K partial GEMM (SimdGroup2D, 3-D grid) ──────────────
+    fn pb(kernel: Kernel, bm: u32, bn: u32, tpg: u32, dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let f32_sz = DType::F32.size_bytes();
+        // A / B input streams (full K across all splits) + the fp32 partials.
+        let bytes = (m * k + k * n) * sz + N_SPLITS as usize * m * n * f32_sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::SimdGroup2D)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            .buffer(BenchBuffer::zeros("partials", N_SPLITS as usize * m * n, DType::F32).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("k", K)
+            .constexpr("k_per_split", K_PER_SPLIT)
+            .with_shape_label(format!(
+                "m{M} n{N} k{K} split{N_SPLITS} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(N / bn, M / bm, N_SPLITS, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/steel_gemm_splitk/bm64_bn64_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_splitk_64x64x16_2x2(dt: DType) -> BenchSetup {
+        pb(mt_steel_gemm_splitk_64x64x16_2x2::kernel_ir_for(dt), 64, 64, 128, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_splitk/bm32_bn32_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_splitk_32x32x16_2x2(dt: DType) -> BenchSetup {
+        pb(mt_steel_gemm_splitk_32x32x16_2x2::kernel_ir_for(dt), 32, 32, 128, dt)
+    }
+
+    // ── Pass 2 — partial-sum reduction (Elementwise, one thread / elem) ────
+    #[bench(name = "mlx/steel_gemm_splitk/accum", dtypes = [f32, f16, bf16])]
+    fn bench_splitk_accum(dt: DType) -> BenchSetup {
+        let (m, n) = (M as usize, N as usize);
+        let sz = dt.size_bytes();
+        let f32_sz = DType::F32.size_bytes();
+        // Read every fp32 partial; write the [M, N] output.
+        let bytes = N_SPLITS as usize * m * n * f32_sz + m * n * sz;
+        BenchSetup::new(mt_steel_gemm_splitk_accum::kernel_ir_for(dt))
+            .mode(KernelMode::Elementwise)
+            .buffer(BenchBuffer::random("partials", N_SPLITS as usize * m * n, DType::F32))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("n_splits", N_SPLITS)
+            .with_shape_label(format!(
+                "m{M} n{N} split{N_SPLITS} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_1d(m * n, ACCUM_TPG)
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/steel_gemm_splitk/accum_axpby", dtypes = [f32, f16, bf16])]
+    fn bench_splitk_accum_axpby(dt: DType) -> BenchSetup {
+        let (m, n) = (M as usize, N as usize);
+        let sz = dt.size_bytes();
+        let f32_sz = DType::F32.size_bytes();
+        // Partials read + c_in read + out write.
+        let bytes = N_SPLITS as usize * m * n * f32_sz + 2 * m * n * sz;
+        BenchSetup::new(mt_steel_gemm_splitk_accum_axpby::kernel_ir_for(dt))
+            .mode(KernelMode::Elementwise)
+            .buffer(BenchBuffer::random("partials", N_SPLITS as usize * m * n, DType::F32))
+            .buffer(BenchBuffer::random("c_in", m * n, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("n_splits", N_SPLITS)
+            .constexpr("alpha", 1.0f32)
+            .constexpr("beta", 1.0f32)
+            .with_shape_label(format!(
+                "m{M} n{N} split{N_SPLITS} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_1d(m * n, ACCUM_TPG)
+            .bytes_moved(bytes as u64)
+    }
+}

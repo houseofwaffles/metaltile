@@ -250,3 +250,72 @@ steel_gemm_fused_kernel!(
     64u32,
     "bm32_bn32_bk16_wm1_wn2"
 );
+
+/// New-syntax benches for the fused steel GEMM block-shape family.
+///
+/// Each shape runs the canonical 4096³ prefill problem (`m = n = k =
+/// 4096`, divisible by every `BM` / `BN` / 16). `SimdGroup2D` dispatch:
+/// the grid is **tile-group counts** `(n/BN, m/BM, 1)` — `program_id<0>`
+/// = N-block, `program_id<1>` = M-block — with `tpg = [WM*WN*32, 1, 1]`
+/// (one simdgroup per sub-tile). `bytes_moved` counts the three dominant
+/// matmul streams (A `m·k`, B `k·n`, C `m·n`). Bench-only — correctness
+/// stays on the legacy GPU-correctness tests.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::*;
+
+    /// Canonical production GEMM problem size (4096³).
+    const M: u32 = 4096;
+    const N: u32 = 4096;
+    const K: u32 = 4096;
+
+    /// Build a fused steel-GEMM bench for one block shape.
+    /// `bn` / `bm` are the output-block dims; `tpg` = `WM*WN*32`.
+    fn fb(kernel: Kernel, bm: u32, bn: u32, tpg: u32, dt: DType) -> BenchSetup {
+        let (m, n, k) = (M as usize, N as usize, K as usize);
+        let sz = dt.size_bytes();
+        let bytes = (m * k + k * n + m * n) * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::SimdGroup2D)
+            .buffer(BenchBuffer::random("a", m * k, dt))
+            .buffer(BenchBuffer::random("b", k * n, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("m", M)
+            .constexpr("n", N)
+            .constexpr("k", K)
+            .with_shape_label(format!("m{M} n{N} k{K} {}", crate::bench_types::dtype_label(dt)))
+            // SimdGroup2D grid is tile-GROUP counts: (n/BN, m/BM, 1).
+            .grid_3d(N / bn, M / bm, 1, [tpg, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/steel_gemm_fused/bm64_bn64_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_64x64x16_2x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_64x64x16_2x2::kernel_ir_for(dt), 64, 64, 128, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_fused/bm32_bn32_bk16_wm2_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_32x32x16_2x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_32x32x16_2x2::kernel_ir_for(dt), 32, 32, 128, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_fused/bm64_bn64_bk16_wm1_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_64x64x16_1x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_64x64x16_1x2::kernel_ir_for(dt), 64, 64, 64, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_fused/bm32_bn64_bk16_wm1_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_32x64x16_1x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_32x64x16_1x2::kernel_ir_for(dt), 32, 64, 64, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_fused/bm64_bn64_bk16_wm4_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_64x64x16_4x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_64x64x16_4x2::kernel_ir_for(dt), 64, 64, 256, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_fused/bm64_bn32_bk16_wm1_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_64x32x16_1x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_64x32x16_1x2::kernel_ir_for(dt), 64, 32, 64, dt)
+    }
+    #[bench(name = "mlx/steel_gemm_fused/bm32_bn32_bk16_wm1_wn2", dtypes = [f32, f16, bf16])]
+    fn bench_fused_32x32x16_1x2(dt: DType) -> BenchSetup {
+        fb(mt_steel_gemm_32x32x16_1x2::kernel_ir_for(dt), 32, 32, 64, dt)
+    }
+}

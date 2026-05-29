@@ -334,3 +334,140 @@ pub fn conv2d_mma<T>(
         simdgroup_elem_load(c_f11, 1).cast::<T>(),
     );
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::conv2d_mma;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Direct 2D conv oracle, pixel-major output `[n_pixels, out_ch]`.
+    /// stride=1, dilation=1, pad=0, no bias. f32.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_conv2d_mma(
+        input: &[f32],
+        weight: &[f32],
+        batch: usize,
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kh: usize,
+        kw: usize,
+    ) -> Vec<f32> {
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let out_hw = out_h * out_w;
+        let n_pixels = batch * out_hw;
+        let mut out = vec![0.0f32; n_pixels * out_ch];
+        for n in 0..batch {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let pixel = n * out_hw + oh * out_w + ow;
+                    for oc in 0..out_ch {
+                        let mut acc = 0.0f32;
+                        for ic in 0..in_ch {
+                            for ky in 0..kh {
+                                for kx in 0..kw {
+                                    let ih = oh + ky;
+                                    let iw = ow + kx;
+                                    let in_idx = ((n * in_ch + ic) * in_h + ih) * in_w + iw;
+                                    let w_idx = ((oc * in_ch + ic) * kh + ky) * kw + kx;
+                                    acc += input[in_idx] * weight[w_idx];
+                                }
+                            }
+                        }
+                        out[pixel * out_ch + oc] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mma_setup(
+        batch: usize,
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kh: usize,
+        kw: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let n_pixels = batch * out_h * out_w;
+        assert_eq!(out_ch % 32, 0, "out_ch must be a multiple of 32 for the MMA tile");
+        assert_eq!(n_pixels % 32, 0, "n_pixels must be a multiple of 32 for the MMA tile");
+        let n_out = n_pixels * out_ch;
+        let input_f = ramp(batch * in_ch * in_h * in_w, 13, 2.0);
+        let weight_f = ramp(out_ch * in_ch * kh * kw, 11, 2.0);
+        let input = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let expected = naive_conv2d_mma(&input, &weight, batch, in_ch, in_h, in_w, out_ch, kh, kw);
+        TestSetup::new(conv2d_mma::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((out_ch / 32) as u32, (n_pixels / 32) as u32, 1, [128, 1, 1])
+    }
+
+    // 3×3 conv: in 10×10 → out 8×8, n_pixels=64, out_ch=32.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv2d_mma_3x3(dt: DType) -> TestSetup { mma_setup(1, 4, 10, 10, 32, 3, 3, dt) }
+
+    // Multi-tile 1×1: batch=4, 8×8 image → n_pixels=256 (8 tiles), out_ch=32.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv2d_mma_multi_tile(dt: DType) -> TestSetup { mma_setup(4, 4, 8, 8, 32, 1, 1, dt) }
+}
+
+/// New-syntax bench for `conv2d_mma` (ViT-L patch14 stem, hidden 1024).
+/// Reduction mode, `grid_3d(out_ch/32, n_pixels/32, 1, [128,1,1])`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::conv2d_mma;
+
+    #[bench(name = "ffai/conv2d/mma", dtypes = [f32, f16, bf16])]
+    fn bench_conv2d_mma(dt: DType) -> BenchSetup {
+        // 14×14 stride-1 conv on a 32×32 feature map → out 19×19=361 px
+        // → not %32. Pick a 1×1 conv on a 32×32 map: n_pixels=1024, out_ch=1024.
+        let (batch, in_ch, in_h, in_w, out_ch, kh, kw) =
+            (1usize, 256usize, 32usize, 32usize, 1024usize, 1usize, 1usize);
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let n_pixels = batch * out_h * out_w;
+        let n_out = n_pixels * out_ch;
+        BenchSetup::new(conv2d_mma::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("input", batch * in_ch * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", out_ch * in_ch * kh * kw, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .grid_3d((out_ch / 32) as u32, (n_pixels / 32) as u32, 1, [128, 1, 1])
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+}

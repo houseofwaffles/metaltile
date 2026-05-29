@@ -296,3 +296,139 @@ pub fn patch_embed_mma<T>(
         (simdgroup_elem_load(c_f11, 1) + b11).cast::<T>(),
     );
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::patch_embed_mma;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Explicit unfold + projection + bias oracle. Output [num_patches, hidden]. f32.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_patch_embed_mma(
+        image: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        patch_h: usize,
+        patch_w: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let patch_dim = in_ch * patch_h * patch_w;
+        let input_plane = in_h * in_w;
+        let patches_h = in_h / patch_h;
+        let patches_w = in_w / patch_w;
+        let num_patches = patches_h * patches_w;
+        let mut out = vec![0.0f32; num_patches * hidden];
+        for ph in 0..patches_h {
+            for pw in 0..patches_w {
+                let pat = ph * patches_w + pw;
+                let py0 = ph * patch_h;
+                let px0 = pw * patch_w;
+                for h in 0..hidden {
+                    let mut acc = bias[h];
+                    for ic in 0..in_ch {
+                        for py in 0..patch_h {
+                            for px in 0..patch_w {
+                                let img_idx = ic * input_plane + (py0 + py) * in_w + (px0 + px);
+                                let w_idx =
+                                    h * patch_dim + ic * patch_h * patch_w + py * patch_w + px;
+                                acc += image[img_idx] * weight[w_idx];
+                            }
+                        }
+                    }
+                    out[pat * hidden + h] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mma_setup(
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        patch_h: usize,
+        patch_w: usize,
+        hidden: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let num_patches = (in_h / patch_h) * (in_w / patch_w);
+        let patch_dim = in_ch * patch_h * patch_w;
+        assert_eq!(hidden % 32, 0, "hidden must be a multiple of 32 for the MMA tile");
+        assert_eq!(num_patches % 32, 0, "num_patches must be a multiple of 32");
+        assert_eq!(patch_dim % 32, 0, "patch_dim must be a multiple of 32 for the K-loop");
+        let n_out = num_patches * hidden;
+        let image_f = ramp(in_ch * in_h * in_w, 13, 2.0);
+        let weight_f = ramp(hidden * patch_dim, 11, 2.0);
+        let bias_f = ramp(hidden, 5, 1.0);
+        let image = unpack_f32(&pack_f32(&image_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let bias = unpack_f32(&pack_f32(&bias_f, dt), dt);
+        let expected = naive_patch_embed_mma(
+            &image, &weight, &bias, in_ch, in_h, in_w, patch_h, patch_w, hidden,
+        );
+        TestSetup::new(patch_embed_mma::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("image", pack_f32(&image_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::from_vec("bias", pack_f32(&bias_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("patch_h", patch_h as u32)
+            .constexpr("patch_w", patch_w as u32)
+            .constexpr("hidden", hidden as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((hidden / 32) as u32, (num_patches / 32) as u32, 1, [128, 1, 1])
+    }
+
+    // 8×8 patch, 4-channel (patch_dim=256), hidden=32, 64×64 image → 64 patches.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_patch_embed_mma_8x8(dt: DType) -> TestSetup { mma_setup(4, 64, 64, 8, 8, 32, dt) }
+
+    // 4×4 patch, 8-channel (patch_dim=128), hidden=32, 32×32 image → 64 patches.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_patch_embed_mma_4x4(dt: DType) -> TestSetup { mma_setup(8, 32, 32, 4, 4, 32, dt) }
+}
+
+/// New-syntax bench for `patch_embed_mma` (ViT-L-ish 8×8 patch, hidden 1024).
+/// Reduction mode, `grid_3d(hidden/32, num_patches/32, 1, [128,1,1])`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::patch_embed_mma;
+
+    #[bench(name = "ffai/patch_embed/mma", dtypes = [f32, f16, bf16])]
+    fn bench_patch_embed_mma(dt: DType) -> BenchSetup {
+        // 8×8 patch, 4 channels (patch_dim=256), 256×256 image →
+        // 32×32 = 1024 patches, hidden 1024.
+        let (in_ch, in_h, in_w, patch_h, patch_w, hidden) =
+            (4usize, 256usize, 256usize, 8usize, 8usize, 1024usize);
+        let num_patches = (in_h / patch_h) * (in_w / patch_w);
+        let patch_dim = in_ch * patch_h * patch_w;
+        let n_out = num_patches * hidden;
+        BenchSetup::new(patch_embed_mma::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("image", in_ch * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", hidden * patch_dim, dt))
+            .buffer(BenchBuffer::random("bias", hidden, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("patch_h", patch_h as u32)
+            .constexpr("patch_w", patch_w as u32)
+            .constexpr("hidden", hidden as u32)
+            .grid_3d((hidden / 32) as u32, (num_patches / 32) as u32, 1, [128, 1, 1])
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+}

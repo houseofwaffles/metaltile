@@ -345,3 +345,36 @@ pub fn mt_gated_delta_wy_chunk<T>(
         store(state_out[state_base + ii], s.cast::<T>());
     }
 }
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_gated_delta_wy_chunk;
+
+    // Single-chunk shape (T = C) that fits the scalar TG-memory budget:
+    // Dk=32, Dv=16, C=16, Hk=Hv=1. `t_len` must be a multiple of `c`.
+    #[bench(name = "ffai/gated_delta_wy_chunk", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_wy_chunk(dt: DType) -> BenchSetup {
+        let (b, t, hk, hv, dk, dv, c) =
+            (1usize, 16usize, 1usize, 1usize, 32usize, 16usize, 16usize);
+        let n_total = b * hv;
+        BenchSetup::new(mt_gated_delta_wy_chunk::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", t * hk * dk, dt))
+            .buffer(BenchBuffer::random("k", t * hk * dk, dt))
+            .buffer(BenchBuffer::random("v", t * n_total * dv, dt))
+            .buffer(BenchBuffer::random("g", t * n_total, dt))
+            .buffer(BenchBuffer::random("beta", t * n_total, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * dv * dk, dt))
+            .buffer(BenchBuffer::zeros("state_out", n_total * dv * dk, dt).output())
+            .buffer(BenchBuffer::zeros("y", t * n_total * dv, dt).output())
+            .constexpr("dk", dk as u32)
+            .constexpr("dv", dv as u32)
+            .constexpr("hv", hv as u32)
+            .constexpr("hk", hk as u32)
+            .constexpr("c", c as u32)
+            .constexpr("t_len", t as u32)
+            .grid_3d(1, n_total as u32, 1, [32, 1, 1])
+            .bytes_moved((t * n_total * dv * dt.size_bytes()) as u64)
+    }
+}

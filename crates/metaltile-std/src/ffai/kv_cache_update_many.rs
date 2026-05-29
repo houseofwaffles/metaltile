@@ -77,3 +77,79 @@ pub fn kv_cache_update_many<T>(
     let dst_idx = h * max_seq * head_dim + position * head_dim + d;
     store(out[dst_idx], load(src[idx]));
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::kv_cache_update_many;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.0)]
+    fn test_kv_cache_update_many(dt: DType) -> TestSetup {
+        let (n_tokens, n_kv_heads, head_dim, max_seq) = (8usize, 8usize, 16usize, 32usize);
+        let sentinel = 999.0f32;
+        let src: Vec<f32> =
+            (0..n_tokens * n_kv_heads * head_dim).map(|i| (i as f32) * 0.01 - 1.0).collect();
+        // Distinct positions (no overlap → matches production prefill).
+        let positions: Vec<u32> = (0..n_tokens as u32).map(|r| r * 3 + 1).collect();
+        let cache = vec![sentinel; n_kv_heads * max_seq * head_dim];
+        let src_dt = unpack_f32(&pack_f32(&src, dt), dt);
+        let mut expected = unpack_f32(&pack_f32(&cache, dt), dt);
+        let row_stride = n_kv_heads * head_dim;
+        for (r, &pos_u32) in positions.iter().enumerate() {
+            let pos = pos_u32 as usize;
+            for h in 0..n_kv_heads {
+                for d in 0..head_dim {
+                    let s = r * row_stride + h * head_dim + d;
+                    let dst = h * max_seq * head_dim + pos * head_dim + d;
+                    expected[dst] = src_dt[s];
+                }
+            }
+        }
+        let total = n_tokens * n_kv_heads * head_dim;
+        TestSetup::new(kv_cache_update_many::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("src", pack_f32(&src, dt), dt))
+            .input(TestBuffer::from_vec("positions", u32_bytes(&positions), DType::U32))
+            .input(TestBuffer::from_vec("out", pack_f32(&cache, dt), dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("max_seq", max_seq as u32)
+            .constexpr("n_kv_heads_x_head_dim", (n_kv_heads * head_dim) as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(total, 256)
+    }
+}
+
+/// New-syntax benchmark for `kv_cache_update_many` — a Qwen-class prefill
+/// batch appended in one dispatch (Grid3D, one thread per source element).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::kv_cache_update_many;
+
+    fn u32_bytes(v: impl Iterator<Item = u32>) -> Vec<u8> {
+        v.flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[bench(name = "ffai/kv_cache/update_many", dtypes = [f32, f16, bf16])]
+    fn bench_kv_cache_update_many(dt: DType) -> BenchSetup {
+        let (n_tokens, n_kv_heads, head_dim, max_seq) = (512usize, 8usize, 128usize, 4096usize);
+        let total = n_tokens * n_kv_heads * head_dim;
+        BenchSetup::new(kv_cache_update_many::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("src", total, dt))
+            .buffer(BenchBuffer::from_vec(
+                "positions",
+                u32_bytes((0..n_tokens).map(|r| r as u32)),
+                DType::U32,
+            ))
+            .buffer(BenchBuffer::zeros("out", n_kv_heads * max_seq * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("max_seq", max_seq as u32)
+            .constexpr("n_kv_heads_x_head_dim", (n_kv_heads * head_dim) as u32)
+            .grid_1d(total, 256)
+            .bytes_moved((2 * total * dt.size_bytes()) as u64)
+    }
+}

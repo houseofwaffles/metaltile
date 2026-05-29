@@ -586,3 +586,322 @@ pub fn winograd_conv2d_3x3_split<T>(
     store(out[out_row1 + ow0], y10.cast::<T>());
     store(out[out_row1 + ow0 + 1u32], y11.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{winograd_conv2d_3x3, winograd_conv2d_3x3_split, winograd_filter_transform_3x3};
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Direct 3×3 stride-1 conv oracle (NCHW input, OIHW weight). Padding
+    /// taps contribute zero. f32.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn naive_conv3x3(
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        batch: usize,
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        pad: usize,
+    ) -> Vec<f32> {
+        let out_h = in_h + 2 * pad - 2;
+        let out_w = in_w + 2 * pad - 2;
+        let mut out = vec![0.0f32; batch * out_ch * out_h * out_w];
+        for n in 0..batch {
+            for oc in 0..out_ch {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut acc = bias[oc];
+                        for ic in 0..in_ch {
+                            for ky in 0..3 {
+                                for kx in 0..3 {
+                                    let ph = oh + ky;
+                                    let pw = ow + kx;
+                                    if ph < pad || ph >= pad + in_h || pw < pad || pw >= pad + in_w
+                                    {
+                                        continue;
+                                    }
+                                    let ih = ph - pad;
+                                    let iw = pw - pad;
+                                    let in_idx = ((n * in_ch + ic) * in_h + ih) * in_w + iw;
+                                    let w_idx = ((oc * in_ch + ic) * 3 + ky) * 3 + kx;
+                                    acc += input[in_idx] * weight[w_idx];
+                                }
+                            }
+                        }
+                        let o_idx = ((n * out_ch + oc) * out_h + oh) * out_w + ow;
+                        out[o_idx] = acc;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Filter transform oracle `U = G·g·Gᵀ` for one 3×3 filter `g` →
+    /// 4×4 `U`, row-major. Mirrors `winograd_filter_transform_3x3`.
+    fn filter_transform_one(g: &[f32]) -> [f32; 16] {
+        let (g00, g01, g02) = (g[0], g[1], g[2]);
+        let (g10, g11, g12) = (g[3], g[4], g[5]);
+        let (g20, g21, g22) = (g[6], g[7], g[8]);
+        // s = G·g (rows mix). G rows: [1,0,0] [½,½,½] [½,-½,½] [0,0,1].
+        let s00 = g00;
+        let s01 = g01;
+        let s02 = g02;
+        let s10 = 0.5 * (g00 + g10 + g20);
+        let s11 = 0.5 * (g01 + g11 + g21);
+        let s12 = 0.5 * (g02 + g12 + g22);
+        let s20 = 0.5 * (g00 - g10 + g20);
+        let s21 = 0.5 * (g01 - g11 + g21);
+        let s22 = 0.5 * (g02 - g12 + g22);
+        let s30 = g20;
+        let s31 = g21;
+        let s32 = g22;
+        // U = s·Gᵀ (columns mix).
+        [
+            s00,
+            0.5 * (s00 + s01 + s02),
+            0.5 * (s00 - s01 + s02),
+            s02,
+            s10,
+            0.5 * (s10 + s11 + s12),
+            0.5 * (s10 - s11 + s12),
+            s12,
+            s20,
+            0.5 * (s20 + s21 + s22),
+            0.5 * (s20 - s21 + s22),
+            s22,
+            s30,
+            0.5 * (s30 + s31 + s32),
+            0.5 * (s30 - s31 + s32),
+            s32,
+        ]
+    }
+
+    // ── winograd_conv2d_3x3 (single kernel) ──────────────────────────────
+
+    fn conv_setup(
+        batch: usize,
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        pad: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let out_h = in_h + 2 * pad - 2;
+        let out_w = in_w + 2 * pad - 2;
+        assert!(
+            out_h.is_multiple_of(2) && out_w.is_multiple_of(2),
+            "Winograd needs even output dims"
+        );
+        let (tiles_h, tiles_w) = (out_h / 2, out_w / 2);
+        let n_out = batch * out_ch * out_h * out_w;
+        let n_tiles = batch * out_ch * tiles_h * tiles_w;
+        let input_f = ramp(batch * in_ch * in_h * in_w, 13, 4.0);
+        let weight_f = ramp(out_ch * in_ch * 9, 11, 2.0);
+        let bias_f = ramp(out_ch, 5, 1.0);
+        let input = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let bias = unpack_f32(&pack_f32(&bias_f, dt), dt);
+        let expected = naive_conv3x3(&input, &weight, &bias, batch, in_ch, in_h, in_w, out_ch, pad);
+        TestSetup::new(winograd_conv2d_3x3::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::from_vec("bias", pack_f32(&bias_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("pad_h", pad as u32)
+            .constexpr("pad_w", pad as u32)
+            .constexpr("tiles_h", tiles_h as u32)
+            .constexpr("tiles_w", tiles_w as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_tiles, 64)
+    }
+
+    // Unpadded single-channel — the minimal transform check (in 8×8 → out 6×6).
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_winograd_unpadded(dt: DType) -> TestSetup { conv_setup(1, 1, 8, 8, 1, 0, dt) }
+
+    // Padded multi-channel — clamp on every tile edge + per-channel accum.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_winograd_padded(dt: DType) -> TestSetup { conv_setup(2, 4, 8, 10, 5, 1, dt) }
+
+    // ── winograd_filter_transform_3x3 ────────────────────────────────────
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_winograd_filter_transform(dt: DType) -> TestSetup {
+        let (out_ch, in_ch) = (5usize, 4usize);
+        let n_filt = out_ch * in_ch;
+        let weight_f = ramp(n_filt * 9, 11, 2.0);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let mut expected = vec![0.0f32; n_filt * 16];
+        for f in 0..n_filt {
+            let u = filter_transform_one(&weight[f * 9..f * 9 + 9]);
+            expected[f * 16..f * 16 + 16].copy_from_slice(&u);
+        }
+        TestSetup::new(winograd_filter_transform_3x3::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_filt * 16, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_filt, 64)
+    }
+
+    // ── winograd_conv2d_3x3_split (consumes pre-transformed U) ────────────
+
+    fn split_setup(
+        batch: usize,
+        in_ch: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        pad: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let out_h = in_h + 2 * pad - 2;
+        let out_w = in_w + 2 * pad - 2;
+        assert!(
+            out_h.is_multiple_of(2) && out_w.is_multiple_of(2),
+            "Winograd needs even output dims"
+        );
+        let (tiles_h, tiles_w) = (out_h / 2, out_w / 2);
+        let n_out = batch * out_ch * out_h * out_w;
+        let n_tiles = batch * out_ch * tiles_h * tiles_w;
+        let input_f = ramp(batch * in_ch * in_h * in_w, 13, 4.0);
+        let weight_f = ramp(out_ch * in_ch * 9, 11, 2.0);
+        let bias_f = ramp(out_ch, 5, 1.0);
+        let input = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let bias = unpack_f32(&pack_f32(&bias_f, dt), dt);
+        // Pre-transform every filter on the CPU into the [out_ch, in_ch, 4, 4]
+        // U buffer the split kernel consumes — packed/rounded through `dt`
+        // so the kernel sees the same precision a real two-pass run would.
+        let n_filt = out_ch * in_ch;
+        let mut u_f = vec![0.0f32; n_filt * 16];
+        for f in 0..n_filt {
+            let u = filter_transform_one(&weight[f * 9..f * 9 + 9]);
+            u_f[f * 16..f * 16 + 16].copy_from_slice(&u);
+        }
+        let expected = naive_conv3x3(&input, &weight, &bias, batch, in_ch, in_h, in_w, out_ch, pad);
+        TestSetup::new(winograd_conv2d_3x3_split::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::from_vec("u", pack_f32(&u_f, dt), dt))
+            .input(TestBuffer::from_vec("bias", pack_f32(&bias_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("pad_h", pad as u32)
+            .constexpr("pad_w", pad as u32)
+            .constexpr("tiles_h", tiles_h as u32)
+            .constexpr("tiles_w", tiles_w as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_tiles, 64)
+    }
+
+    // bf16 tol 8e-2: F(2×2,3×3) Winograd accumulates more rounding than direct
+    // conv, and the split path stages the filter transform through bf16 too.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 8e-2])]
+    fn test_winograd_split(dt: DType) -> TestSetup { split_setup(2, 4, 8, 10, 5, 1, dt) }
+}
+
+/// New-syntax benches for the Winograd family. Grid3D. The conv kernels
+/// run one thread per 2×2 tile; the filter transform one per (oc, ic).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{winograd_conv2d_3x3, winograd_conv2d_3x3_split, winograd_filter_transform_3x3};
+
+    #[bench(name = "ffai/conv2d/winograd_3x3", dtypes = [f32, f16, bf16])]
+    fn bench_winograd_3x3(dt: DType) -> BenchSetup {
+        // ResNet-ish 3×3 stride-1 pad-1: 64ch 56×56.
+        let (batch, in_ch, in_h, in_w, out_ch, pad) =
+            (1usize, 64usize, 56usize, 56usize, 64usize, 1usize);
+        let out_h = in_h + 2 * pad - 2;
+        let out_w = in_w + 2 * pad - 2;
+        let (tiles_h, tiles_w) = (out_h / 2, out_w / 2);
+        let n_out = batch * out_ch * out_h * out_w;
+        let n_tiles = batch * out_ch * tiles_h * tiles_w;
+        BenchSetup::new(winograd_conv2d_3x3::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("input", batch * in_ch * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", out_ch * in_ch * 9, dt))
+            .buffer(BenchBuffer::random("bias", out_ch, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("pad_h", pad as u32)
+            .constexpr("pad_w", pad as u32)
+            .constexpr("tiles_h", tiles_h as u32)
+            .constexpr("tiles_w", tiles_w as u32)
+            .grid_1d(n_tiles, 64)
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+
+    #[bench(name = "ffai/conv2d/winograd_filter_transform_3x3", dtypes = [f32, f16, bf16])]
+    fn bench_winograd_filter_transform(dt: DType) -> BenchSetup {
+        let (out_ch, in_ch) = (256usize, 256usize);
+        let n_filt = out_ch * in_ch;
+        BenchSetup::new(winograd_filter_transform_3x3::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("weight", n_filt * 9, dt))
+            .buffer(BenchBuffer::zeros("out", n_filt * 16, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .grid_1d(n_filt, 64)
+            .bytes_moved((n_filt * 16 * dt.size_bytes()) as u64)
+    }
+
+    #[bench(name = "ffai/conv2d/winograd_3x3_split", dtypes = [f32, f16, bf16])]
+    fn bench_winograd_3x3_split(dt: DType) -> BenchSetup {
+        let (batch, in_ch, in_h, in_w, out_ch, pad) =
+            (1usize, 64usize, 56usize, 56usize, 64usize, 1usize);
+        let out_h = in_h + 2 * pad - 2;
+        let out_w = in_w + 2 * pad - 2;
+        let (tiles_h, tiles_w) = (out_h / 2, out_w / 2);
+        let n_out = batch * out_ch * out_h * out_w;
+        let n_tiles = batch * out_ch * tiles_h * tiles_w;
+        BenchSetup::new(winograd_conv2d_3x3_split::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("input", batch * in_ch * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("u", out_ch * in_ch * 16, dt))
+            .buffer(BenchBuffer::random("bias", out_ch, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("pad_h", pad as u32)
+            .constexpr("pad_w", pad as u32)
+            .constexpr("tiles_h", tiles_h as u32)
+            .constexpr("tiles_w", tiles_w as u32)
+            .grid_1d(n_tiles, 64)
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+}

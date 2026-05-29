@@ -343,3 +343,129 @@ aura_flash_p1_kernel!(
     1u32,
     "flash_p1_causal_kb4_vb2_d64"
 );
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        aura_flash_p1_causal_kb4_vb2_d64,
+        aura_flash_p1_causal_kb4_vb2_d128,
+        aura_flash_p1_kb4_vb2_d64,
+        aura_flash_p1_kb4_vb2_d128,
+        aura_flash_p1_kb4_vb4_d64,
+        aura_flash_p1_kb4_vb4_d128,
+    };
+
+    // Shared builder for every (kb, vb, dim) flash-p1 variant. The grid is
+    // (1, q_heads, num_blocks) with a 32-lane threadgroup; only the
+    // dim-dependent packed widths and codebook sizes vary per variant.
+    // `causal` selects q_position so the causal kernels exercise their
+    // clamped inner loop (mid-stream query) vs the non-causal full sweep.
+    fn flash_p1(
+        s: BenchSetup,
+        dt: DType,
+        dim: usize,
+        key_bits: usize,
+        val_bits: usize,
+        causal: bool,
+    ) -> BenchSetup {
+        let (q_heads, kv_heads, tokens) = (32usize, 8usize, 4096usize);
+        let repeat = q_heads / kv_heads;
+        let block_size = 256usize;
+        let num_blocks = tokens.div_ceil(block_size);
+        let kv_stride = tokens;
+        let key_pw = (dim * key_bits).div_ceil(32);
+        let val_pw = (dim * val_bits).div_ceil(32);
+        // Causal: place the query mid-stream so roughly half the blocks
+        // contribute. Non-causal: ignored by the kernel (constexpr-folded).
+        let q_position = if causal { tokens / 2 } else { tokens - 1 };
+
+        s.mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("q_rot", q_heads * dim, dt))
+            .buffer(BenchBuffer::random("key_packed", kv_heads * kv_stride * key_pw, DType::U32))
+            .buffer(BenchBuffer::random("key_norms", kv_heads * kv_stride, dt))
+            .buffer(BenchBuffer::random("key_codebook", 1 << key_bits, dt))
+            .buffer(BenchBuffer::random("val_packed", kv_heads * kv_stride * val_pw, DType::U32))
+            .buffer(BenchBuffer::random("val_norms", kv_heads * kv_stride, dt))
+            .buffer(BenchBuffer::random("val_codebook", 1 << val_bits, dt))
+            .buffer(BenchBuffer::zeros("o_partials", q_heads * num_blocks * dim, dt).output())
+            .buffer(BenchBuffer::zeros("m_partials", q_heads * num_blocks, dt).output())
+            .buffer(BenchBuffer::zeros("l_partials", q_heads * num_blocks, dt).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("key_packed_width", key_pw as u32)
+            .constexpr("value_packed_width", val_pw as u32)
+            .constexpr("tokens", tokens as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("repeat_count", repeat as u32)
+            .constexpr("num_blocks", num_blocks as u32)
+            .constexpr("block_size", block_size as u32)
+            .constexpr("q_position", q_position as u32)
+            // K+V packed reads dominate.
+            .bytes_moved((kv_heads * kv_stride * (key_pw + val_pw) * 4) as u64)
+            .grid_3d(1, q_heads as u32, num_blocks as u32, [32, 1, 1])
+    }
+
+    #[bench(name = "ffai/aura_flash_p1_kb4_vb2_d128", dtypes = [f32, f16, bf16])]
+    fn bench_flash_p1(dt: DType) -> BenchSetup {
+        // Production: head_dim 128, kb=4 vb=2, decode-time KV of 4096 tokens.
+        flash_p1(
+            BenchSetup::new(aura_flash_p1_kb4_vb2_d128::kernel_ir_for(dt)),
+            dt,
+            128,
+            4,
+            2,
+            false,
+        )
+    }
+
+    #[bench(name = "ffai/aura_flash_p1_kb4_vb4_d128", dtypes = [f32, f16, bf16])]
+    fn bench_flash_p1_kb4_vb4_d128(dt: DType) -> BenchSetup {
+        // Symmetric aura4v4 on head_dim 128.
+        flash_p1(
+            BenchSetup::new(aura_flash_p1_kb4_vb4_d128::kernel_ir_for(dt)),
+            dt,
+            128,
+            4,
+            4,
+            false,
+        )
+    }
+
+    #[bench(name = "ffai/aura_flash_p1_kb4_vb2_d64", dtypes = [f32, f16, bf16])]
+    fn bench_flash_p1_kb4_vb2_d64(dt: DType) -> BenchSetup {
+        // aura4v2 on head_dim 64 (Llama 3.2 1B, GPT-OSS sliding window).
+        flash_p1(BenchSetup::new(aura_flash_p1_kb4_vb2_d64::kernel_ir_for(dt)), dt, 64, 4, 2, false)
+    }
+
+    #[bench(name = "ffai/aura_flash_p1_kb4_vb4_d64", dtypes = [f32, f16, bf16])]
+    fn bench_flash_p1_kb4_vb4_d64(dt: DType) -> BenchSetup {
+        // Symmetric aura4v4 on head_dim 64.
+        flash_p1(BenchSetup::new(aura_flash_p1_kb4_vb4_d64::kernel_ir_for(dt)), dt, 64, 4, 4, false)
+    }
+
+    #[bench(name = "ffai/aura_flash_p1_causal_kb4_vb2_d128", dtypes = [f32, f16, bf16])]
+    fn bench_flash_p1_causal_kb4_vb2_d128(dt: DType) -> BenchSetup {
+        // Causal prefill/chunked form, aura4v2 on head_dim 128.
+        flash_p1(
+            BenchSetup::new(aura_flash_p1_causal_kb4_vb2_d128::kernel_ir_for(dt)),
+            dt,
+            128,
+            4,
+            2,
+            true,
+        )
+    }
+
+    #[bench(name = "ffai/aura_flash_p1_causal_kb4_vb2_d64", dtypes = [f32, f16, bf16])]
+    fn bench_flash_p1_causal_kb4_vb2_d64(dt: DType) -> BenchSetup {
+        // Causal prefill/chunked form, aura4v2 on head_dim 64.
+        flash_p1(
+            BenchSetup::new(aura_flash_p1_causal_kb4_vb2_d64::kernel_ir_for(dt)),
+            dt,
+            64,
+            4,
+            2,
+            true,
+        )
+    }
+}

@@ -239,3 +239,34 @@ mod tests {
         assert_eq!(setup, DType::F16, "bf16 activation must stage as half");
     }
 }
+
+/// New-syntax benchmark for the MPP MoE int8 BGEMM (BM=8). Bench-only:
+/// correctness covered by the int4 MPP bm8 test + legacy int8 A/B test.
+/// `bits=8` → `k_in/4` u32 weight words/row.
+///
+/// Grid (Reduction, 1 simdgroup per TG): `grid_3d(n_out/32, ceil(m_total/8), 1, [32,1,1])`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_moe_gather_qmm_mma_int8_bm8_mpp;
+    use crate::ffai::moe_mpp_shared::{MmaBenchShape, int4_mma_bench};
+
+    #[bench(name = "ffai/moe_mpp/gather_qmm_mma_int8_bm8", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_int8_bm8_mpp(dt: DType) -> BenchSetup {
+        int4_mma_bench(
+            mt_moe_gather_qmm_mma_int8_bm8_mpp::kernel_ir_for(dt),
+            MmaBenchShape {
+                bits: 8,
+                bn: 32,
+                bm: 8,
+                tpg: 32,
+                m_total: 1024,
+                n_out: 256,
+                k_in: 2048,
+                n_experts: 128,
+                group_size: 64,
+            },
+            dt,
+        )
+    }
+}

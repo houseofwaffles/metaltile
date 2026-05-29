@@ -239,3 +239,77 @@ aura_flash_sdpa_kernel!(
     2u32,
     "flash_sdpa_kb4_vb4_d64"
 );
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    // Decode-class shape: 32 Q heads, GQA fan-out 4, 512-token cache.
+    const Q_HEADS: usize = 32;
+    const KV_HEADS: usize = 8;
+    const TOKENS: usize = 512;
+
+    // `key_bits`/`value_bits` set the packed-width and codebook (level)
+    // sizes: packed_width = dim / (32 / bits); levels = 2^bits.
+    fn setup(
+        ir: metaltile::core::ir::Kernel,
+        dim: usize,
+        key_bits: usize,
+        value_bits: usize,
+        dt: DType,
+    ) -> BenchSetup {
+        let key_pw = dim / (32 / key_bits);
+        let val_pw = dim / (32 / value_bits);
+        let key_levels = 1usize << key_bits;
+        let value_levels = 1usize << value_bits;
+        let repeat = Q_HEADS / KV_HEADS;
+        let kv_stride = TOKENS;
+        let kv_rows = KV_HEADS * kv_stride;
+        let bytes = Q_HEADS * dim * 4
+            + kv_rows * key_pw * 4
+            + kv_rows * val_pw * 4
+            + kv_rows * 2 * 4
+            + Q_HEADS * dim * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("q_rot", Q_HEADS * dim, DType::F32))
+            .buffer(BenchBuffer::random("key_packed", kv_rows * key_pw, DType::U32))
+            .buffer(BenchBuffer::random("key_norms", kv_rows, DType::F32))
+            .buffer(BenchBuffer::random("key_codebook", key_levels, DType::F32))
+            .buffer(BenchBuffer::random("val_packed", kv_rows * val_pw, DType::U32))
+            .buffer(BenchBuffer::random("val_norms", kv_rows, DType::F32))
+            .buffer(BenchBuffer::random("val_codebook", value_levels, DType::F32))
+            .buffer(BenchBuffer::random("sinks", Q_HEADS, DType::F32))
+            .buffer(BenchBuffer::zeros("out", Q_HEADS * dim, dt).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("key_packed_width", key_pw as u32)
+            .constexpr("value_packed_width", val_pw as u32)
+            .constexpr("tokens", TOKENS as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("repeat_count", repeat as u32)
+            .constexpr("num_q_heads", Q_HEADS as u32)
+            .constexpr("has_sinks", 0u32)
+            .constexpr("window_size", 0u32)
+            .grid_3d(1, Q_HEADS as u32, 1, [32, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/aura_flash_sdpa_kb4_vb2_d128", dtypes = [f32, f16, bf16])]
+    fn bench_kb4_vb2_d128(dt: DType) -> BenchSetup {
+        setup(super::aura_flash_sdpa_kb4_vb2_d128::kernel_ir_for(dt), 128, 4, 2, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_sdpa_kb4_vb4_d128", dtypes = [f32, f16, bf16])]
+    fn bench_kb4_vb4_d128(dt: DType) -> BenchSetup {
+        setup(super::aura_flash_sdpa_kb4_vb4_d128::kernel_ir_for(dt), 128, 4, 4, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_sdpa_kb4_vb2_d64", dtypes = [f32, f16, bf16])]
+    fn bench_kb4_vb2_d64(dt: DType) -> BenchSetup {
+        setup(super::aura_flash_sdpa_kb4_vb2_d64::kernel_ir_for(dt), 64, 4, 2, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_sdpa_kb4_vb4_d64", dtypes = [f32, f16, bf16])]
+    fn bench_kb4_vb4_d64(dt: DType) -> BenchSetup {
+        setup(super::aura_flash_sdpa_kb4_vb4_d64::kernel_ir_for(dt), 64, 4, 4, dt)
+    }
+}

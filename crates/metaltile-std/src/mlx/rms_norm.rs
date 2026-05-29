@@ -436,7 +436,7 @@ pub mod kernel_tests {
 pub mod kernel_benches {
     use metaltile::{bench, test::*};
 
-    use super::mt_rms_norm;
+    use super::{mt_gated_mixer_norm, mt_rms_norm, mt_rms_norm_small, mt_rms_norm_wide};
 
     #[bench(name = "mlx/rms_norm", dtypes = [f32, f16, bf16])]
     fn bench_rms_norm(dt: DType) -> BenchSetup {
@@ -450,5 +450,56 @@ pub mod kernel_benches {
             .constexpr("n", n as u32)
             .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
             .bytes_moved((2 * rows * n * dt.size_bytes()) as u64)
+    }
+
+    // rms_norm_small: 2 elements per thread → tpg = n/2. Per-head shape
+    // (head_dim=64, 1024 rows) matching the legacy bench(b=1024, n=64).
+    #[bench(name = "mlx/rms_norm/rms_norm_small", dtypes = [f32, f16, bf16])]
+    fn bench_rms_norm_small(dt: DType) -> BenchSetup {
+        let (rows, n) = (1024usize, 64usize);
+        BenchSetup::new(mt_rms_norm_small::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", rows * n, dt))
+            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("n", n as u32)
+            .grid_3d(rows as u32, 1, 1, [(n / 2) as u32, 1, 1])
+            .bytes_moved((2 * rows * n * dt.size_bytes()) as u64)
+    }
+
+    // rms_norm_wide: strided over the row, one threadgroup (tpg=1024) per
+    // row. Handles rows wider than the 4096 cap of mt_rms_norm — use a
+    // large-hidden shape (n=5376, Gemma-class) to exercise the strided path.
+    #[bench(name = "mlx/rms_norm/rms_norm_wide", dtypes = [f32, f16, bf16])]
+    fn bench_rms_norm_wide(dt: DType) -> BenchSetup {
+        let (rows, n) = (4096usize, 5376usize);
+        const TPG: u32 = 1024;
+        BenchSetup::new(mt_rms_norm_wide::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", rows * n, dt))
+            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("n", n as u32)
+            .grid_3d(rows as u32, 1, 1, [TPG, 1, 1])
+            .bytes_moved((2 * rows * n * dt.size_bytes()) as u64)
+    }
+
+    // gated_mixer_norm: out = rms_norm(y, w) · silu(z). N = tpg*4. `y` is
+    // fp32 (recurrence output); z/w/out in model dtype. GDN-mixer shape.
+    #[bench(name = "mlx/rms_norm/gated_mixer_norm", dtypes = [f32, f16, bf16])]
+    fn bench_gated_mixer_norm(dt: DType) -> BenchSetup {
+        let (rows, n) = (4096usize, 512usize);
+        BenchSetup::new(mt_gated_mixer_norm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("y", rows * n, DType::F32))
+            .buffer(BenchBuffer::random("z", rows * n, dt))
+            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("n", n as u32)
+            .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
+            .bytes_moved(((rows * n) * (DType::F32.size_bytes() + 2 * dt.size_bytes())) as u64)
     }
 }

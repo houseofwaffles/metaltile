@@ -94,3 +94,97 @@ pub fn ffai_gemm<T>(
         }
     }
 }
+
+/// New-syntax correctness tests for `ffai_gemm` — the multi-row 32×32-tiled
+/// GEMM `out[r, :] = weight · input[r, :]`. Reduction-mode (threadgroup-memory
+/// tiles + barriers).
+///
+/// Oracle: straight triple-loop `out[r, o] = Σ_k weight[o, k]·input[r, k]` in
+/// f32. Inputs are dtype-rounded so the oracle matches the kernel's load-cast.
+/// Covers an aligned shape (dims multiples of 32) and an edge shape (n_rows /
+/// out_dim NOT multiples of 32 — exercises the in-kernel load-clamp + store-skip);
+/// in_dim stays a multiple of 16 (the K-tile contract).
+///
+/// Grid: `grid_3d((out_dim+31)/32, (n_rows+31)/32, 1, [1024, 1, 1])` — one TG per
+/// 32×32 output tile, 1024 threads (BM·BN) cooperatively load tiles + one output
+/// each.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_gemm;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// Triple-loop reference: out[r, o] = Σ_k weight[o, k] · input[r, k].
+    fn gemm_oracle(
+        weight: &[f32],
+        input: &[f32],
+        n_rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_rows * out_dim];
+        for r in 0..n_rows {
+            for o in 0..out_dim {
+                let mut acc = 0.0f32;
+                for k in 0..in_dim {
+                    acc += weight[o * in_dim + k] * input[r * in_dim + k];
+                }
+                out[r * out_dim + o] = acc;
+            }
+        }
+        out
+    }
+
+    fn gemm_setup(n_rows: usize, in_dim: usize, out_dim: usize, dt: DType) -> TestSetup {
+        let weight_f: Vec<f32> =
+            (0..out_dim * in_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let input_f: Vec<f32> =
+            (0..n_rows * in_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.04).collect();
+        let w = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let x = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let expected = gemm_oracle(&w, &x, n_rows, in_dim, out_dim);
+        TestSetup::new(ffai_gemm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_rows * out_dim, dt))
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("out_dim", out_dim as u32)
+            .constexpr("n_rows", n_rows as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(out_dim.div_ceil(32) as u32, n_rows.div_ceil(32) as u32, 1, [1024, 1, 1])
+    }
+
+    // Aligned: n_rows / out_dim multiples of 32, in_dim a multiple of 16.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_gemm_aligned(dt: DType) -> TestSetup { gemm_setup(32, 64, 64, dt) }
+
+    // Edge: n_rows / out_dim NOT multiples of 32 (load-clamp + store-skip).
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_gemm_edge(dt: DType) -> TestSetup { gemm_setup(20, 48, 100, dt) }
+}
+
+/// New-syntax benchmark for `ffai_gemm`. Nemotron-class block-diffusion shape:
+/// a 32-row block projected through a `[out_dim, in_dim]` weight (hidden 4096).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_gemm;
+
+    #[bench(name = "ffai/gemm/gemm", dtypes = [f32, f16, bf16])]
+    fn bench_gemm(dt: DType) -> BenchSetup {
+        let (n_rows, in_dim, out_dim) = (32usize, 4096usize, 4096usize);
+        let sz = dt.size_bytes();
+        let bytes = out_dim * in_dim * sz + n_rows * in_dim * sz + n_rows * out_dim * sz;
+        BenchSetup::new(ffai_gemm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("weight", out_dim * in_dim, dt))
+            .buffer(BenchBuffer::random("input", n_rows * in_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_rows * out_dim, dt).output())
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("out_dim", out_dim as u32)
+            .constexpr("n_rows", n_rows as u32)
+            .grid_3d(out_dim.div_ceil(32) as u32, n_rows.div_ceil(32) as u32, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}

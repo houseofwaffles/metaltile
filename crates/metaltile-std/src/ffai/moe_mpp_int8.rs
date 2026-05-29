@@ -251,3 +251,34 @@ mod tests {
         assert!(msl.contains("kernel void mt_moe_gather_qmm_mma_int8_bm16_mpp_f32"));
     }
 }
+
+/// New-syntax benchmark for the MPP MoE int8 BGEMM (BM=16). Bench-only:
+/// correctness is covered by the int4 MPP bm16 test (same tiling) plus the
+/// legacy int8 bit-width A/B test. `bits=8` → `k_in/4` u32 weight words/row.
+///
+/// Grid (Reduction, 1 simdgroup per TG): `grid_3d(n_out/32, ceil(m_total/16), 1, [32,1,1])`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_moe_gather_qmm_mma_int8_bm16_mpp;
+    use crate::ffai::moe_mpp_shared::{MmaBenchShape, int4_mma_bench};
+
+    #[bench(name = "ffai/moe_mpp/gather_qmm_mma_int8_bm16", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_int8_bm16_mpp(dt: DType) -> BenchSetup {
+        int4_mma_bench(
+            mt_moe_gather_qmm_mma_int8_bm16_mpp::kernel_ir_for(dt),
+            MmaBenchShape {
+                bits: 8,
+                bn: 32,
+                bm: 16,
+                tpg: 32,
+                m_total: 1024,
+                n_out: 256,
+                k_in: 2048,
+                n_experts: 128,
+                group_size: 64,
+            },
+            dt,
+        )
+    }
+}

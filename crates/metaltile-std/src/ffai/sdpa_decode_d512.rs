@@ -341,3 +341,32 @@ mod tests {
         }
     }
 }
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_sdpa_decode_d512;
+
+    #[bench(name = "ffai/sdpa_decode_d512", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_decode_d512(dt: DType) -> BenchSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 512usize);
+        let (n_kv, kv_stride) = (4096usize, 4096usize);
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let bytes = (2 * n_q_heads * head_dim + 2 * n_kv_heads * n_kv * head_dim) * dt.size_bytes();
+        BenchSetup::new(ffai_sdpa_decode_d512::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", n_q_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("k", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_q_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_kv", n_kv as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            // TPG=512 (16 SG), not 1024 — see DISPATCH INVARIANTS.
+            .grid_3d(n_q_heads as u32, 1, 1, [512, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}

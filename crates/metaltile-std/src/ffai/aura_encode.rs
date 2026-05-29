@@ -213,3 +213,57 @@ aura_encode_kernel!(aura_encode_int3, 3u32, 8u32, "encode_int3");
 aura_encode_kernel!(aura_encode_int4, 4u32, 16u32, "encode_int4");
 aura_encode_kernel!(aura_encode_int6, 6u32, 64u32, "encode_int6");
 aura_encode_kernel!(aura_encode_int8, 8u32, 256u32, "encode_int8");
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        aura_encode_int2,
+        aura_encode_int3,
+        aura_encode_int4,
+        aura_encode_int6,
+        aura_encode_int8,
+    };
+
+    fn setup(s: BenchSetup, dim: usize, bits: usize, rows: usize, dt: DType) -> BenchSetup {
+        let packed_width = (dim * bits).div_ceil(32);
+        let levels = 1usize << bits;
+        s.mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("input", rows * dim, dt))
+            .buffer(BenchBuffer::random("rotation", dim * dim, DType::F32))
+            .buffer(BenchBuffer::random("boundaries", levels - 1, DType::F32))
+            .buffer(BenchBuffer::random("codebook", levels, DType::F32))
+            .buffer(BenchBuffer::zeros("packed_out", rows * packed_width, DType::U32).output())
+            .buffer(BenchBuffer::zeros("norms_out", rows, DType::F32).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("packed_width", packed_width as u32)
+            // Rotation matmul dominates: rows reads of a dim×dim f32 matrix.
+            .bytes_moved((rows * dim * dim * 4) as u64)
+            .grid_3d(rows as u32, 1, 1, [dim as u32, 1, 1])
+    }
+
+    #[bench(name = "ffai/aura_encode_int2", dtypes = [f32, f16, bf16])]
+    fn bench_int2(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_encode_int2::kernel_ir_for(dt)), 128, 2, 256, dt)
+    }
+
+    #[bench(name = "ffai/aura_encode_int3", dtypes = [f32, f16, bf16])]
+    fn bench_int3(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_encode_int3::kernel_ir_for(dt)), 128, 3, 256, dt)
+    }
+
+    #[bench(name = "ffai/aura_encode_int4", dtypes = [f32, f16, bf16])]
+    fn bench_int4(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_encode_int4::kernel_ir_for(dt)), 128, 4, 256, dt)
+    }
+
+    #[bench(name = "ffai/aura_encode_int6", dtypes = [f32, f16, bf16])]
+    fn bench_int6(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_encode_int6::kernel_ir_for(dt)), 128, 6, 256, dt)
+    }
+
+    #[bench(name = "ffai/aura_encode_int8", dtypes = [f32, f16, bf16])]
+    fn bench_int8(dt: DType) -> BenchSetup {
+        setup(BenchSetup::new(aura_encode_int8::kernel_ir_for(dt)), 128, 8, 256, dt)
+    }
+}

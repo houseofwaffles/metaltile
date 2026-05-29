@@ -779,3 +779,106 @@ pub fn sdpa_decode_2pass_pass2_d256<T>(
 // production decode dim (d=128, the base) needs the Swift wrapper
 // at this point. Add per-dim registrations here as FFAI starts
 // dispatching them.
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        sdpa_decode_2pass_pass1,
+        sdpa_decode_2pass_pass1_d64,
+        sdpa_decode_2pass_pass1_d96,
+        sdpa_decode_2pass_pass1_d256,
+        sdpa_decode_2pass_pass2,
+        sdpa_decode_2pass_pass2_d64,
+        sdpa_decode_2pass_pass2_d96,
+        sdpa_decode_2pass_pass2_d256,
+    };
+
+    // Shared decode shape (Qwen3-class GQA, 4096 context, 32-block 2-pass).
+    const N_Q_HEADS: usize = 32;
+    const N_KV_HEADS: usize = 8;
+    const N_KV: usize = 4096;
+    const BLOCKS: usize = 32;
+
+    fn pass1(ir: metaltile::core::ir::Kernel, head_dim: usize, dt: DType) -> BenchSetup {
+        let gqa_factor = N_Q_HEADS / N_KV_HEADS;
+        let kv_stride = N_KV;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let partial_len = N_Q_HEADS * BLOCKS * head_dim;
+        let ml_len = N_Q_HEADS * BLOCKS;
+        let bytes = (N_Q_HEADS * head_dim + 2 * N_KV_HEADS * N_KV * head_dim + partial_len)
+            * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", N_Q_HEADS * head_dim, dt))
+            .buffer(BenchBuffer::random("k", N_KV_HEADS * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", N_KV_HEADS * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("partial_o", partial_len, dt).output())
+            .buffer(BenchBuffer::zeros("partial_m", ml_len, DType::F32).output())
+            .buffer(BenchBuffer::zeros("partial_l", ml_len, DType::F32).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_kv", N_KV as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("gqa_factor", gqa_factor as u32)
+            .constexpr("blocks", BLOCKS as u32)
+            .constexpr("scale", scale)
+            .grid_3d(N_KV_HEADS as u32, BLOCKS as u32, 1, [32, gqa_factor as u32, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    fn pass2(ir: metaltile::core::ir::Kernel, head_dim: usize, dt: DType) -> BenchSetup {
+        let partial_len = N_Q_HEADS * BLOCKS * head_dim;
+        let ml_len = N_Q_HEADS * BLOCKS;
+        let bytes = (partial_len + N_Q_HEADS * head_dim) * dt.size_bytes();
+        BenchSetup::new(ir)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("partial_o", partial_len, dt))
+            .buffer(BenchBuffer::random("partial_m", ml_len, DType::F32))
+            .buffer(BenchBuffer::random("partial_l", ml_len, DType::F32))
+            .buffer(BenchBuffer::zeros("out", N_Q_HEADS * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("blocks", BLOCKS as u32)
+            .grid_3d(N_Q_HEADS as u32, 1, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass1", dtypes = [f32, f16, bf16])]
+    fn bench_pass1(dt: DType) -> BenchSetup {
+        pass1(sdpa_decode_2pass_pass1::kernel_ir_for(dt), 128, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass2", dtypes = [f32, f16, bf16])]
+    fn bench_pass2(dt: DType) -> BenchSetup {
+        pass2(sdpa_decode_2pass_pass2::kernel_ir_for(dt), 128, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass1_d64", dtypes = [f32, f16, bf16])]
+    fn bench_pass1_d64(dt: DType) -> BenchSetup {
+        pass1(sdpa_decode_2pass_pass1_d64::kernel_ir_for(dt), 64, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass2_d64", dtypes = [f32, f16, bf16])]
+    fn bench_pass2_d64(dt: DType) -> BenchSetup {
+        pass2(sdpa_decode_2pass_pass2_d64::kernel_ir_for(dt), 64, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass1_d96", dtypes = [f32, f16, bf16])]
+    fn bench_pass1_d96(dt: DType) -> BenchSetup {
+        pass1(sdpa_decode_2pass_pass1_d96::kernel_ir_for(dt), 96, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass2_d96", dtypes = [f32, f16, bf16])]
+    fn bench_pass2_d96(dt: DType) -> BenchSetup {
+        pass2(sdpa_decode_2pass_pass2_d96::kernel_ir_for(dt), 96, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass1_d256", dtypes = [f32, f16, bf16])]
+    fn bench_pass1_d256(dt: DType) -> BenchSetup {
+        pass1(sdpa_decode_2pass_pass1_d256::kernel_ir_for(dt), 256, dt)
+    }
+
+    #[bench(name = "ffai/sdpa_decode_2pass_pass2_d256", dtypes = [f32, f16, bf16])]
+    fn bench_pass2_d256(dt: DType) -> BenchSetup {
+        pass2(sdpa_decode_2pass_pass2_d256::kernel_ir_for(dt), 256, dt)
+    }
+}

@@ -227,3 +227,118 @@ mod tests {
         }
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_sdpa_decode_d256;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    #[allow(clippy::too_many_arguments)]
+    fn naive_sdpa(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_kv: usize,
+        kv_stride: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let gqa = n_q_heads / n_kv_heads;
+        let mut out = vec![0.0f32; n_q_heads * head_dim];
+        for qh in 0..n_q_heads {
+            let kvh = qh / gqa;
+            let q_off = qh * head_dim;
+            let kv_slab = kvh * kv_stride * head_dim;
+            let mut scores = vec![0.0f32; n_kv];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let k_off = kv_slab + t * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q[q_off + d] * k[k_off + d];
+                }
+                *score = dot * scale;
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
+                sum += *s;
+            }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (t, s) in scores.iter().enumerate() {
+                    acc += *s * inv * v[kv_slab + t * head_dim + d];
+                }
+                out[q_off + d] = acc;
+            }
+        }
+        out
+    }
+
+    fn ramp(n: usize, step: f32, start: f32) -> Vec<f32> {
+        (0..n).map(|i| ((start + i as f32 * step) % 2.0) - 1.0).collect()
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_decode_d256(dt: DType) -> TestSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (8usize, 4usize, 256usize);
+        let (n_kv, kv_stride) = (64usize, 64usize);
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let q = unpack_f32(&pack_f32(&ramp(n_q_heads * head_dim, 0.013, -0.4), dt), dt);
+        let k =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.011, -0.5), dt), dt);
+        let v =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
+        let expected =
+            naive_sdpa(&q, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale);
+
+        TestSetup::new(ffai_sdpa_decode_d256::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
+            .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
+            .input(TestBuffer::from_vec("v", pack_f32(&v, dt), dt))
+            .input(TestBuffer::zeros("out", n_q_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_kv", n_kv as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(n_q_heads as u32, 1, 1, [1024, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_sdpa_decode_d256` (`class=GenericEmpty`).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_sdpa_decode_d256;
+
+    #[bench(name = "ffai/sdpa_decode_d256", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_decode_d256(dt: DType) -> BenchSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 256usize);
+        let (n_kv, kv_stride) = (4096usize, 4096usize);
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let bytes = (2 * n_q_heads * head_dim + 2 * n_kv_heads * n_kv * head_dim) * dt.size_bytes();
+        BenchSetup::new(ffai_sdpa_decode_d256::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", n_q_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("k", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_q_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_kv", n_kv as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .grid_3d(n_q_heads as u32, 1, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}

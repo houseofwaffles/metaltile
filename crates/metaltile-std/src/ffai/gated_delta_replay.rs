@@ -201,3 +201,131 @@ gated_delta_record!(
     "record_d64_32_2_2"
 );
 state_replay!(state_replay_d64_32_2_2, 64u32, 32u32, 2u32, 2u32, "replay_d64_32_2_2");
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        gated_delta_step_record_d64_32_2_2,
+        gated_delta_step_record_d192_128_4_4,
+        state_replay_d64_32_2_2,
+        state_replay_d192_128_4_4,
+    };
+
+    const DK: usize = 64;
+    const DV: usize = 32;
+    const HK: usize = 2;
+    const HV: usize = 2;
+
+    // Production Qwen 3.5/3.6 A3B cell: Dk=192, Dv=128, Hk=4, Hv=4.
+    const P_DK: usize = 192;
+    const P_DV: usize = 128;
+    const P_HK: usize = 4;
+    const P_HV: usize = 4;
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    // Forward recurrence with per-step delta-tape capture.
+    #[bench(name = "ffai/gated_delta_record", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_record(dt: DType) -> BenchSetup {
+        let (batch, t_val) = (1usize, 8usize);
+        let n_total = batch * HV;
+        BenchSetup::new(gated_delta_step_record_d64_32_2_2::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("q", batch * t_val * HK * DK, dt))
+            .buffer(BenchBuffer::random("k", batch * t_val * HK * DK, dt))
+            .buffer(BenchBuffer::random("v", batch * t_val * HV * DV, dt))
+            .buffer(BenchBuffer::random("g", batch * t_val * HV, dt))
+            .buffer(BenchBuffer::random("beta", batch * t_val * HV, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * DV * DK, dt))
+            .buffer(BenchBuffer::from_vec(
+                "mask",
+                u32_bytes(&vec![1u32; batch * t_val]),
+                DType::U32,
+            ))
+            .buffer(BenchBuffer::zeros("y", batch * t_val * HV * DV, dt).output())
+            .buffer(BenchBuffer::zeros("state_out", n_total * DV * DK, dt).output())
+            .buffer(BenchBuffer::zeros("delta_log", batch * t_val * HV * DV, dt).output())
+            .constexpr("t_val", t_val as u32)
+            .constexpr("has_mask", 0u32)
+            .grid_3d(1, DV as u32, (batch * HV) as u32, [32, 1, 1])
+            .bytes_moved((n_total * DV * DK * 2 * dt.size_bytes()) as u64)
+    }
+
+    // Branchless tape re-fold of the accepted prefix onto a snapshot.
+    #[bench(name = "ffai/gated_delta_replay", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_replay(dt: DType) -> BenchSetup {
+        let (batch, t_log, accepted) = (1usize, 8usize, 8usize);
+        let n_total = batch * HV;
+        BenchSetup::new(state_replay_d64_32_2_2::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("delta_log", batch * t_log * HV * DV, dt))
+            .buffer(BenchBuffer::random("k_log", batch * t_log * HV * DK, dt))
+            .buffer(BenchBuffer::random("g_log", batch * t_log * HV, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * DV * DK, dt))
+            .buffer(BenchBuffer::from_vec(
+                "mask",
+                u32_bytes(&vec![1u32; batch * t_log]),
+                DType::U32,
+            ))
+            .buffer(BenchBuffer::zeros("state_out", n_total * DV * DK, dt).output())
+            .constexpr("t_log", t_log as u32)
+            .constexpr("accepted", accepted as u32)
+            .constexpr("has_mask", 0u32)
+            .grid_3d(1, DV as u32, (batch * HV) as u32, [32, 1, 1])
+            .bytes_moved((n_total * DV * DK * 2 * dt.size_bytes()) as u64)
+    }
+
+    // Production cell (Dk=192, Dv=128, Hk=4, Hv=4): forward recurrence with
+    // per-step delta-tape capture.
+    #[bench(name = "ffai/gated_delta_record_d192_128_4_4", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_record_d192_128_4_4(dt: DType) -> BenchSetup {
+        let (batch, t_val) = (1usize, 8usize);
+        let n_total = batch * P_HV;
+        BenchSetup::new(gated_delta_step_record_d192_128_4_4::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("q", batch * t_val * P_HK * P_DK, dt))
+            .buffer(BenchBuffer::random("k", batch * t_val * P_HK * P_DK, dt))
+            .buffer(BenchBuffer::random("v", batch * t_val * P_HV * P_DV, dt))
+            .buffer(BenchBuffer::random("g", batch * t_val * P_HV, dt))
+            .buffer(BenchBuffer::random("beta", batch * t_val * P_HV, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * P_DV * P_DK, dt))
+            .buffer(BenchBuffer::from_vec(
+                "mask",
+                u32_bytes(&vec![1u32; batch * t_val]),
+                DType::U32,
+            ))
+            .buffer(BenchBuffer::zeros("y", batch * t_val * P_HV * P_DV, dt).output())
+            .buffer(BenchBuffer::zeros("state_out", n_total * P_DV * P_DK, dt).output())
+            .buffer(BenchBuffer::zeros("delta_log", batch * t_val * P_HV * P_DV, dt).output())
+            .constexpr("t_val", t_val as u32)
+            .constexpr("has_mask", 0u32)
+            .grid_3d(1, P_DV as u32, (batch * P_HV) as u32, [32, 1, 1])
+            .bytes_moved((n_total * P_DV * P_DK * 2 * dt.size_bytes()) as u64)
+    }
+
+    // Production cell (Dk=192, Dv=128, Hv=4): branchless tape re-fold of the
+    // accepted prefix onto a snapshot.
+    #[bench(name = "ffai/gated_delta_replay_d192_128_4_4", dtypes = [f32, f16, bf16])]
+    fn bench_gated_delta_replay_d192_128_4_4(dt: DType) -> BenchSetup {
+        let (batch, t_log, accepted) = (1usize, 8usize, 8usize);
+        let n_total = batch * P_HV;
+        BenchSetup::new(state_replay_d192_128_4_4::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("delta_log", batch * t_log * P_HV * P_DV, dt))
+            .buffer(BenchBuffer::random("k_log", batch * t_log * P_HV * P_DK, dt))
+            .buffer(BenchBuffer::random("g_log", batch * t_log * P_HV, dt))
+            .buffer(BenchBuffer::random("state_in", n_total * P_DV * P_DK, dt))
+            .buffer(BenchBuffer::from_vec(
+                "mask",
+                u32_bytes(&vec![1u32; batch * t_log]),
+                DType::U32,
+            ))
+            .buffer(BenchBuffer::zeros("state_out", n_total * P_DV * P_DK, dt).output())
+            .constexpr("t_log", t_log as u32)
+            .constexpr("accepted", accepted as u32)
+            .constexpr("has_mask", 0u32)
+            .grid_3d(1, P_DV as u32, (batch * P_HV) as u32, [32, 1, 1])
+            .bytes_moved((n_total * P_DV * P_DK * 2 * dt.size_bytes()) as u64)
+    }
+}

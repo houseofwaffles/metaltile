@@ -121,3 +121,64 @@ aura_flash_pass2_kernel!(aura_flash_pass2_d96, 3u32, "flash_pass2_d96");
 aura_flash_pass2_kernel!(aura_flash_pass2_d128, 4u32, "flash_pass2_d128");
 aura_flash_pass2_kernel!(aura_flash_pass2_d256, 8u32, "flash_pass2_d256");
 aura_flash_pass2_kernel!(aura_flash_pass2_d512, 16u32, "flash_pass2_d512");
+
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{
+        aura_flash_pass2_d64,
+        aura_flash_pass2_d80,
+        aura_flash_pass2_d96,
+        aura_flash_pass2_d128,
+        aura_flash_pass2_d256,
+        aura_flash_pass2_d512,
+    };
+
+    // Shared builder for every pass2 dim. Grid is (q_heads, 1, 1) with a
+    // 32-lane reduction threadgroup; only `dim` (and the buffer sizes it
+    // drives) varies. KV of 4096 tokens / block 256 = 16 blocks throughout.
+    fn flash_pass2(s: BenchSetup, dim: usize, dt: DType) -> BenchSetup {
+        let (q_heads, num_blocks) = (32usize, 16usize);
+        s.mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("o_partials", q_heads * num_blocks * dim, dt))
+            .buffer(BenchBuffer::random("m_partials", q_heads * num_blocks, dt))
+            .buffer(BenchBuffer::random("l_partials", q_heads * num_blocks, dt))
+            .buffer(BenchBuffer::zeros("output", q_heads * dim, dt).output())
+            .constexpr("dim", dim as u32)
+            .constexpr("num_blocks", num_blocks as u32)
+            // o_partials read dominates the merge.
+            .bytes_moved((q_heads * num_blocks * dim * dt.size_bytes()) as u64)
+            .grid_3d(q_heads as u32, 1, 1, [32, 1, 1])
+    }
+
+    #[bench(name = "ffai/aura_flash_pass2_d64", dtypes = [f32, f16, bf16])]
+    fn bench_flash_pass2_d64(dt: DType) -> BenchSetup {
+        flash_pass2(BenchSetup::new(aura_flash_pass2_d64::kernel_ir_for(dt)), 64, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_pass2_d80", dtypes = [f32, f16, bf16])]
+    fn bench_flash_pass2_d80(dt: DType) -> BenchSetup {
+        flash_pass2(BenchSetup::new(aura_flash_pass2_d80::kernel_ir_for(dt)), 80, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_pass2_d96", dtypes = [f32, f16, bf16])]
+    fn bench_flash_pass2_d96(dt: DType) -> BenchSetup {
+        flash_pass2(BenchSetup::new(aura_flash_pass2_d96::kernel_ir_for(dt)), 96, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_pass2_d128", dtypes = [f32, f16, bf16])]
+    fn bench_flash_pass2(dt: DType) -> BenchSetup {
+        // head_dim 128, decode-time KV of 4096 tokens / block 256 = 16 blocks.
+        flash_pass2(BenchSetup::new(aura_flash_pass2_d128::kernel_ir_for(dt)), 128, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_pass2_d256", dtypes = [f32, f16, bf16])]
+    fn bench_flash_pass2_d256(dt: DType) -> BenchSetup {
+        flash_pass2(BenchSetup::new(aura_flash_pass2_d256::kernel_ir_for(dt)), 256, dt)
+    }
+
+    #[bench(name = "ffai/aura_flash_pass2_d512", dtypes = [f32, f16, bf16])]
+    fn bench_flash_pass2_d512(dt: DType) -> BenchSetup {
+        flash_pass2(BenchSetup::new(aura_flash_pass2_d512::kernel_ir_for(dt)), 512, dt)
+    }
+}

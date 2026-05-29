@@ -218,3 +218,56 @@ mod tests {
         assert_eq!(setup, DType::F16, "bf16 activation must stage as half");
     }
 }
+
+/// New-syntax correctness test for the MPP MoE int4 BGEMM (BM=BN=64). Shares
+/// the per-row-`indices` int4 dequant-then-matmul oracle with the BM=16
+/// sibling; the 4-SG 2x2 warp grid over a 64x64 tile changes only the tile
+/// geometry (BN=64 → n_out/64 n-tiles, BM=64 → ceil(M/64) m-tiles, tpg=128).
+///
+/// Grid (Reduction, 4 simdgroups per TG): `grid_3d(n_out/64, ceil(m_total/64), 1, [128,1,1])`.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::mt_moe_gather_qmm_mma_int4_bm64_mpp;
+    use crate::ffai::moe_mpp_shared::{MmaTestShape, int4_indexed_setup};
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_moe_gather_qmm_mma_int4_bm64_mpp(dt: DType) -> TestSetup {
+        // BN=64 → 64/64=1 n-tile, BM=64 → ceil(64/64)=1 m-tile.
+        int4_indexed_setup(
+            mt_moe_gather_qmm_mma_int4_bm64_mpp::kernel_ir_for(dt),
+            MmaTestShape { n_experts: 4, m_total: 64, n_out: 64, k_in: 64, group_size: 32 },
+            64,  // bn
+            64,  // bm
+            128, // tpg (4 SGs)
+            dt,
+        )
+    }
+}
+
+/// New-syntax benchmark for the MPP MoE int4 BGEMM (BM=BN=64). Qwen3.6-A3B-ish.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_moe_gather_qmm_mma_int4_bm64_mpp;
+    use crate::ffai::moe_mpp_shared::{MmaBenchShape, int4_mma_bench};
+
+    #[bench(name = "ffai/moe_mpp/gather_qmm_mma_int4_bm64", dtypes = [f32, f16, bf16])]
+    fn bench_moe_gather_qmm_mma_int4_bm64_mpp(dt: DType) -> BenchSetup {
+        int4_mma_bench(
+            mt_moe_gather_qmm_mma_int4_bm64_mpp::kernel_ir_for(dt),
+            MmaBenchShape {
+                bits: 4,
+                bn: 64,
+                bm: 64,
+                tpg: 128,
+                m_total: 1024,
+                n_out: 256,
+                k_in: 2048,
+                n_experts: 128,
+                group_size: 64,
+            },
+            dt,
+        )
+    }
+}

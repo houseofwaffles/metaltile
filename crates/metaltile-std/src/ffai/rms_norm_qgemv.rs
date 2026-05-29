@@ -684,3 +684,275 @@ pub fn ffai_rms_norm_qgemv_int8_fast<T>(
         store(output[row3], r3.cast::<T>());
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{ffai_rms_norm_qgemv, ffai_rms_norm_qgemv_fast, ffai_rms_norm_qgemv_int8_fast};
+    use crate::utils::{pack_f32, unpack_f32};
+
+    const EPS: f32 = 1e-5;
+
+    /// Round one f32 through the kernel dtype, matching the GPU load-cast.
+    fn round(v: f32, dt: DType) -> f32 { unpack_f32(&pack_f32(&[v], dt), dt)[0] }
+
+    /// Pack u32 weight words to little-endian bytes.
+    fn pack_u32(words: &[u32]) -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() }
+
+    /// Deterministic xorshift source — matches the legacy test generator so
+    /// the dtype-rounded oracle inputs reproduce the same distribution.
+    fn source(n: usize, seed: u64, scale: f32, off: f32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s % 20_000) as f32 / 20_000.0 - 0.5) * scale + off
+            })
+            .collect()
+    }
+
+    /// Affine per-group int4 quantize of one weight row, nibble-packed
+    /// (8 values per u32). Mirrors the legacy GPU-test quantizer exactly.
+    fn quantize_int4_row(row: &[f32], group_size: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let in_dim = row.len();
+        let n_groups = in_dim / group_size;
+        let mut packed = vec![0u32; in_dim / 8];
+        let mut scales = vec![0.0_f32; n_groups];
+        let mut biases = vec![0.0_f32; n_groups];
+        for g in 0..n_groups {
+            let gs = &row[g * group_size..(g + 1) * group_size];
+            let mn = gs.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = gs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = mx - mn;
+            let scale = if range.abs() < 1e-10 { 1.0 } else { range / 15.0 };
+            scales[g] = scale;
+            biases[g] = mn;
+            for (i, &v) in gs.iter().enumerate() {
+                let q = ((v - mn) / scale).round().clamp(0.0, 15.0) as u32;
+                let d = g * group_size + i;
+                packed[d / 8] |= q << ((d % 8) * 4);
+            }
+        }
+        (packed, scales, biases)
+    }
+
+    /// Affine per-group int8 quantize of one weight row — 4 bytes per u32,
+    /// the byte-strided layout `ffai_rms_norm_qgemv_int8_fast` decodes.
+    fn quantize_int8_row(row: &[f32], group_size: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let in_dim = row.len();
+        let n_groups = in_dim / group_size;
+        let mut packed = vec![0u32; in_dim / 4];
+        let mut scales = vec![0.0_f32; n_groups];
+        let mut biases = vec![0.0_f32; n_groups];
+        for g in 0..n_groups {
+            let gs = &row[g * group_size..(g + 1) * group_size];
+            let mn = gs.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = gs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = mx - mn;
+            let scale = if range.abs() < 1e-10 { 1.0 } else { range / 255.0 };
+            scales[g] = scale;
+            biases[g] = mn;
+            for (i, &v) in gs.iter().enumerate() {
+                let q = ((v - mn) / scale).round().clamp(0.0, 255.0) as u32;
+                let d = g * group_size + i;
+                packed[d / 4] |= q << ((d % 4) * 8);
+            }
+        }
+        (packed, scales, biases)
+    }
+
+    /// Dequant-then-matmul oracle. `bits` is 4 or 8.
+    #[allow(clippy::too_many_arguments)]
+    fn naive(
+        weight: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        x: &[f32],
+        norm_weight: &[f32],
+        in_dim: usize,
+        group_size: usize,
+        out_dim: usize,
+        bits: usize,
+    ) -> Vec<f32> {
+        let ssq: f32 = x.iter().map(|&v| v * v).sum();
+        let inv_rms = 1.0 / (ssq / in_dim as f32 + EPS).sqrt();
+        let vals_per_word = 32 / bits; // 8 (int4) or 4 (int8)
+        let mask = (1u32 << bits) - 1;
+        let u32_per_row = in_dim / vals_per_word;
+        let n_groups = in_dim / group_size;
+        (0..out_dim)
+            .map(|row| {
+                let rw = &weight[row * u32_per_row..(row + 1) * u32_per_row];
+                let rs = &scales[row * n_groups..(row + 1) * n_groups];
+                let rb = &biases[row * n_groups..(row + 1) * n_groups];
+                let mut acc = 0.0_f32;
+                for d in 0..in_dim {
+                    let q = (rw[d / vals_per_word] >> ((d % vals_per_word) * bits)) & mask;
+                    let g = d / group_size;
+                    let w_real = q as f32 * rs[g] + rb[g];
+                    acc += w_real * (x[d] * norm_weight[d] * inv_rms);
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// Quantize a full `[out_dim, in_dim]` weight matrix row-by-row.
+    fn quantize_matrix(
+        rows: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+        group_size: usize,
+        int8: bool,
+    ) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let mut w = Vec::new();
+        let mut s = Vec::new();
+        let mut b = Vec::new();
+        for row in 0..out_dim {
+            let r = &rows[row * in_dim..(row + 1) * in_dim];
+            let (pw, ps, pb) = if int8 {
+                quantize_int8_row(r, group_size)
+            } else {
+                quantize_int4_row(r, group_size)
+            };
+            w.extend(pw);
+            s.extend(ps);
+            b.extend(pb);
+        }
+        (w, s, b)
+    }
+
+    /// Assemble the shared buffer set + expected output for any variant.
+    fn setup(
+        kernel: metaltile::core::ir::Kernel,
+        dt: DType,
+        in_dim: usize,
+        group_size: usize,
+        out_dim: usize,
+        int8: bool,
+    ) -> TestSetup {
+        let x: Vec<f32> = source(in_dim, 0xA1, 2.0, 0.1).iter().map(|&v| round(v, dt)).collect();
+        let norm_weight: Vec<f32> =
+            source(in_dim, 0xB2, 0.4, 1.0).iter().map(|&v| round(v, dt)).collect();
+        let w_rows = source(out_dim * in_dim, 0xC3, 3.0, 0.0);
+        let (weight, scales, biases) = quantize_matrix(&w_rows, out_dim, in_dim, group_size, int8);
+        let scales_r: Vec<f32> = scales.iter().map(|&v| round(v, dt)).collect();
+        let biases_r: Vec<f32> = biases.iter().map(|&v| round(v, dt)).collect();
+        let bits = if int8 { 8 } else { 4 };
+        let expected = naive(
+            &weight,
+            &scales_r,
+            &biases_r,
+            &x,
+            &norm_weight,
+            in_dim,
+            group_size,
+            out_dim,
+            bits,
+        );
+
+        TestSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("norm_weight", pack_f32(&norm_weight, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_u32(&weight), DType::U32))
+            .input(TestBuffer::from_vec("scales", pack_f32(&scales, dt), dt))
+            .input(TestBuffer::from_vec("biases", pack_f32(&biases, dt), dt))
+            .input(TestBuffer::zeros("output", out_dim, dt))
+            .input(TestBuffer::from_vec("eps_buf", EPS.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("group_size", group_size as u32)
+            .expect(TestBuffer::from_vec("output", pack_f32(&expected, dt), dt))
+    }
+
+    // ── Scalar variant: grid [out_dim, 1, 1], tpg 128 (one row per TG). ──
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 2e-1)]
+    fn test_rms_norm_qgemv(dt: DType) -> TestSetup {
+        let (in_dim, gs, out_dim) = (256usize, 64usize, 8usize);
+        setup(ffai_rms_norm_qgemv::kernel_ir_for(dt), dt, in_dim, gs, out_dim, false).grid_3d(
+            out_dim as u32,
+            1,
+            1,
+            [128, 1, 1],
+        )
+    }
+
+    // ── Fast int4 variant: grid [out_dim/8, 1, 1], tpg 64 (8 rows per TG). ──
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 2e-1)]
+    fn test_rms_norm_qgemv_fast(dt: DType) -> TestSetup {
+        let (in_dim, gs, out_dim) = (512usize, 64usize, 16usize);
+        setup(ffai_rms_norm_qgemv_fast::kernel_ir_for(dt), dt, in_dim, gs, out_dim, false).grid_3d(
+            (out_dim / 8) as u32,
+            1,
+            1,
+            [64, 1, 1],
+        )
+    }
+
+    // ── Fast int8 variant: grid [out_dim/8, 1, 1], tpg 64 (8 rows per TG). ──
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 2e-1)]
+    fn test_rms_norm_qgemv_int8_fast(dt: DType) -> TestSetup {
+        let (in_dim, gs, out_dim) = (512usize, 64usize, 16usize);
+        setup(ffai_rms_norm_qgemv_int8_fast::kernel_ir_for(dt), dt, in_dim, gs, out_dim, true)
+            .grid_3d((out_dim / 8) as u32, 1, 1, [64, 1, 1])
+    }
+}
+
+/// New-syntax benchmarks for the fused RMSNorm + quantized GEMV family —
+/// MLX-less reduction kernels (`Ref(GB/s)` blank). Production decode shape:
+/// Qwen3-class hidden = 4096, projection out = 4096.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{ffai_rms_norm_qgemv, ffai_rms_norm_qgemv_fast, ffai_rms_norm_qgemv_int8_fast};
+
+    const EPS: f32 = 1e-5;
+
+    /// Shared buffer set. `bits` is 4 or 8 (weight word count differs).
+    fn buffers(
+        s: BenchSetup,
+        in_dim: usize,
+        gs: usize,
+        out_dim: usize,
+        dt: DType,
+        bits: usize,
+    ) -> BenchSetup {
+        let n_groups = in_dim / gs;
+        let weight_words = out_dim * in_dim / (32 / bits);
+        s.buffer(BenchBuffer::random("x", in_dim, dt))
+            .buffer(BenchBuffer::random("norm_weight", in_dim, dt))
+            .buffer(BenchBuffer::random("weight", weight_words, DType::U32))
+            .buffer(BenchBuffer::random("scales", out_dim * n_groups, dt))
+            .buffer(BenchBuffer::random("biases", out_dim * n_groups, dt))
+            .buffer(BenchBuffer::zeros("output", out_dim, dt).output())
+            .buffer(BenchBuffer::from_vec("eps_buf", EPS.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("group_size", gs as u32)
+            .bytes_moved((weight_words * 4) as u64)
+    }
+
+    #[bench(name = "ffai/rms_norm_qgemv", dtypes = [f32, f16, bf16])]
+    fn bench_rms_norm_qgemv(dt: DType) -> BenchSetup {
+        let (in_dim, gs, out_dim) = (4096usize, 64usize, 4096usize);
+        let s = BenchSetup::new(ffai_rms_norm_qgemv::kernel_ir_for(dt)).mode(KernelMode::Reduction);
+        buffers(s, in_dim, gs, out_dim, dt, 4).grid_3d(out_dim as u32, 1, 1, [128, 1, 1])
+    }
+
+    #[bench(name = "ffai/rms_norm_qgemv_fast", dtypes = [f32, f16, bf16])]
+    fn bench_rms_norm_qgemv_fast(dt: DType) -> BenchSetup {
+        let (in_dim, gs, out_dim) = (4096usize, 64usize, 4096usize);
+        let s = BenchSetup::new(ffai_rms_norm_qgemv_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction);
+        buffers(s, in_dim, gs, out_dim, dt, 4).grid_3d((out_dim / 8) as u32, 1, 1, [64, 1, 1])
+    }
+
+    #[bench(name = "ffai/rms_norm_qgemv_int8_fast", dtypes = [f32, f16, bf16])]
+    fn bench_rms_norm_qgemv_int8_fast(dt: DType) -> BenchSetup {
+        let (in_dim, gs, out_dim) = (4096usize, 64usize, 4096usize);
+        let s = BenchSetup::new(ffai_rms_norm_qgemv_int8_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction);
+        buffers(s, in_dim, gs, out_dim, dt, 8).grid_3d((out_dim / 8) as u32, 1, 1, [64, 1, 1])
+    }
+}

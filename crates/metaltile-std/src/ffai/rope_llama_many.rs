@@ -106,3 +106,94 @@ pub fn ffai_rope_llama_many<T>(
     store(out[i1], o1.cast::<T>());
     store(out[i2], o2.cast::<T>());
 }
+
+/// New-syntax correctness + bench for `ffai_rope_llama_many` (batched per-row
+/// Llama RoPE). Grid3D, grid `[T, n_heads, half_dim]`, tpg `[1,1,1]`. Reuses
+/// the banded inv_freq from `rope_llama`; each row uses its own position.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_rope_llama_many;
+    use crate::{
+        ffai::rope_llama::kernel_tests::band_inv_freq,
+        utils::{pack_f32, unpack_f32},
+    };
+
+    fn u32_bytes(v: &[u32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 5e-2])]
+    fn test_rope_llama_many(dt: DType) -> TestSetup {
+        let (t_len, n_heads, head_dim) = (4usize, 4usize, 64usize);
+        let half = head_dim / 2;
+        let row_stride = n_heads * head_dim; // contiguous (no fused-QKV slack)
+        let theta_base = 500_000.0f32;
+        let (sf, lf, hf, omp) = (1.0f32, 1.0f32, 1.0f32, 1.0e9f32);
+        let positions: Vec<u32> = (0..t_len).map(|r| (r * 10) as u32).collect();
+        let qk_f: Vec<f32> =
+            (0..t_len * row_stride).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let qk = unpack_f32(&pack_f32(&qk_f, dt), dt);
+        let mut exp = vec![0.0f32; t_len * row_stride];
+        for (r, &posu) in positions.iter().enumerate() {
+            let pos = posu as f32;
+            for h in 0..n_heads {
+                for i in 0..half {
+                    let invf = band_inv_freq(i, half, theta_base, sf, lf, hf, omp);
+                    let th = pos * invf;
+                    let (c, s) = (th.cos(), th.sin());
+                    let base = r * row_stride + h * head_dim;
+                    let (x1, x2) = (qk[base + i], qk[base + i + half]);
+                    exp[base + i] = x1 * c - x2 * s;
+                    exp[base + i + half] = x1 * s + x2 * c;
+                }
+            }
+        }
+        TestSetup::new(ffai_rope_llama_many::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("qk", pack_f32(&qk_f, dt), dt))
+            .input(TestBuffer::from_vec("positions", u32_bytes(&positions), DType::U32))
+            .input(TestBuffer::zeros("out", t_len * row_stride, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("row_stride", row_stride as u32)
+            .constexpr("theta_base", theta_base)
+            .constexpr("scale_factor", sf)
+            .constexpr("low_freq_factor", lf)
+            .constexpr("high_freq_factor", hf)
+            .constexpr("original_max_position", omp)
+            .expect(TestBuffer::from_vec("out", pack_f32(&exp, dt), dt))
+            .grid_3d(t_len as u32, n_heads as u32, half as u32, [1, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_rope_llama_many` (prefill batched RoPE).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_rope_llama_many;
+
+    #[bench(name = "ffai/rope/rope_llama_many", dtypes = [f32, f16, bf16])]
+    fn bench_rope_llama_many(dt: DType) -> BenchSetup {
+        let (t_len, n_heads, head_dim) = (512usize, 32usize, 128usize);
+        let half = head_dim / 2;
+        let row_stride = n_heads * head_dim;
+        BenchSetup::new(ffai_rope_llama_many::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("qk", t_len * row_stride, dt))
+            .buffer(BenchBuffer::random("positions", t_len, DType::U32))
+            .buffer(BenchBuffer::zeros("out", t_len * row_stride, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("row_stride", row_stride as u32)
+            .constexpr("theta_base", 500_000.0f32)
+            .constexpr("scale_factor", 8.0f32)
+            .constexpr("low_freq_factor", 1.0f32)
+            .constexpr("high_freq_factor", 4.0f32)
+            .constexpr("original_max_position", 8192.0f32)
+            .with_shape_label(format!(
+                "T{t_len} h{n_heads} d{head_dim} {}",
+                crate::bench_types::dtype_label(dt)
+            ))
+            .grid_3d(t_len as u32, n_heads as u32, half as u32, [1, 1, 1])
+            .bytes_moved((2 * t_len * row_stride * dt.size_bytes()) as u64)
+    }
+}

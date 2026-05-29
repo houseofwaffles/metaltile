@@ -80,3 +80,81 @@ pub fn ffai_rope_yarn<T>(
     store(out[i1], o1.cast::<T>());
     store(out[i2], o2.cast::<T>());
 }
+
+/// New-syntax correctness + bench for `ffai_rope_yarn` (YaRN context-extension
+/// RoPE). Grid3D, grid `[n_heads, half_dim, 1]`, tpg `[1,1,1]`. Oracle replays
+/// the extrapolation/interpolation ramp + attn_factor scaling in f32.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_rope_yarn;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 5e-2])]
+    fn test_rope_yarn(dt: DType) -> TestSetup {
+        let (n_heads, head_dim) = (4usize, 64usize);
+        let half = head_dim / 2;
+        let (theta_base, position) = (10_000.0f32, 100u32);
+        let (factor, low, high, attn) = (4.0f32, 16.0f32, 24.0f32, 1.0f32);
+        let qk_f: Vec<f32> =
+            (0..n_heads * head_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let qk = unpack_f32(&pack_f32(&qk_f, dt), dt);
+        let mut exp = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            for i in 0..half {
+                let extrap = (-(i as f32) * theta_base.log2() / half as f32).exp2();
+                let interp = extrap / factor;
+                let t = (i as f32 - low) / (high - low);
+                let ramp = t.clamp(0.0, 1.0);
+                let invf = interp * ramp + extrap * (1.0 - ramp);
+                let th = position as f32 * invf;
+                let (c, s) = (th.cos() * attn, th.sin() * attn);
+                let base = h * head_dim;
+                let (x1, x2) = (qk[base + i], qk[base + i + half]);
+                exp[base + i] = x1 * c - x2 * s;
+                exp[base + i + half] = x1 * s + x2 * c;
+            }
+        }
+        TestSetup::new(ffai_rope_yarn::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("qk", pack_f32(&qk_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("position", position)
+            .constexpr("theta_base", theta_base)
+            .constexpr("factor", factor)
+            .constexpr("low", low)
+            .constexpr("high", high)
+            .constexpr("attn_factor", attn)
+            .expect(TestBuffer::from_vec("out", pack_f32(&exp, dt), dt))
+            .grid_3d(n_heads as u32, half as u32, 1, [1, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_rope_yarn`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_rope_yarn;
+
+    #[bench(name = "ffai/rope/rope_yarn", dtypes = [f32, f16, bf16])]
+    fn bench_rope_yarn(dt: DType) -> BenchSetup {
+        let (n_heads, head_dim) = (32usize, 128usize);
+        let half = head_dim / 2;
+        BenchSetup::new(ffai_rope_yarn::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("qk", n_heads * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("half_dim", half as u32)
+            .constexpr("position", 1000u32)
+            .constexpr("theta_base", 10_000.0f32)
+            .constexpr("factor", 4.0f32)
+            .constexpr("low", 16.0f32)
+            .constexpr("high", 48.0f32)
+            .constexpr("attn_factor", 1.0f32)
+            .grid_3d(n_heads as u32, half as u32, 1, [1, 1, 1])
+            .bytes_moved((2 * n_heads * head_dim * dt.size_bytes()) as u64)
+    }
+}

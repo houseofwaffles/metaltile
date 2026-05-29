@@ -345,3 +345,78 @@ pub fn mt_sdpa_prefill<T>(
     store(out[q7_row + d0 + 2u32], o72 * is7);
     store(out[q7_row + d0 + 3u32], o73 * is7);
 }
+
+/// New-syntax benchmarks for the SDPA-prefill family (vs MLX's
+/// `steel_attention_*_bq32_bk16_bd128_wm4_wn1` Flash-Attention-2 tile
+/// kernel). Covers the scalar flash variant and both simdgroup-matrix
+/// (MMA) variants. All three share the same dispatch contract:
+///
+/// - **SimdGroup2D mode** — the kernels read `tgid_x`/`tgid_y`/`tgid_z`.
+/// - **Grid = (q_len / BQ=32, n_q_heads, batch)** threadGROUP counts,
+///   **TPG = 128** (4 simdgroups). `grid_3d` takes group counts, so the
+///   first three args are the group counts directly.
+/// - `head_dim` is hardcoded 128 in the kernel body; `scale = 1/sqrt(128)`.
+///
+/// Shape mirrors the legacy `bench(...)`: h=128, n_heads=32, gqa_factor=4
+/// (→ 8 KV heads), batch=1, q_len=k_len=512.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_sdpa_prefill;
+    use crate::mlx::steel::attn::{
+        steel_attention_mma::mt_sdpa_prefill_mma,
+        steel_attention_mma_bf16::mt_sdpa_prefill_mma_bf16,
+    };
+
+    // SDPA prefill geometry shared by all three variants.
+    const HEAD_DIM: usize = 128;
+    const N_Q_HEADS: usize = 32;
+    const GQA_FACTOR: usize = 4;
+    const N_KV_HEADS: usize = N_Q_HEADS / GQA_FACTOR; // 8
+    const BATCH: usize = 1;
+    const Q_LEN: usize = 512;
+    const K_LEN: usize = 512;
+    const BQ: u32 = 32;
+    const TPG: u32 = 128;
+
+    fn sdpa_b(kernel: metaltile::core::ir::Kernel, dt: DType) -> BenchSetup {
+        let q_elems = BATCH * N_Q_HEADS * Q_LEN * HEAD_DIM;
+        let kv_elems = BATCH * N_KV_HEADS * K_LEN * HEAD_DIM;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        BenchSetup::new(kernel)
+            .mode(KernelMode::SimdGroup2D)
+            .buffer(BenchBuffer::random("q", q_elems, dt))
+            .buffer(BenchBuffer::random("k", kv_elems, dt))
+            .buffer(BenchBuffer::random("v", kv_elems, dt))
+            .buffer(BenchBuffer::zeros("out", q_elems, dt).output())
+            .constexpr("q_len", Q_LEN as u32)
+            .constexpr("k_len", K_LEN as u32)
+            .constexpr("gqa_factor", GQA_FACTOR as u32)
+            .constexpr("n_q_heads", N_Q_HEADS as u32)
+            .constexpr("n_kv_heads", N_KV_HEADS as u32)
+            .constexpr("scale", scale)
+            // grid_3d takes threadGROUP counts: (q_len / BQ, n_q_heads, batch).
+            .grid_3d(Q_LEN as u32 / BQ, N_Q_HEADS as u32, BATCH as u32, [TPG, 1, 1])
+            // Q/O read+written once each; K/V read once per q_tile group.
+            .bytes_moved(((2 * q_elems + 2 * kv_elems) * dt.size_bytes()) as u64)
+    }
+
+    #[bench(name = "mlx/sdpa/sdpa_prefill", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_prefill(dt: DType) -> BenchSetup {
+        sdpa_b(mt_sdpa_prefill::kernel_ir_for(dt), dt)
+    }
+
+    #[bench(name = "mlx/sdpa/sdpa_prefill_mma", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_prefill_mma(dt: DType) -> BenchSetup {
+        sdpa_b(mt_sdpa_prefill_mma::kernel_ir_for(dt), dt)
+    }
+
+    // bf16-emulated MMA variant — the M2-family bf16 routing target. Only
+    // meaningful at bf16 (single-Q dd-loop, bf16 MMA frags).
+    // dtypes f32/f16/bf16 to match the legacy emission (the bf16-tile kernel
+    // is monomorphized over all three input dtypes, same as the legacy spec).
+    #[bench(name = "mlx/sdpa/sdpa_prefill_mma_bf16", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_prefill_mma_bf16(dt: DType) -> BenchSetup {
+        sdpa_b(mt_sdpa_prefill_mma_bf16::kernel_ir_for(dt), dt)
+    }
+}

@@ -106,3 +106,78 @@ pub fn logits_top_p_mask<T>(
         store(out[_i], select(exp(v - row_max) >= lo, v, neg_inf).cast::<T>());
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::logits_top_p_mask;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// Bisection halvings — must match the kernel's loop bound.
+    const BISECT_ITERS: usize = 24;
+
+    /// CPU oracle: replay the kernel's bisection per row.
+    fn cpu_top_p_mask(logits: &[f32], n: usize, rows: usize, top_p: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * n];
+        for r in 0..rows {
+            let base = r * n;
+            let row = &logits[base..base + n];
+            let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let w: Vec<f32> = row.iter().map(|&v| (v - m).exp()).collect();
+            let z: f32 = w.iter().sum();
+            let target = top_p * z;
+            let mut lo = 0.0f32;
+            let mut hi = 1.0f32;
+            for _ in 0..BISECT_ITERS {
+                let mid = (lo + hi) * 0.5;
+                let kept: f32 = w.iter().filter(|&&x| x >= mid).sum();
+                if kept >= target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            for (i, &wi) in w.iter().enumerate() {
+                out[base + i] = if wi >= lo { row[i] } else { f32::NEG_INFINITY };
+            }
+        }
+        out
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.0)]
+    fn test_logits_top_p_mask(dt: DType) -> TestSetup {
+        let (n, rows, top_p) = (320usize, 4usize, 0.9f32);
+        let logits: Vec<f32> = (0..n * rows).map(|i| (i % 53) as f32 * 0.2 - 5.0).collect();
+        let rounded = unpack_f32(&pack_f32(&logits, dt), dt);
+        let expected = cpu_top_p_mask(&rounded, n, rows, top_p);
+        TestSetup::new(logits_top_p_mask::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("inp", pack_f32(&logits, dt), dt))
+            .input(TestBuffer::zeros("out", n * rows, dt))
+            .constexpr("n", n as u32)
+            .constexpr("top_p", top_p)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(rows as u32, 1, 1, [256, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `logits_top_p_mask` at Qwen3 vocab scale
+/// (Reduction, one TG per row; 24 bisection passes over the row).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::logits_top_p_mask;
+
+    #[bench(name = "ffai/logits_processors/top_p_mask", dtypes = [f32, f16, bf16])]
+    fn bench_logits_top_p_mask(dt: DType) -> BenchSetup {
+        let (n, rows) = (152_064usize, 2usize);
+        BenchSetup::new(logits_top_p_mask::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("inp", n * rows, dt))
+            .buffer(BenchBuffer::zeros("out", n * rows, dt).output())
+            .constexpr("n", n as u32)
+            .constexpr("top_p", 0.9f32)
+            .grid_3d(rows as u32, 1, 1, [256, 1, 1])
+            .bytes_moved((2 * n * rows * dt.size_bytes()) as u64)
+    }
+}

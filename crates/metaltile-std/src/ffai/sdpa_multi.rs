@@ -350,3 +350,168 @@ pub fn ffai_sdpa_multi_tree_mask<T>(
         store(out[out_off + 3u32], so3.cast::<T>());
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_sdpa_multi;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    // Per (query, q_head): softmax(Q·Kᵀ·scale)·V over the attended KV
+    // range. Q/out layout `[n_query, n_q_heads, head_dim]`, K/V layout
+    // `[n_kv_heads, kv_stride, head_dim]`. `causal=false` → full range.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_sdpa_multi(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        base_kv: usize,
+        n_query: usize,
+        kv_stride: usize,
+        causal: bool,
+        scale: f32,
+    ) -> Vec<f32> {
+        let gqa = n_q_heads / n_kv_heads;
+        let mut out = vec![0.0f32; n_query * n_q_heads * head_dim];
+        for r in 0..n_query {
+            let n_kv = if causal { base_kv + r + 1 } else { base_kv + n_query };
+            for qh in 0..n_q_heads {
+                let kvh = qh / gqa;
+                let q_off = (r * n_q_heads + qh) * head_dim;
+                let kv_slab = kvh * kv_stride * head_dim;
+                let mut scores = vec![0.0f32; n_kv];
+                for (t, score) in scores.iter_mut().enumerate() {
+                    let k_off = kv_slab + t * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] * k[k_off + d];
+                    }
+                    *score = dot * scale;
+                }
+                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    sum += *s;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (t, s) in scores.iter().enumerate() {
+                        acc += *s * inv * v[kv_slab + t * head_dim + d];
+                    }
+                    out[q_off + d] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    fn ramp(n: usize, step: f32, start: f32) -> Vec<f32> {
+        (0..n).map(|i| ((start + i as f32 * step) % 2.0) - 1.0).collect()
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_multi(dt: DType) -> TestSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (8usize, 4usize, 128usize);
+        let (base_kv, n_query) = (56usize, 8usize);
+        let kv_stride = base_kv + n_query; // 64
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let q = unpack_f32(&pack_f32(&ramp(n_query * n_q_heads * head_dim, 0.013, -0.4), dt), dt);
+        let k =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.011, -0.5), dt), dt);
+        let v =
+            unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
+        let expected = naive_sdpa_multi(
+            &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, false, scale,
+        );
+
+        TestSetup::new(ffai_sdpa_multi::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
+            .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
+            .input(TestBuffer::from_vec("v", pack_f32(&v, dt), dt))
+            .input(TestBuffer::zeros("out", n_query * n_q_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_q_heads", n_q_heads as u32)
+            .constexpr("base_kv", base_kv as u32)
+            .constexpr("n_query", n_query as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("causal", 0u32)
+            .constexpr("scale", scale)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_sdpa_multi` (`class=GenericEmpty`).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_sdpa_multi;
+
+    #[bench(name = "ffai/sdpa_multi", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_multi(dt: DType) -> BenchSetup {
+        let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 128usize);
+        let (base_kv, n_query) = (4096usize, 8usize);
+        let kv_stride = base_kv + n_query;
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let n_kv = base_kv + n_query;
+        let bytes = (2 * n_query * n_q_heads * head_dim + 2 * n_kv_heads * n_kv * head_dim)
+            * dt.size_bytes();
+        BenchSetup::new(ffai_sdpa_multi::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", n_query * n_q_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("k", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("out", n_query * n_q_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_q_heads", n_q_heads as u32)
+            .constexpr("base_kv", base_kv as u32)
+            .constexpr("n_query", n_query as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("causal", 0u32)
+            .constexpr("scale", scale)
+            .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "ffai/sdpa_multi_tree_mask", dtypes = [f32, f16, bf16])]
+    fn bench_sdpa_multi_tree_mask(dt: DType) -> BenchSetup {
+        use super::ffai_sdpa_multi_tree_mask;
+        let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 128usize);
+        let (base_kv, n_query) = (4096usize, 8usize);
+        let kv_stride = base_kv + n_query;
+        let heads_per_group = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let n_kv = base_kv + n_query;
+        let bytes = (2 * n_query * n_q_heads * head_dim
+            + 2 * n_kv_heads * n_kv * head_dim
+            + n_query * n_query)
+            * dt.size_bytes();
+        BenchSetup::new(ffai_sdpa_multi_tree_mask::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("q", n_query * n_q_heads * head_dim, dt))
+            .buffer(BenchBuffer::random("k", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::random("v", n_kv_heads * kv_stride * head_dim, dt))
+            .buffer(BenchBuffer::zeros("mask", n_query * n_query, dt))
+            .buffer(BenchBuffer::zeros("out", n_query * n_q_heads * head_dim, dt).output())
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("n_q_heads", n_q_heads as u32)
+            .constexpr("base_kv", base_kv as u32)
+            .constexpr("n_query", n_query as u32)
+            .constexpr("kv_stride", kv_stride as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .constexpr("scale", scale)
+            .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+}

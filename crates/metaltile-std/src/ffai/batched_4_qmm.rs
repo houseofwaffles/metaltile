@@ -348,3 +348,195 @@ pub fn ffai_batched_4_qmm_fast<T>(
         }
     }
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_batched_4_qmm_fast;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn round(v: f32, dt: DType) -> f32 { unpack_f32(&pack_f32(&[v], dt), dt)[0] }
+    fn pack_u32(words: &[u32]) -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() }
+
+    fn source(n: usize, seed: u64, scale: f32, off: f32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s % 20_000) as f32 / 20_000.0 - 0.5) * scale + off
+            })
+            .collect()
+    }
+
+    fn quantize_int4_row(row: &[f32], group_size: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let in_dim = row.len();
+        let n_groups = in_dim / group_size;
+        let mut packed = vec![0u32; in_dim / 8];
+        let mut scales = vec![0.0_f32; n_groups];
+        let mut biases = vec![0.0_f32; n_groups];
+        for g in 0..n_groups {
+            let gs = &row[g * group_size..(g + 1) * group_size];
+            let mn = gs.iter().copied().fold(f32::INFINITY, f32::min);
+            let mx = gs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let range = mx - mn;
+            let scale = if range.abs() < 1e-10 { 1.0 } else { range / 15.0 };
+            scales[g] = scale;
+            biases[g] = mn;
+            for (i, &v) in gs.iter().enumerate() {
+                let q = ((v - mn) / scale).round().clamp(0.0, 15.0) as u32;
+                let d = g * group_size + i;
+                packed[d / 8] |= q << ((d % 8) * 4);
+            }
+        }
+        (packed, scales, biases)
+    }
+
+    fn quantize_matrix(
+        rows: &[f32],
+        out_dim: usize,
+        in_dim: usize,
+        gs: usize,
+    ) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        let (mut w, mut s, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for row in 0..out_dim {
+            let (pw, ps, pb) = quantize_int4_row(&rows[row * in_dim..(row + 1) * in_dim], gs);
+            w.extend(pw);
+            s.extend(ps);
+            b.extend(pb);
+        }
+        (w, s, b)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn naive_qmm(
+        weight: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        x: &[f32],
+        m: usize,
+        in_dim: usize,
+        gs: usize,
+        out_dim: usize,
+    ) -> Vec<f32> {
+        let u32_per_row = in_dim / 8;
+        let n_groups = in_dim / gs;
+        let mut out = vec![0.0_f32; m * out_dim];
+        for mi in 0..m {
+            let xr = &x[mi * in_dim..(mi + 1) * in_dim];
+            for row in 0..out_dim {
+                let rw = &weight[row * u32_per_row..(row + 1) * u32_per_row];
+                let rs = &scales[row * n_groups..(row + 1) * n_groups];
+                let rb = &biases[row * n_groups..(row + 1) * n_groups];
+                let mut acc = 0.0_f32;
+                for d in 0..in_dim {
+                    let q = (rw[d / 8] >> ((d % 8) * 4)) & 0xf;
+                    let g = d / gs;
+                    acc += (q as f32 * rs[g] + rb[g]) * xr[d];
+                }
+                out[mi * out_dim + row] = acc;
+            }
+        }
+        out
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 2e-1)]
+    fn test_batched_4_qmm_fast(dt: DType) -> TestSetup {
+        let (m, in_dim, gs) = (2usize, 512usize, 64usize);
+        let (out_a, out_b, out_c, out_d) = (16usize, 8usize, 8usize, 8usize);
+        let x: Vec<f32> =
+            source(m * in_dim, 0x11, 2.0, 0.05).iter().map(|&v| round(v, dt)).collect();
+        let wa = source(out_a * in_dim, 0x22, 3.0, 0.0);
+        let wb = source(out_b * in_dim, 0x33, 3.0, 0.0);
+        let wc = source(out_c * in_dim, 0x44, 3.0, 0.0);
+        let wd = source(out_d * in_dim, 0x55, 3.0, 0.0);
+        let (wa_p, sa, bias_a) = quantize_matrix(&wa, out_a, in_dim, gs);
+        let (wb_p, sb, bb) = quantize_matrix(&wb, out_b, in_dim, gs);
+        let (wc_p, sc, bc) = quantize_matrix(&wc, out_c, in_dim, gs);
+        let (wd_p, sd, bd) = quantize_matrix(&wd, out_d, in_dim, gs);
+        let r = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&v| round(v, dt)).collect() };
+
+        let ea = naive_qmm(&wa_p, &r(&sa), &r(&bias_a), &x, m, in_dim, gs, out_a);
+        let eb = naive_qmm(&wb_p, &r(&sb), &r(&bb), &x, m, in_dim, gs, out_b);
+        let ec = naive_qmm(&wc_p, &r(&sc), &r(&bc), &x, m, in_dim, gs, out_c);
+        let ed = naive_qmm(&wd_p, &r(&sd), &r(&bd), &x, m, in_dim, gs, out_d);
+
+        let n_tgs = out_a.max(out_b).max(out_c).max(out_d).div_ceil(8);
+        TestSetup::new(ffai_batched_4_qmm_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("w_a", pack_u32(&wa_p), DType::U32))
+            .input(TestBuffer::from_vec("scales_a", pack_f32(&sa, dt), dt))
+            .input(TestBuffer::from_vec("biases_a", pack_f32(&bias_a, dt), dt))
+            .input(TestBuffer::from_vec("w_b", pack_u32(&wb_p), DType::U32))
+            .input(TestBuffer::from_vec("scales_b", pack_f32(&sb, dt), dt))
+            .input(TestBuffer::from_vec("biases_b", pack_f32(&bb, dt), dt))
+            .input(TestBuffer::from_vec("w_c", pack_u32(&wc_p), DType::U32))
+            .input(TestBuffer::from_vec("scales_c", pack_f32(&sc, dt), dt))
+            .input(TestBuffer::from_vec("biases_c", pack_f32(&bc, dt), dt))
+            .input(TestBuffer::from_vec("w_d", pack_u32(&wd_p), DType::U32))
+            .input(TestBuffer::from_vec("scales_d", pack_f32(&sd, dt), dt))
+            .input(TestBuffer::from_vec("biases_d", pack_f32(&bd, dt), dt))
+            .input(TestBuffer::zeros("a_buf", m * out_a, dt))
+            .input(TestBuffer::zeros("b_buf", m * out_b, dt))
+            .input(TestBuffer::zeros("c_buf", m * out_c, dt))
+            .input(TestBuffer::zeros("d_buf", m * out_d, dt))
+            .constexpr("out_a", out_a as u32)
+            .constexpr("out_b", out_b as u32)
+            .constexpr("out_c", out_c as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("group_size", gs as u32)
+            .expect(TestBuffer::from_vec("a_buf", pack_f32(&ea, dt), dt))
+            .expect(TestBuffer::from_vec("b_buf", pack_f32(&eb, dt), dt))
+            .expect(TestBuffer::from_vec("c_buf", pack_f32(&ec, dt), dt))
+            .expect(TestBuffer::from_vec("d_buf", pack_f32(&ed, dt), dt))
+            .grid_3d(n_tgs as u32, m as u32, 4, [64, 1, 1])
+    }
+}
+
+/// New-syntax benchmark for `ffai_batched_4_qmm_fast` — MLX-less reduction
+/// kernel. M=4 prefill GDN shape (Qwen35): hidden 2048 → qkv/z/b/a projections.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_batched_4_qmm_fast;
+
+    #[bench(name = "ffai/batched_4_qmm_fast", dtypes = [f32, f16, bf16])]
+    fn bench_batched_4_qmm_fast(dt: DType) -> BenchSetup {
+        let (m, in_dim, gs) = (4usize, 2048usize, 64usize);
+        let (out_a, out_b, out_c, out_d) = (2048usize, 2048usize, 16usize, 16usize);
+        let ng = in_dim / gs;
+        let words = |o: usize| o * in_dim / 8;
+        let total = words(out_a) + words(out_b) + words(out_c) + words(out_d);
+        let n_tgs = out_a.max(out_b).max(out_c).max(out_d).div_ceil(8);
+        BenchSetup::new(ffai_batched_4_qmm_fast::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("x", m * in_dim, dt))
+            .buffer(BenchBuffer::random("w_a", words(out_a), DType::U32))
+            .buffer(BenchBuffer::random("scales_a", out_a * ng, dt))
+            .buffer(BenchBuffer::random("biases_a", out_a * ng, dt))
+            .buffer(BenchBuffer::random("w_b", words(out_b), DType::U32))
+            .buffer(BenchBuffer::random("scales_b", out_b * ng, dt))
+            .buffer(BenchBuffer::random("biases_b", out_b * ng, dt))
+            .buffer(BenchBuffer::random("w_c", words(out_c), DType::U32))
+            .buffer(BenchBuffer::random("scales_c", out_c * ng, dt))
+            .buffer(BenchBuffer::random("biases_c", out_c * ng, dt))
+            .buffer(BenchBuffer::random("w_d", words(out_d), DType::U32))
+            .buffer(BenchBuffer::random("scales_d", out_d * ng, dt))
+            .buffer(BenchBuffer::random("biases_d", out_d * ng, dt))
+            .buffer(BenchBuffer::zeros("a_buf", m * out_a, dt).output())
+            .buffer(BenchBuffer::zeros("b_buf", m * out_b, dt).output())
+            .buffer(BenchBuffer::zeros("c_buf", m * out_c, dt).output())
+            .buffer(BenchBuffer::zeros("d_buf", m * out_d, dt).output())
+            .constexpr("out_a", out_a as u32)
+            .constexpr("out_b", out_b as u32)
+            .constexpr("out_c", out_c as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("in_dim", in_dim as u32)
+            .constexpr("group_size", gs as u32)
+            .bytes_moved((total * 4) as u64)
+            .grid_3d(n_tgs as u32, m as u32, 4, [64, 1, 1])
+    }
+}

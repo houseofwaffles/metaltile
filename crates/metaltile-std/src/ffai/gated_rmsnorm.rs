@@ -114,3 +114,79 @@ pub fn ffai_gated_rmsnorm<T>(
         store(out[base + 3u32], o3.cast::<T>());
     }
 }
+
+/// New-syntax correctness for `ffai_gated_rmsnorm` (Reduction mode, one
+/// threadgroup per row, `tpg = n/4` — `n` a multiple of 128, `n ≤ 4096`).
+/// fp32-in / `T`-out split: `y` is always packed f32; `z` / `w` / `out` use
+/// `dt`. Per-row oracle: `out_i = w_i · y_i · rsqrt(mean(y²)+eps) · silu(z_i)`,
+/// with `silu(z) = z / (1 + exp(-z))`, on dtype-rounded `z` / `w`.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_gated_rmsnorm;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn setup(rows: usize, n: usize, dt: DType) -> TestSetup {
+        let eps = 1e-5f32;
+        // z and w are in the model dtype — round them; y stays full fp32.
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + ((i % 11) as f32 - 5.0) * 0.02).collect();
+        let w_dt = unpack_f32(&pack_f32(&w, dt), dt);
+        let mut y = Vec::with_capacity(rows * n);
+        let mut z = Vec::with_capacity(rows * n);
+        let mut expected = Vec::with_capacity(rows * n);
+        for r in 0..rows {
+            let yr: Vec<f32> =
+                (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.1 + r as f32 * 0.03).collect();
+            let zr_raw: Vec<f32> =
+                (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.07 + r as f32 * 0.02).collect();
+            let zr = unpack_f32(&pack_f32(&zr_raw, dt), dt);
+            let ms: f32 = yr.iter().map(|&v| v * v).sum::<f32>() / n as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for i in 0..n {
+                let silu = zr[i] / (1.0 + (-zr[i]).exp());
+                expected.push(yr[i] * inv * w_dt[i] * silu);
+            }
+            y.extend_from_slice(&yr);
+            z.extend_from_slice(&zr_raw);
+        }
+        TestSetup::new(ffai_gated_rmsnorm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            // `y` is fp32 regardless of T.
+            .input(TestBuffer::from_vec("y", pack_f32(&y, DType::F32), DType::F32))
+            .input(TestBuffer::from_vec("z", pack_f32(&z, dt), dt))
+            .input(TestBuffer::from_vec("w", pack_f32(&w, dt), dt))
+            .input(TestBuffer::zeros("out", rows * n, dt))
+            .input(TestBuffer::from_vec("eps_buf", eps.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("n", n as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 2e-2, 8e-2])]
+    fn test_ffai_gated_rmsnorm(dt: DType) -> TestSetup { setup(4, 512, dt) }
+}
+
+/// New-syntax benchmark for `ffai_gated_rmsnorm` (fused GDN post-step, fp32 `y`,
+/// `T` gate / weight / output, n=4096, tpg=1024 — the Apple TPG cap).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::ffai_gated_rmsnorm;
+
+    #[bench(name = "ffai/gated_rmsnorm/gated_rmsnorm", dtypes = [f32, f16, bf16])]
+    fn bench_gated_rmsnorm(dt: DType) -> BenchSetup {
+        let (rows, n) = (4096usize, 4096usize);
+        BenchSetup::new(ffai_gated_rmsnorm::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            // `y` is always fp32 (the GDN recurrence output).
+            .buffer(BenchBuffer::random("y", rows * n, DType::F32))
+            .buffer(BenchBuffer::random("z", rows * n, dt))
+            .buffer(BenchBuffer::random("w", n, dt))
+            .buffer(BenchBuffer::zeros("out", rows * n, dt).output())
+            .buffer(BenchBuffer::from_vec("eps_buf", 1e-5f32.to_le_bytes().to_vec(), DType::F32))
+            .constexpr("n", n as u32)
+            .grid_3d(rows as u32, 1, 1, [(n / 4) as u32, 1, 1])
+            // y (f32) + z (T) read, out (T) write.
+            .bytes_moved((rows * n * DType::F32.size_bytes() + 2 * rows * n * dt.size_bytes()) as u64)
+    }
+}

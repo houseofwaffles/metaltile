@@ -140,3 +140,130 @@ pub fn ffai_conv1d_causal_step_silu_cast_many<T>(
     store(state_out[1u32 * conv_dim + d], s1.cast::<T>());
     store(state_out[2u32 * conv_dim + d], s2.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::ffai_conv1d_causal_step_silu_cast_many;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    const CONV_KERNEL: u32 = 4;
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Per-channel CPU reference. Returns `(out, state_out)`, both
+    /// dtype-rounded to match the GPU load/store quantisation.
+    fn cpu_reference(
+        src: &[f32],
+        w: &[f32],
+        b: &[f32],
+        state_in: &[f32],
+        t_len: usize,
+        conv_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut out = vec![0.0f32; t_len * conv_dim];
+        let mut state_out = vec![0.0f32; 3 * conv_dim];
+        for d in 0..conv_dim {
+            let b_d = b[d];
+            let w0 = w[d];
+            let w1 = w[conv_dim + d];
+            let w2 = w[2 * conv_dim + d];
+            let w3 = w[3 * conv_dim + d];
+            let mut s0 = state_in[d];
+            let mut s1 = state_in[conv_dim + d];
+            let mut s2 = state_in[2 * conv_dim + d];
+            for r in 0..t_len {
+                let x_r = src[r * conv_dim + d];
+                let acc = b_d + w3 * x_r + w0 * s0 + w1 * s1 + w2 * s2;
+                let sig = 1.0f32 / (1.0f32 + (-acc).exp());
+                out[r * conv_dim + d] = acc * sig;
+                s0 = s1;
+                s1 = s2;
+                s2 = x_r;
+            }
+            state_out[d] = s0;
+            state_out[conv_dim + d] = s1;
+            state_out[2 * conv_dim + d] = s2;
+        }
+        (out, state_out)
+    }
+
+    fn setup(t_len: usize, conv_dim: usize, dt: DType) -> TestSetup {
+        let state_rows = (CONV_KERNEL - 1) as usize;
+        // Bounded inputs so SiLU's exp(-acc) stays well-conditioned.
+        let src_f = ramp(t_len * conv_dim, 13, 2.0);
+        let w_f = ramp(CONV_KERNEL as usize * conv_dim, 7, 0.6);
+        let b_f = ramp(conv_dim, 5, 0.2);
+        let state_f = ramp(state_rows * conv_dim, 11, 2.0);
+        // Round every input through `dt` so the f32-internal oracle sees
+        // the same load precision the kernel does.
+        let src = unpack_f32(&pack_f32(&src_f, dt), dt);
+        let w = unpack_f32(&pack_f32(&w_f, dt), dt);
+        let b = unpack_f32(&pack_f32(&b_f, dt), dt);
+        let state_in = unpack_f32(&pack_f32(&state_f, dt), dt);
+        let (out_exp, state_exp) = cpu_reference(&src, &w, &b, &state_in, t_len, conv_dim);
+        // `out_f32` is f32 regardless of `dt`; `state_out` is dtype-T and
+        // gets rounded on store, so round the expected state through `dt`.
+        let state_exp_t = unpack_f32(&pack_f32(&state_exp, dt), dt);
+        TestSetup::new(ffai_conv1d_causal_step_silu_cast_many::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("src", pack_f32(&src_f, dt), dt))
+            .input(TestBuffer::from_vec("w", pack_f32(&w_f, dt), dt))
+            .input(TestBuffer::from_vec("b", pack_f32(&b_f, dt), dt))
+            .input(TestBuffer::from_vec("state_in", pack_f32(&state_f, dt), dt))
+            .input(TestBuffer::zeros("out_f32", t_len * conv_dim, DType::F32))
+            .input(TestBuffer::zeros("state_out", state_rows * conv_dim, dt))
+            .constexpr("t_len", t_len as u32)
+            .constexpr("conv_dim", conv_dim as u32)
+            .constexpr("conv_kernel", CONV_KERNEL)
+            .expect(TestBuffer::from_vec("out_f32", pack_f32(&out_exp, DType::F32), DType::F32))
+            .expect(TestBuffer::from_vec("state_out", pack_f32(&state_exp_t, dt), dt))
+            .grid_3d(conv_dim as u32, 1, 1, [1, 1, 1])
+    }
+
+    // Short T-sweep, single-group conv_dim.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv1d_causal_many_small(dt: DType) -> TestSetup { setup(2, 64, dt) }
+
+    // Medium T-sweep, multi-group conv_dim.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv1d_causal_many_medium(dt: DType) -> TestSetup { setup(8, 256, dt) }
+}
+
+/// New-syntax bench for `ffai_conv1d_causal_step_silu_cast_many`
+/// (Qwen3.6-A3B GDN prefill shape). Grid3D, `grid_3d(conv_dim, 1, 1,
+/// [1, 1, 1])`. bytes_moved counts the f32 output stream + the T×conv_dim
+/// src read.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::ffai_conv1d_causal_step_silu_cast_many;
+
+    const CONV_KERNEL: u32 = 4;
+
+    fn bench_shape(t_len: usize, conv_dim: usize, dt: DType) -> BenchSetup {
+        let state_rows = (CONV_KERNEL - 1) as usize;
+        let kernel: Kernel = ffai_conv1d_causal_step_silu_cast_many::kernel_ir_for(dt);
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("src", t_len * conv_dim, dt))
+            .buffer(BenchBuffer::random("w", CONV_KERNEL as usize * conv_dim, dt))
+            .buffer(BenchBuffer::random("b", conv_dim, dt))
+            .buffer(BenchBuffer::random("state_in", state_rows * conv_dim, dt))
+            .buffer(BenchBuffer::zeros("out_f32", t_len * conv_dim, DType::F32).output())
+            .buffer(BenchBuffer::zeros("state_out", state_rows * conv_dim, dt).output())
+            .constexpr("t_len", t_len as u32)
+            .constexpr("conv_dim", conv_dim as u32)
+            .constexpr("conv_kernel", CONV_KERNEL)
+            .grid_3d(conv_dim as u32, 1, 1, [1, 1, 1])
+            .bytes_moved(((t_len * conv_dim) * (DType::F32.size_bytes() + dt.size_bytes())) as u64)
+    }
+
+    #[bench(name = "ffai/ssm/conv1d_causal_step_silu_cast_many", dtypes = [f32, f16, bf16])]
+    fn bench_conv1d_causal_many(dt: DType) -> BenchSetup {
+        // Qwen3.6-A3B GDN prefill: T=512, conv_dim=2048.
+        bench_shape(512, 2048, dt)
+    }
+}

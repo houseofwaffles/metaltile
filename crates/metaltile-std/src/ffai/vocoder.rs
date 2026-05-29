@@ -130,3 +130,146 @@ pub fn vocoder_istft<T>(
     let out_val = select(den > 1e-8f32, num / safe_den, 0.0f32);
     store(out[t], out_val.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::vocoder_istft;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    const PI: f32 = std::f32::consts::PI;
+
+    fn hann(n: usize) -> Vec<f32> {
+        (0..n).map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / n as f32).cos()).collect()
+    }
+
+    /// Forward STFT of a real signal → (re, im) planes `[n_frames, n_freq]`.
+    fn forward_stft(
+        signal: &[f32],
+        window: &[f32],
+        n_frames: usize,
+        n_fft: usize,
+        n_freq: usize,
+        hop: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut re = vec![0.0f32; n_frames * n_freq];
+        let mut im = vec![0.0f32; n_frames * n_freq];
+        let neg_two_pi_over_n = -2.0 * PI / n_fft as f32;
+        for f in 0..n_frames {
+            let start = f * hop;
+            for k in 0..n_freq {
+                let angle_step = neg_two_pi_over_n * k as f32;
+                let mut r = 0.0f32;
+                let mut i = 0.0f32;
+                for t in 0..n_fft {
+                    let xw = signal[start + t] * window[t];
+                    let angle = angle_step * t as f32;
+                    r += xw * angle.cos();
+                    i += xw * angle.sin();
+                }
+                re[f * n_freq + k] = r;
+                im[f * n_freq + k] = i;
+            }
+        }
+        (re, im)
+    }
+
+    /// Direct CPU iSTFT mirroring the kernel.
+    fn naive_istft(
+        spec_re: &[f32],
+        spec_im: &[f32],
+        window: &[f32],
+        n_frames: usize,
+        n_fft: usize,
+        n_freq: usize,
+        hop: usize,
+    ) -> Vec<f32> {
+        let out_len = (n_frames - 1) * hop + n_fft;
+        let nyquist = n_fft / 2;
+        let inv_n = 1.0 / n_fft as f32;
+        let two_pi_over_n = 2.0 * PI / n_fft as f32;
+        let mut out = vec![0.0f32; out_len];
+        for (t, o) in out.iter_mut().enumerate() {
+            let f_hi = (t / hop).min(n_frames - 1);
+            let f_lo = if t + 1 > n_fft { (t + 1 - n_fft).div_ceil(hop) } else { 0 };
+            let mut num = 0.0f32;
+            let mut den = 0.0f32;
+            for f in f_lo..=f_hi {
+                let tau = t - f * hop;
+                let angle_step = two_pi_over_n * tau as f32;
+                let row = f * n_freq;
+                let mut sample = 0.0f32;
+                for k in 0..n_freq {
+                    let re = spec_re[row + k];
+                    let im = spec_im[row + k];
+                    let angle = angle_step * k as f32;
+                    let contrib = re * angle.cos() - im * angle.sin();
+                    let w = if k == 0 || k == nyquist { 1.0 } else { 2.0 };
+                    sample += w * contrib;
+                }
+                sample *= inv_n;
+                let win = window[tau];
+                num += sample * win;
+                den += win * win;
+            }
+            *o = if den > 1e-8 { num / den } else { 0.0 };
+        }
+        out
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [2e-3, 3e-2, 1.5e-1])]
+    fn test_vocoder_istft(dt: DType) -> TestSetup {
+        // Kokoro-style small iSTFTNet tail (n_fft=16, hop=4 satisfies COLA).
+        let (n_frames, n_fft, hop) = (6usize, 16usize, 4usize);
+        let n_freq = n_fft / 2 + 1;
+        let out_len = (n_frames - 1) * hop + n_fft;
+        let window = hann(n_fft);
+        let signal: Vec<f32> =
+            (0..out_len).map(|i| (i as f32 * 0.21).sin() + (i as f32 * 0.07).cos() * 0.4).collect();
+        let (re, im) = forward_stft(&signal, &window, n_frames, n_fft, n_freq, hop);
+        // Oracle on dtype-rounded inputs so the compare is tight.
+        let re_dt = unpack_f32(&pack_f32(&re, dt), dt);
+        let im_dt = unpack_f32(&pack_f32(&im, dt), dt);
+        let win_dt = unpack_f32(&pack_f32(&window, dt), dt);
+        let expected = naive_istft(&re_dt, &im_dt, &win_dt, n_frames, n_fft, n_freq, hop);
+        TestSetup::new(vocoder_istft::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("spec_re", pack_f32(&re, dt), dt))
+            .input(TestBuffer::from_vec("spec_im", pack_f32(&im, dt), dt))
+            .input(TestBuffer::from_vec("window", pack_f32(&window, dt), dt))
+            .input(TestBuffer::zeros("out", out_len, dt))
+            .constexpr("n_frames", n_frames as u32)
+            .constexpr("n_fft", n_fft as u32)
+            .constexpr("n_freq", n_freq as u32)
+            .constexpr("hop_length", hop as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(out_len, 256)
+    }
+}
+
+/// New-syntax benchmark for `vocoder_istft` — a Kokoro-class iSTFTNet tail
+/// over many frames (Grid3D, one thread per output sample).
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::vocoder_istft;
+
+    #[bench(name = "ffai/vocoder/istft", dtypes = [f32, f16, bf16])]
+    fn bench_vocoder_istft(dt: DType) -> BenchSetup {
+        let (n_frames, n_fft, hop) = (2048usize, 20usize, 5usize);
+        let n_freq = n_fft / 2 + 1;
+        let out_len = (n_frames - 1) * hop + n_fft;
+        BenchSetup::new(vocoder_istft::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("spec_re", n_frames * n_freq, dt))
+            .buffer(BenchBuffer::random("spec_im", n_frames * n_freq, dt))
+            .buffer(BenchBuffer::random("window", n_fft, dt))
+            .buffer(BenchBuffer::zeros("out", out_len, dt).output())
+            .constexpr("n_frames", n_frames as u32)
+            .constexpr("n_fft", n_fft as u32)
+            .constexpr("n_freq", n_freq as u32)
+            .constexpr("hop_length", hop as u32)
+            .grid_1d(out_len, 256)
+            .bytes_moved((out_len * dt.size_bytes()) as u64)
+    }
+}

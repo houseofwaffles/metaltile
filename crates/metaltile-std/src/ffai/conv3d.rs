@@ -301,3 +301,338 @@ pub fn conv3d_grouped<T>(
     }
     store(out[idx], acc.cast::<T>());
 }
+
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::{conv3d_generic, conv3d_grouped};
+    use crate::utils::{pack_f32, unpack_f32};
+
+    fn ramp(n: usize, period: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % period) as f32 / period as f32 - 0.5) * amp).collect()
+    }
+
+    /// Direct 3D conv oracle (NCDHW input, OIDHW weight, I = in_ch/groups).
+    /// Padding taps contribute zero; dilation scales tap offsets. f32.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn naive_conv3d(
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        batch: usize,
+        in_ch: usize,
+        in_d: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kd: usize,
+        kh: usize,
+        kw: usize,
+        stride_d: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_d: usize,
+        pad_h: usize,
+        pad_w: usize,
+        dilation_d: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        icpg: usize,
+        ocpg: usize,
+    ) -> Vec<f32> {
+        let out_d = (in_d + 2 * pad_d - ((kd - 1) * dilation_d + 1)) / stride_d + 1;
+        let out_h = (in_h + 2 * pad_h - ((kh - 1) * dilation_h + 1)) / stride_h + 1;
+        let out_w = (in_w + 2 * pad_w - ((kw - 1) * dilation_w + 1)) / stride_w + 1;
+        let mut out = vec![0.0f32; batch * out_ch * out_d * out_h * out_w];
+        for n in 0..batch {
+            for oc in 0..out_ch {
+                let group = oc / ocpg;
+                let ic_base = group * icpg;
+                for od in 0..out_d {
+                    for oh in 0..out_h {
+                        for ow in 0..out_w {
+                            let mut acc = bias[oc];
+                            for wic in 0..icpg {
+                                let real_ic = ic_base + wic;
+                                for kz in 0..kd {
+                                    for ky in 0..kh {
+                                        for kx in 0..kw {
+                                            let pd = od * stride_d + kz * dilation_d;
+                                            let ph = oh * stride_h + ky * dilation_h;
+                                            let pw = ow * stride_w + kx * dilation_w;
+                                            if pd < pad_d
+                                                || pd >= pad_d + in_d
+                                                || ph < pad_h
+                                                || ph >= pad_h + in_h
+                                                || pw < pad_w
+                                                || pw >= pad_w + in_w
+                                            {
+                                                continue;
+                                            }
+                                            let id = pd - pad_d;
+                                            let ih = ph - pad_h;
+                                            let iw = pw - pad_w;
+                                            let in_idx =
+                                                (((n * in_ch + real_ic) * in_d + id) * in_h + ih)
+                                                    * in_w
+                                                    + iw;
+                                            let w_idx =
+                                                (((oc * icpg + wic) * kd + kz) * kh + ky) * kw + kx;
+                                            acc += input[in_idx] * weight[w_idx];
+                                        }
+                                    }
+                                }
+                            }
+                            let o_idx =
+                                (((n * out_ch + oc) * out_d + od) * out_h + oh) * out_w + ow;
+                            out[o_idx] = acc;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Setup for the dense `conv3d_generic` path (groups=1, dilation=1).
+    #[allow(clippy::too_many_arguments)]
+    fn generic_setup(
+        batch: usize,
+        in_ch: usize,
+        in_d: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kd: usize,
+        kh: usize,
+        kw: usize,
+        stride_d: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_d: usize,
+        pad_h: usize,
+        pad_w: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let out_d = (in_d + 2 * pad_d - kd) / stride_d + 1;
+        let out_h = (in_h + 2 * pad_h - kh) / stride_h + 1;
+        let out_w = (in_w + 2 * pad_w - kw) / stride_w + 1;
+        let n_out = batch * out_ch * out_d * out_h * out_w;
+        let input_f = ramp(batch * in_ch * in_d * in_h * in_w, 13, 6.0);
+        let weight_f = ramp(out_ch * in_ch * kd * kh * kw, 11, 4.0);
+        let bias_f = ramp(out_ch, 5, 2.0);
+        let input = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let bias = unpack_f32(&pack_f32(&bias_f, dt), dt);
+        let expected = naive_conv3d(
+            &input, &weight, &bias, batch, in_ch, in_d, in_h, in_w, out_ch, kd, kh, kw, stride_d,
+            stride_h, stride_w, pad_d, pad_h, pad_w, 1, 1, 1, in_ch, out_ch,
+        );
+        TestSetup::new(conv3d_generic::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::from_vec("bias", pack_f32(&bias_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_d", in_d as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kd", kd as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .constexpr("stride_d", stride_d as u32)
+            .constexpr("stride_h", stride_h as u32)
+            .constexpr("stride_w", stride_w as u32)
+            .constexpr("pad_d", pad_d as u32)
+            .constexpr("pad_h", pad_h as u32)
+            .constexpr("pad_w", pad_w as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_out, 256)
+    }
+
+    /// Setup for the grouped / dilated `conv3d_grouped` path.
+    #[allow(clippy::too_many_arguments)]
+    fn grouped_setup(
+        batch: usize,
+        in_ch: usize,
+        in_d: usize,
+        in_h: usize,
+        in_w: usize,
+        out_ch: usize,
+        kd: usize,
+        kh: usize,
+        kw: usize,
+        stride_d: usize,
+        stride_h: usize,
+        stride_w: usize,
+        pad_d: usize,
+        pad_h: usize,
+        pad_w: usize,
+        dilation_d: usize,
+        dilation_h: usize,
+        dilation_w: usize,
+        groups: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let (icpg, ocpg) = (in_ch / groups, out_ch / groups);
+        let out_d = (in_d + 2 * pad_d - ((kd - 1) * dilation_d + 1)) / stride_d + 1;
+        let out_h = (in_h + 2 * pad_h - ((kh - 1) * dilation_h + 1)) / stride_h + 1;
+        let out_w = (in_w + 2 * pad_w - ((kw - 1) * dilation_w + 1)) / stride_w + 1;
+        let n_out = batch * out_ch * out_d * out_h * out_w;
+        let input_f = ramp(batch * in_ch * in_d * in_h * in_w, 13, 6.0);
+        let weight_f = ramp(out_ch * icpg * kd * kh * kw, 11, 4.0);
+        let bias_f = ramp(out_ch, 5, 2.0);
+        let input = unpack_f32(&pack_f32(&input_f, dt), dt);
+        let weight = unpack_f32(&pack_f32(&weight_f, dt), dt);
+        let bias = unpack_f32(&pack_f32(&bias_f, dt), dt);
+        let expected = naive_conv3d(
+            &input, &weight, &bias, batch, in_ch, in_d, in_h, in_w, out_ch, kd, kh, kw, stride_d,
+            stride_h, stride_w, pad_d, pad_h, pad_w, dilation_d, dilation_h, dilation_w, icpg,
+            ocpg,
+        );
+        TestSetup::new(conv3d_grouped::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("input", pack_f32(&input_f, dt), dt))
+            .input(TestBuffer::from_vec("weight", pack_f32(&weight_f, dt), dt))
+            .input(TestBuffer::from_vec("bias", pack_f32(&bias_f, dt), dt))
+            .input(TestBuffer::zeros("out", n_out, dt))
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_d", in_d as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kd", kd as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .constexpr("stride_d", stride_d as u32)
+            .constexpr("stride_h", stride_h as u32)
+            .constexpr("stride_w", stride_w as u32)
+            .constexpr("pad_d", pad_d as u32)
+            .constexpr("pad_h", pad_h as u32)
+            .constexpr("pad_w", pad_w as u32)
+            .constexpr("dilation_d", dilation_d as u32)
+            .constexpr("dilation_h", dilation_h as u32)
+            .constexpr("dilation_w", dilation_w as u32)
+            .constexpr("icpg", icpg as u32)
+            .constexpr("ocpg", ocpg as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_1d(n_out, 256)
+    }
+
+    // Padded 3×3×3 stride-1 dense conv — padding clamp on every axis.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv3d_generic(dt: DType) -> TestSetup {
+        generic_setup(2, 3, 7, 9, 8, 5, 3, 3, 3, 1, 1, 1, 1, 1, 1, dt)
+    }
+
+    // Strided anisotropic conv, no padding (video-VLM patch stem shape).
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv3d_generic_strided(dt: DType) -> TestSetup {
+        generic_setup(1, 4, 12, 16, 14, 6, 2, 3, 3, 2, 2, 2, 0, 0, 0, dt)
+    }
+
+    // Depthwise 3D conv: groups == in_ch == out_ch.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv3d_grouped_depthwise(dt: DType) -> TestSetup {
+        grouped_setup(2, 6, 8, 10, 10, 6, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6, dt)
+    }
+
+    // groups=2 + dilation=2 + stride=2 — every degree of freedom at once.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 8e-3, 4e-2])]
+    fn test_conv3d_grouped_full(dt: DType) -> TestSetup {
+        grouped_setup(1, 6, 16, 18, 18, 8, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, dt)
+    }
+}
+
+/// New-syntax benches for the conv3d family. Grid3D, `grid_1d(n_out, 256)`.
+/// bytes_moved counts the output stream.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::{conv3d_generic, conv3d_grouped};
+
+    #[bench(name = "ffai/conv3d/generic", dtypes = [f32, f16, bf16])]
+    fn bench_conv3d_generic(dt: DType) -> BenchSetup {
+        let (batch, in_ch, in_d, in_h, in_w, out_ch) =
+            (1usize, 16usize, 16usize, 32usize, 32usize, 32usize);
+        let (kd, kh, kw) = (3usize, 3usize, 3usize);
+        let out_d = in_d - kd + 1;
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let n_out = batch * out_ch * out_d * out_h * out_w;
+        BenchSetup::new(conv3d_generic::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("input", batch * in_ch * in_d * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", out_ch * in_ch * kd * kh * kw, dt))
+            .buffer(BenchBuffer::random("bias", out_ch, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", in_ch as u32)
+            .constexpr("in_d", in_d as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", out_ch as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kd", kd as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .constexpr("stride_d", 1u32)
+            .constexpr("stride_h", 1u32)
+            .constexpr("stride_w", 1u32)
+            .constexpr("pad_d", 0u32)
+            .constexpr("pad_h", 0u32)
+            .constexpr("pad_w", 0u32)
+            .grid_1d(n_out, 256)
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+
+    #[bench(name = "ffai/conv3d/grouped", dtypes = [f32, f16, bf16])]
+    fn bench_conv3d_grouped(dt: DType) -> BenchSetup {
+        // Depthwise 3×3×3 stride-1, groups == in_ch == out_ch.
+        let (batch, ch, in_d, in_h, in_w) = (1usize, 32usize, 16usize, 32usize, 32usize);
+        let (kd, kh, kw) = (3usize, 3usize, 3usize);
+        let out_d = in_d - kd + 1;
+        let out_h = in_h - kh + 1;
+        let out_w = in_w - kw + 1;
+        let n_out = batch * ch * out_d * out_h * out_w;
+        BenchSetup::new(conv3d_grouped::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .buffer(BenchBuffer::random("input", batch * ch * in_d * in_h * in_w, dt))
+            .buffer(BenchBuffer::random("weight", ch * kd * kh * kw, dt))
+            .buffer(BenchBuffer::random("bias", ch, dt))
+            .buffer(BenchBuffer::zeros("out", n_out, dt).output())
+            .constexpr("in_ch", ch as u32)
+            .constexpr("in_d", in_d as u32)
+            .constexpr("in_h", in_h as u32)
+            .constexpr("in_w", in_w as u32)
+            .constexpr("out_ch", ch as u32)
+            .constexpr("out_d", out_d as u32)
+            .constexpr("out_h", out_h as u32)
+            .constexpr("out_w", out_w as u32)
+            .constexpr("kd", kd as u32)
+            .constexpr("kh", kh as u32)
+            .constexpr("kw", kw as u32)
+            .constexpr("stride_d", 1u32)
+            .constexpr("stride_h", 1u32)
+            .constexpr("stride_w", 1u32)
+            .constexpr("pad_d", 0u32)
+            .constexpr("pad_h", 0u32)
+            .constexpr("pad_w", 0u32)
+            .constexpr("dilation_d", 1u32)
+            .constexpr("dilation_h", 1u32)
+            .constexpr("dilation_w", 1u32)
+            .constexpr("icpg", 1u32)
+            .constexpr("ocpg", 1u32)
+            .grid_1d(n_out, 256)
+            .bytes_moved((n_out * dt.size_bytes()) as u64)
+    }
+}
