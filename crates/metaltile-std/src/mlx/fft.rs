@@ -450,12 +450,12 @@ pub fn mt_fft_bluestein_postprocess<T>(
 /// individual stages). Inputs are kept small + dtype-rounded so the f32
 /// threadgroup math the kernels use matches the oracle within an absolute tol.
 pub mod kernel_tests {
+    use std::f32::consts::PI;
+
     use metaltile::{core::ir::Kernel, test::*, test_kernel};
 
     use super::*;
     use crate::utils::{pack_f32, unpack_f32};
-
-    const PI: f32 = 3.141592653589793;
 
     /// Naive O(N²) DFT (`inv=false`) / IDFT (`inv=true`, 1/N scaled) per row.
     fn naive_dft(re: &[f32], im: &[f32], rows: usize, n: usize, inv: bool) -> (Vec<f32>, Vec<f32>) {
@@ -548,7 +548,11 @@ pub mod kernel_tests {
             .constexpr("m_len", m_len as u32)
             .expect(TestBuffer::from_vec("filter_re", u8re(&fr), DType::F32))
             .expect(TestBuffer::from_vec("filter_im", u8re(&fi), DType::F32))
-            .grid_3d(m_len as u32, 1, 1, [m_len as u32, 1, 1])
+            // Grid3D, unguarded `filter[m]` store: total threads must equal
+            // m_len exactly (grid_1d → one group of m_len; grid_3d's first arg
+            // is a *group count*, so the prior `(m_len, …, [m_len,…])` launched
+            // m_len² threads and wrote out of bounds).
+            .grid_1d(m_len, m_len as u32)
     }
 
     /// preprocess: chirp pre-multiply + zero-pad input `[rows,n]` → `[rows,m]`.
@@ -703,7 +707,10 @@ pub mod kernel_benches {
             .constexpr("n_len", N_LEN as u32)
             .constexpr("m_len", M_LEN as u32)
             .with_shape_label(format!("M={M_LEN} f32"))
-            .grid_3d(M_LEN as u32, 1, 1, [256, 1, 1])
+            // Grid3D, unguarded `filter[m]` store: total threads = M_LEN
+            // exactly (M_LEN is a multiple of 256). grid_3d's first arg is a
+            // group *count*, so the prior form launched M_LEN×256 threads.
+            .grid_1d(M_LEN, 256)
             .bytes_moved((2 * M_LEN * 4) as u64)
     }
     #[bench(name = "mlx/fft/bluestein_preprocess", dtypes = [f32, f16, bf16])]

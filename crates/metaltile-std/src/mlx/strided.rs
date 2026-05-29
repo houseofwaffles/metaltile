@@ -221,7 +221,11 @@ pub mod kernel_benches {
                 "{rows}×{dest_cols} pad{pad} {}",
                 crate::bench_types::dtype_label(dt)
             ))
-            .grid_3d(rows as u32, dest_cols as u32, 1, [1, 1, 1])
+            // Grid3D, unguarded: total threads = [rows, dest_cols] exactly.
+            // 256-wide threadgroups along the contiguous (col) axis — dest_cols
+            // is a multiple of 256, so groups·tpg lands exactly on the extent
+            // (a [1,1,1] tpg would launch rows×dest_cols single-thread groups).
+            .grid_3d(rows as u32, (dest_cols / 256) as u32, 1, [1, 256, 1])
             .bytes_moved((2 * rows * dest_cols * dt.size_bytes()) as u64)
     }
 
@@ -241,7 +245,12 @@ pub mod kernel_benches {
                 "{d0}×{d1} transpose {}",
                 crate::bench_types::dtype_label(dt)
             ))
-            .grid_3d(n_out as u32, 1, 1, [256, 1, 1])
+            // Grid3D, unguarded `out[p]` store: total threads must equal
+            // n_out exactly. grid_1d sets groups = n_out/tpg; n_out is a
+            // multiple of 256 so nothing over-dispatches. (grid_3d's first
+            // args are threadgroup *counts*, not total threads — passing
+            // n_out there would launch n_out×256 threads and write OOB.)
+            .grid_1d(n_out, 256)
             .bytes_moved((2 * n_out * dt.size_bytes()) as u64)
     }
 }
