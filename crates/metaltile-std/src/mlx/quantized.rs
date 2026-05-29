@@ -5834,7 +5834,7 @@ pub mod kernel_tests {
 
     /// Deterministic packed int-`bits` weights for an `[n, k]` matrix, codes
     /// packed little-endian along k (`pack_factor = 32/bits` codes per u32).
-    fn synth_packed_w(n: usize, k: usize, bits: u32) -> Vec<u32> {
+    pub(crate) fn synth_packed_w(n: usize, k: usize, bits: u32) -> Vec<u32> {
         let pack_factor = 32 / bits as usize;
         let mask = (1u32 << bits) - 1;
         let n_packs = n * k / pack_factor;
@@ -5853,7 +5853,7 @@ pub mod kernel_tests {
     /// Dequant-then-matmul reference. `w` packs an `[n, k]` int-`bits` matrix,
     /// `scales`/`biases` are `[n, k/group_size]`, `x` is `[m, k]`, output `[m, n]`.
     #[allow(clippy::too_many_arguments)]
-    fn qmm_oracle(
+    pub(crate) fn qmm_oracle(
         w: &[u32],
         scales: &[f32],
         biases: &[f32],
@@ -5890,7 +5890,7 @@ pub mod kernel_tests {
     /// dispatch contract. All use Reduction mode (the `tgid_x`/`tgid_y`/`simd_*`
     /// aliases the bodies reference).
     #[allow(clippy::too_many_arguments)]
-    fn qx_setup(
+    pub(crate) fn qx_setup(
         kernel: Kernel,
         m: usize,
         n: usize,
@@ -6225,7 +6225,7 @@ pub mod kernel_benches {
     // Representative production shape (n=k=4096, group_size=64). bytes_moved
     // counts the packed weights (the dominant stream) plus scales/biases, x, y.
     #[allow(clippy::too_many_arguments)]
-    fn qmb(
+    pub(crate) fn qmb(
         kernel: Kernel,
         m: usize,
         n: usize,

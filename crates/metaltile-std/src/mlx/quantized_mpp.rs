@@ -221,3 +221,54 @@ mod tests {
         }
     }
 }
+
+/// New-syntax correctness + benchmark for `mt_qmm_mma_mpp` (MPP/NAX tensor-core
+/// quantized matmul). The dequant-then-matmul math is identical to the
+/// `quantized` qmm-MMA family (group_size 64 baked), so this reuses the
+/// shared CPU oracle / bench builder rather than restating them.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::mt_qmm_mma_mpp;
+    use crate::mlx::quantized::kernel_tests::qx_setup;
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
+    fn test_qmm_mma_mpp(dt: DType) -> TestSetup {
+        qx_setup(
+            mt_qmm_mma_mpp::kernel_ir_for(dt),
+            32,
+            64,
+            512,
+            4,
+            64,
+            true,
+            [2, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+}
+
+/// New-syntax benchmark for `mt_qmm_mma_mpp`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_qmm_mma_mpp;
+    use crate::mlx::quantized::kernel_benches::qmb;
+
+    #[bench(name = "mlx/quantized/qmm_mma_mpp", dtypes = [f32, f16, bf16])]
+    fn bench_qmm_mma_mpp(dt: DType) -> BenchSetup {
+        qmb(
+            mt_qmm_mma_mpp::kernel_ir_for(dt),
+            32,
+            4096,
+            4096,
+            4,
+            64,
+            true,
+            [128, 1, 1],
+            [128, 1, 1],
+            dt,
+        )
+    }
+}

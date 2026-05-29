@@ -508,3 +508,188 @@ pub fn mt_fp8_e4m3_qmm_mma<T>(
         simdgroup_elem_load(c_f11, 1).cast::<T>(),
     );
 }
+
+/// New-syntax correctness for the floating-point MMA quantized-matmul kernels
+/// (`mt_fp4_qmm_mma`, `mt_fp8_e4m3_qmm_mma`). These are scale-only (no bias):
+/// the oracle replays the exact E2M1 / E4M3 codebook decode the kernel uses
+/// (the legacy `fp_quantized_mma_gpu_correctness.rs` checks the same via
+/// cosine similarity). Inputs are small + dtype-rounded so an absolute
+/// tolerance is meaningful. The fp4 decode is reused by `fp_quantized_nax`.
+pub mod kernel_tests {
+    use metaltile::{core::ir::Kernel, test::*, test_kernel};
+
+    use super::{mt_fp4_qmm_mma, mt_fp8_e4m3_qmm_mma};
+    use crate::utils::{pack_f32, unpack_f32};
+
+    /// Decode one E2M1 fp4 nibble (`sign · two_m_int / 2`).
+    pub(crate) fn fp4_decode(nibble: u32) -> f32 {
+        let sign = 1.0 - 2.0 * ((nibble >> 3) & 1) as f32;
+        let code3 = nibble & 7;
+        let exp = code3 >> 1;
+        let mantissa = code3 & 1;
+        let two_m_int = if exp > 0 { (mantissa + 2) << (exp - 1) } else { mantissa };
+        sign * two_m_int as f32 * 0.5
+    }
+
+    /// Decode one E4M3 fp8 code (bias 7; subnormal when `e_raw == 0`).
+    pub(crate) fn fp8_e4m3_decode(code: u32) -> f32 {
+        let sign = 1.0 - 2.0 * (code >> 7) as f32;
+        let c = code & 0x7F;
+        let e = c >> 3;
+        let m = c & 7;
+        let mag = if e > 0 {
+            (e as f32 - 7.0).exp2() * (1.0 + m as f32 * 0.125)
+        } else {
+            (-6.0f32).exp2() * m as f32 * 0.125
+        };
+        sign * mag
+    }
+
+    /// Pack fp codes into u32 words: `32/bits` codes per word, LSB first.
+    pub(crate) fn pack_fp_codes(codes: &[u32], bits: u32) -> Vec<u32> {
+        let per = 32 / bits as usize;
+        let mask = (1u32 << bits) - 1;
+        codes
+            .chunks_exact(per)
+            .map(|ch| {
+                ch.iter().enumerate().fold(0u32, |a, (i, &c)| a | ((c & mask) << (i as u32 * bits)))
+            })
+            .collect()
+    }
+
+    /// Deterministic valid fp codes for an `[n, k]` matrix (fp4: 0..15; fp8:
+    /// normal range, `e_raw ≥ 1`, no NaN/inf).
+    pub(crate) fn synth_fp_codes(n: usize, k: usize, bits: u32) -> Vec<u32> {
+        (0..n * k)
+            .map(|i| {
+                if bits == 4 {
+                    (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(12) & 0xF
+                } else {
+                    let c = (i as u32).wrapping_mul(2_654_435_761).wrapping_shr(11) & 0x7F;
+                    let e = ((c >> 3) & 0xF).max(1);
+                    (e << 3) | (c & 7)
+                }
+            })
+            .collect()
+    }
+
+    /// fp dequant-then-matmul oracle (scale-only). `codes` is `[n, k]`,
+    /// `scales` is `[n, k/group_size]`, `x` is `[m, k]`, output `[m, n]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fp_qmm_oracle(
+        codes: &[u32],
+        scales: &[f32],
+        x: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let gspr = k / group_size;
+        let mut out = vec![0.0f32; m * n];
+        for mr in 0..m {
+            for nc in 0..n {
+                let mut acc = 0.0f32;
+                for d in 0..k {
+                    let g = d / group_size;
+                    let dec = if bits == 4 {
+                        fp4_decode(codes[nc * k + d])
+                    } else {
+                        fp8_e4m3_decode(codes[nc * k + d])
+                    };
+                    acc += scales[nc * gspr + g] * dec * x[mr * k + d];
+                }
+                out[mr * n + nc] = acc;
+            }
+        }
+        out
+    }
+
+    /// Shared setup for the scale-only fp matmul kernels (group_size 32).
+    pub(crate) fn fp_setup(
+        kernel: Kernel,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        dt: DType,
+    ) -> TestSetup {
+        let group_size = 32usize;
+        let gspr = k / group_size;
+        let codes = synth_fp_codes(n, k, bits);
+        let packed = pack_fp_codes(&codes, bits);
+        let scales_f: Vec<f32> = (0..n * gspr).map(|i| 0.05 + (i % 9) as f32 * 0.01).collect();
+        let x_f: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let s = unpack_f32(&pack_f32(&scales_f, dt), dt);
+        let x = unpack_f32(&pack_f32(&x_f, dt), dt);
+        let expected = fp_qmm_oracle(&codes, &s, &x, m, n, k, bits, group_size);
+        TestSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec(
+                "w",
+                packed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                DType::U32,
+            ))
+            .input(TestBuffer::from_vec("scales", pack_f32(&scales_f, dt), dt))
+            .input(TestBuffer::from_vec("x", pack_f32(&x_f, dt), dt))
+            .input(TestBuffer::zeros("out", m * n, dt))
+            .constexpr("k", k as u32)
+            .constexpr("n", n as u32)
+            .constexpr("gs_per_row", gspr as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d((n / 32) as u32, (m / 32) as u32, 1, [128, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 1e-2, 5e-2])]
+    fn test_fp4_qmm_mma(dt: DType) -> TestSetup {
+        fp_setup(mt_fp4_qmm_mma::kernel_ir_for(dt), 32, 32, 128, 4, dt)
+    }
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 1e-2, 5e-2])]
+    fn test_fp8_e4m3_qmm_mma(dt: DType) -> TestSetup {
+        fp_setup(mt_fp8_e4m3_qmm_mma::kernel_ir_for(dt), 32, 32, 128, 8, dt)
+    }
+}
+
+/// New-syntax benchmarks for the fp MMA quantized-matmul kernels.
+pub mod kernel_benches {
+    use metaltile::{bench, core::ir::Kernel, test::*};
+
+    use super::{mt_fp4_qmm_mma, mt_fp8_e4m3_qmm_mma};
+
+    pub(crate) fn fpb(
+        kernel: Kernel,
+        m: usize,
+        n: usize,
+        k: usize,
+        bits: u32,
+        dt: DType,
+    ) -> BenchSetup {
+        let group_size = 32usize;
+        let gspr = k / group_size;
+        let pf = 32 / bits as usize;
+        let sz = dt.size_bytes();
+        let bytes = n * k * bits as usize / 8 + n * gspr * sz + m * k * sz + m * n * sz;
+        BenchSetup::new(kernel)
+            .mode(KernelMode::Reduction)
+            .buffer(BenchBuffer::random("w", n * k / pf, DType::U32))
+            .buffer(BenchBuffer::random("scales", n * gspr, dt))
+            .buffer(BenchBuffer::random("x", m * k, dt))
+            .buffer(BenchBuffer::zeros("out", m * n, dt).output())
+            .constexpr("k", k as u32)
+            .constexpr("n", n as u32)
+            .constexpr("gs_per_row", gspr as u32)
+            .with_shape_label(format!("m{m} n{n} k{k} {}", crate::bench_types::dtype_label(dt)))
+            .grid_3d((n / 32) as u32, (m / 32) as u32, 1, [128, 1, 1])
+            .bytes_moved(bytes as u64)
+    }
+
+    #[bench(name = "mlx/fp_quantized/fp4_qmm_mma", dtypes = [f32, f16, bf16])]
+    fn bench_fp4_qmm_mma(dt: DType) -> BenchSetup {
+        fpb(mt_fp4_qmm_mma::kernel_ir_for(dt), 32, 4096, 4096, 4, dt)
+    }
+    #[bench(name = "mlx/fp_quantized/fp8_e4m3_qmm_mma", dtypes = [f32, f16, bf16])]
+    fn bench_fp8_e4m3_qmm_mma(dt: DType) -> BenchSetup {
+        fpb(mt_fp8_e4m3_qmm_mma::kernel_ir_for(dt), 32, 4096, 4096, 8, dt)
+    }
+}

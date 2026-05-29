@@ -234,3 +234,31 @@ mod tests {
         }
     }
 }
+
+/// New-syntax correctness + benchmark for `mt_fp_qmm_nax` — the MPP
+/// (matmul2d) fp4 E2M1 matmul. Same scale-only E2M1 dequant as
+/// `mt_fp4_qmm_mma`, so this reuses that file's shared oracle / bench builder.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::mt_fp_qmm_nax;
+    use crate::mlx::fp_quantized_mma::kernel_tests::fp_setup;
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 1e-2, 5e-2])]
+    fn test_fp_qmm_nax(dt: DType) -> TestSetup {
+        fp_setup(mt_fp_qmm_nax::kernel_ir_for(dt), 32, 32, 128, 4, dt)
+    }
+}
+
+/// New-syntax benchmark for `mt_fp_qmm_nax`.
+pub mod kernel_benches {
+    use metaltile::{bench, test::*};
+
+    use super::mt_fp_qmm_nax;
+    use crate::mlx::fp_quantized_mma::kernel_benches::fpb;
+
+    #[bench(name = "mlx/fp_quantized/fp_qmm_nax", dtypes = [f32, f16, bf16])]
+    fn bench_fp_qmm_nax(dt: DType) -> BenchSetup {
+        fpb(mt_fp_qmm_nax::kernel_ir_for(dt), 32, 4096, 4096, 4, dt)
+    }
+}
