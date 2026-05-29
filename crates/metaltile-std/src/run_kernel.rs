@@ -186,8 +186,9 @@ fn dispatch_outputs(ctx: &Context, setup: &TestSetup) -> Result<BTreeMap<String,
 ///
 /// Returns an [`OpResult`] (already reported through the active result
 /// reporter), or `None` if MSL generation/compilation fails, a buffer the
-/// kernel expects is missing from the setup, the kernel uses strided params
-/// (not yet supported here), or timing is unavailable (e.g. off-GPU platforms).
+/// kernel expects is missing from the setup (including the `_shape`/`_strides`
+/// metadata buffers a `#[strided]` param requires), or timing is unavailable
+/// (e.g. off-GPU platforms).
 ///
 /// Correctness is **not** checked here — it is proven by the kernel's
 /// `#[test_kernel]`s via `tile test` / the cargo-test harness. The row carries
@@ -211,13 +212,20 @@ pub fn run_kernel_bench(
     let mut bufs: Vec<GpuBuffer> =
         Vec::with_capacity(kernel.params.len() + kernel.constexprs.len());
     for param in &kernel.params {
-        // Strided params bind three buffers (data + shape + strides); the
-        // in-process runner doesn't synthesize that metadata yet, so skip.
-        if param.kind == ParamKind::Strided {
-            return None;
-        }
         let buf = setup.buffers().iter().find(|b| b.name() == param.name)?;
         bufs.push(runner.buffer_bytes(&buf.initial_bytes()));
+        // A `#[strided]` param occupies three consecutive buffer slots —
+        // data, then `<name>_shape` and `<name>_strides` — matching the
+        // runtime's `push_strided` ABI. The bench setup must carry those two
+        // metadata buffers (u32 `[rank]` each) as ordinary named buffers.
+        if param.kind == ParamKind::Strided {
+            let shape_name = format!("{}_shape", param.name);
+            let strides_name = format!("{}_strides", param.name);
+            let shape = setup.buffers().iter().find(|b| b.name() == shape_name)?;
+            let strides = setup.buffers().iter().find(|b| b.name() == strides_name)?;
+            bufs.push(runner.buffer_bytes(&shape.initial_bytes()));
+            bufs.push(runner.buffer_bytes(&strides.initial_bytes()));
+        }
     }
     for decl in &kernel.constexprs {
         let name = decl.name.name();
