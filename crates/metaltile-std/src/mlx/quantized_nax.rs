@@ -31,16 +31,18 @@
 //! - **`KernelMode::Reduction`**.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// MPP int4 quantized matmul `Out = X · dequant(W)`. Same shape as
 /// `mt_qmm_mma_mpp`; both kernels co-exist for naming compatibility.
-#[kernel]
+#[kernel(
+    bench(
+        op="quantized",
+        subop="qmm_nax",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_qmm_nax<T>(
     w: Tensor<u32>,
@@ -125,26 +127,10 @@ pub fn mt_qmm_nax<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "quantized",
-        subop: "qmm_nax",
-        kernel_name: "mt_qmm_nax",
-        kernel_ir: mt_qmm_nax::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::Op;
+    use metaltile_core::{dtype::DType, ir::Op};
 
     use super::*;
 

@@ -3,12 +3,6 @@
 //! Strided copy benchmark — #[kernel] DSL vs MLX metal/copy.metal
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 #[kernel(
     bench(
@@ -74,7 +68,15 @@ pub fn mt_strided_copy<T>(#[strided] src: Tensor<T>, out: Tensor<T>, #[constexpr
 //   remainder is divided by `shape[d]` from `d = rank-1` down to `0`,
 //   so `strides` is interpreted in the same major-to-minor order as
 //   `shape` (row-major logical indexing).
-#[kernel]
+#[kernel(
+    bench(
+        op="strided_copy",
+        subop="strided_copy_nd",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_strided_copy_nd<T>(
     src: Tensor<T>,
     shape: Tensor<u32>,
@@ -100,20 +102,4 @@ pub fn mt_strided_copy_nd<T>(
         src_off = src_off + coord * load(strides[d]);
     }
     store(out[p], load(src[src_off]));
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "strided_copy",
-        subop: "strided_copy_nd",
-        kernel_name: "mt_strided_copy_nd",
-        kernel_ir: mt_strided_copy_nd::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0, // exact copy — no numerical drift
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

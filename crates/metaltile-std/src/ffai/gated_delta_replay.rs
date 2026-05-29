@@ -26,37 +26,20 @@
 //! `tests/gated_delta_replay_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-macro_rules! gdr_spec {
-    ($name:ident, $subop:literal) => {
-        inventory::submit! {
-            BenchSpec {
-                op: "gated_delta_replay",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
-    };
-}
 
 // ── Forward GatedDelta step with per-step delta-tape capture ────────────────
+#[rustfmt::skip]
 macro_rules! gated_delta_record {
     ($name:ident, $dk:literal, $dv:literal, $hk:literal, $hv:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="gated_delta_replay",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=1e-3,
+                kernel_mode=Grid3D,
+            )
+        )]
         pub fn $name<T>(
             q: Tensor<T>,
             k: Tensor<T>,
@@ -129,14 +112,22 @@ macro_rules! gated_delta_record {
                 store(state_out[i_state_base + $n_per_t * lane + i], st.cast::<T>());
             }
         }
-        gdr_spec!($name, $subop);
     };
 }
 
 // ── Tape replay: re-fold the accepted prefix onto a snapshot ────────────────
+#[rustfmt::skip]
 macro_rules! state_replay {
     ($name:ident, $dk:literal, $dv:literal, $hv:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="gated_delta_replay",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=1e-3,
+                kernel_mode=Grid3D,
+            )
+        )]
         pub fn $name<T>(
             delta_log: Tensor<T>,
             k_log: Tensor<T>,
@@ -185,7 +176,6 @@ macro_rules! state_replay {
                 store(state_out[i_state_base + $n_per_t * lane + i], st.cast::<T>());
             }
         }
-        gdr_spec!($name, $subop);
     };
 }
 

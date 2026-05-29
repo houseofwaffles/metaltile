@@ -18,12 +18,6 @@
 //!     threadgroup-per-row layout would under-occupy the GPU.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 #[kernel(
     bench(
@@ -32,7 +26,7 @@ use crate::{
         class=AllReduce,
         // tol=256.0 — summing 64M signed bf16 values, MT and MLX accumulate
         // in slightly different orders. With bf16 precision (~7-bit
-        // mantissa, ~1% relative) the result drifts by up to ~192 absolute
+            // mantissa, ~1% relative) the result drifts by up to ~192 absolute
         // between the two reduction trees. f32 stays comfortably below 1e-3.
         tol=256.0,
         mlx="all_reduce_sum{tn}",
@@ -197,9 +191,18 @@ pub fn mt_row_reduce_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32)
 // (an inner macro inside the body would silently emit no IR — see
 // docs/developing.md kernel-authoring hazards).
 
+#[rustfmt::skip]
 macro_rules! col_reduce_kernel {
     ($name:ident, $reduce_op:ident, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="col_reduce",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=128.0,
+                kernel_mode=Grid3D,
+            )
+        )]
         pub fn $name<T>(
             inp: Tensor<T>,
             out: Tensor<T>,
@@ -211,22 +214,6 @@ macro_rules! col_reduce_kernel {
                 let end = rows * cols;
                 let acc = strided_reduce(inp, col, cols, end, $reduce_op);
                 store(out[col], acc.cast::<T>());
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "col_reduce",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 128.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
             }
         }
     };
@@ -250,9 +237,18 @@ col_reduce_kernel!(mt_col_reduce_min, min, "min");
 // threadgroup-per-row form under-occupies the GPU (most lanes idle),
 // whereas one thread per segment keeps every lane busy.
 
+#[rustfmt::skip]
 macro_rules! seg_reduce_kernel {
     ($name:ident, $reduce_op:ident, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="seg_reduce",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=128.0,
+                kernel_mode=Grid3D,
+            )
+        )]
         pub fn $name<T>(
             inp: Tensor<T>,
             out: Tensor<T>,
@@ -267,22 +263,6 @@ macro_rules! seg_reduce_kernel {
                 // `reduce_*` finishing step (see col-reduce note above).
                 let acc = strided_reduce(inp, start, 1u32, end, $reduce_op);
                 store(out[seg], acc.cast::<T>());
-            }
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "seg_reduce",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 128.0,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
             }
         }
     };

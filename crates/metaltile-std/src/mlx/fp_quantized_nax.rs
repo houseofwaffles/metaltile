@@ -52,18 +52,20 @@
 //! `crates/metaltile-std/tests/fp_quantized_nax_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// MPP fp4 (E2M1) quantized matmul `Out = X · dequant(W)`. Params:
 ///   `w [n, k/8]` fp4 packed (8 codes/u32),
 ///   `scales [n, k/group_size]` (T) — group_size = 32, scale-only,
 ///   `x [m, k]` (T), `out [m, n]` (T).
-#[kernel]
+#[kernel(
+    bench(
+        op="fp_quantized",
+        subop="fp_qmm_nax",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fp_qmm_nax<T>(
     w: Tensor<u32>,
@@ -167,26 +169,10 @@ pub fn mt_fp_qmm_nax<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "fp_quantized",
-        subop: "fp_qmm_nax",
-        kernel_name: "mt_fp_qmm_nax",
-        kernel_ir: mt_fp_qmm_nax::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::Op;
+    use metaltile_core::{dtype::DType, ir::Op};
 
     use super::*;
 

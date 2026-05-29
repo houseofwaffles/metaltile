@@ -47,12 +47,6 @@
 //!   *separate* buffer (no in-place — caller ping-pongs).
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 #[kernel(
     bench(
@@ -143,7 +137,15 @@ pub fn mt_sort<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 // `tests/sort_gpu_correctness.rs`; there is no single-dispatch MLX
 // merge-pass to bench against (MLX fuses partition + merge differently).
 
-#[kernel]
+#[kernel(
+    bench(
+        op="sort",
+        subop="merge",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_merge<T>(
     inp: Tensor<T>,
     out: Tensor<T>,
@@ -232,22 +234,6 @@ pub fn mt_merge<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "sort",
-        subop: "merge",
-        kernel_name: "mt_merge",
-        kernel_ir: mt_merge::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 // ── Per-row (segmented) sort ─────────────────────────────────────────────
 //
 // `mt_sort_segmented<T>` sorts each row of a `[batch, n]` matrix
@@ -275,7 +261,15 @@ inventory::submit! {
 // is acceptable (we only need the threshold value, not tie-breaking).
 // Stability is documented as a non-guarantee.
 
-#[kernel]
+#[kernel(
+    bench(
+        op="sort",
+        subop="sort_segmented",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_sort_segmented<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     // `tgid_x` = row index; `tid` = thread-local ID within the TG.
     let row = tgid_x;
@@ -339,21 +333,5 @@ pub fn mt_sort_segmented<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32)
     }
     if i3 < n {
         store(out[row_base + i3], threadgroup_load("shared", i3));
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "sort",
-        subop: "sort_segmented",
-        kernel_name: "mt_sort_segmented",
-        kernel_ir: mt_sort_segmented::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

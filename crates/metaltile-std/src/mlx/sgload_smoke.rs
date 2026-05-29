@@ -47,12 +47,6 @@
 //! ```
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// Round-trip an 8×8 tile through TG memory + a simdgroup-matrix
 /// fragment via the `simdgroup_load` HW intrinsic. f32 / f16 should
@@ -63,7 +57,16 @@ use crate::{
 /// Outputs:
 ///   - `dst`: `[64]` flat row-major 8×8 destination, written from
 ///     the fragment in A/C lane convention
-#[kernel]
+#[kernel(
+    bench(
+        op="sgload",
+        subop="smoke",
+        class=GenericEmpty,
+        tol=0.0,
+        dtypes=&[DType::F32, DType::F16],
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_sgload_smoke<T>(src: Tensor<T>, mut dst: Tensor<T>) {
     let lane = simd_lane;
     // A/C lane → frag-element mapping. Matches the probe kernel +
@@ -103,20 +106,4 @@ pub fn mt_sgload_smoke<T>(src: Tensor<T>, mut dst: Tensor<T>) {
     let v1 = simdgroup_elem_load(frag, 1);
     store(dst[fm * 8u32 + fn0], v0);
     store(dst[fm * 8u32 + fn1], v1);
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "sgload",
-        subop: "smoke",
-        kernel_name: "mt_sgload_smoke",
-        kernel_ir: mt_sgload_smoke::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
 }

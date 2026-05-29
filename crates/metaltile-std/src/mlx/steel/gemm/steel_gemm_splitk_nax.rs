@@ -53,17 +53,19 @@
 //! `crates/metaltile-std/tests/steel_gemm_splitk_nax_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// NAX split-K partial GEMM. Each `tgid_z` computes the partial
 /// `[M, N]` product over `[k_start, k_end)` and writes (fp32) to
 /// `partials[split, :, :]`.
-#[kernel]
+#[kernel(
+    bench(
+        op="steel_gemm",
+        subop="splitk_nax",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_steel_gemm_splitk_nax<T>(
     a: Tensor<T>,
@@ -152,7 +154,15 @@ pub fn mt_steel_gemm_splitk_nax<T>(
 
 /// NAX split-K accumulator. One thread per `[M, N]` output element;
 /// sums `n_splits` partial slabs into the final `out` tensor.
-#[kernel]
+#[kernel(
+    bench(
+        op="steel_gemm",
+        subop="splitk_accum_nax",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_steel_gemm_splitk_accum_nax<T>(
     partials: Tensor<f32>,
     mut out: Tensor<T>,
@@ -171,42 +181,10 @@ pub fn mt_steel_gemm_splitk_accum_nax<T>(
     store(out[idx], acc.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "steel_gemm",
-        subop: "splitk_nax",
-        kernel_name: "mt_steel_gemm_splitk_nax",
-        kernel_ir: mt_steel_gemm_splitk_nax::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "steel_gemm",
-        subop: "splitk_accum_nax",
-        kernel_name: "mt_steel_gemm_splitk_accum_nax",
-        kernel_ir: mt_steel_gemm_splitk_accum_nax::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::Op;
+    use metaltile_core::{dtype::DType, ir::Op};
 
     use super::*;
 

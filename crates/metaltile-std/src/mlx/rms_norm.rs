@@ -40,12 +40,6 @@
 //!   that into `nRows` threadgroups of `TPG` threads each.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// Cross-kernel callee: threadgroup-wide RMS inverse.
 ///
@@ -182,7 +176,7 @@ pub fn mt_rms_norm<T>(
         class=RowNorm,
         // Per-head dispatch shape: head_dim=64 row count tuned so the bench
         // walks a representative batched-prefill workload (4 batches × 16
-        // tokens × 16 q heads at head_dim=64 = 1024 rows). Same `n × b`
+            // tokens × 16 q heads at head_dim=64 = 1024 rows). Same `n × b`
         // total element count as the parent `mt_rms_norm` bench so the
         // GB/s comparison is apples-to-apples.
         b=1024,
@@ -246,7 +240,15 @@ pub fn mt_rms_norm_small<T>(
 ///   `n`, so no `N = TPG * k` relationship is required; threads whose
 ///   stride walks past `n` simply stop. Unlike `mt_rms_norm` there is
 ///   no 128-alignment or `n ≤ 4096` requirement.
-#[kernel]
+#[kernel(
+    bench(
+        op="rms_norm",
+        subop="rms_norm_wide",
+        class=GenericEmpty,
+        tol=5e-4,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_rms_norm_wide<T>(
     x: Tensor<T>,
     w: Tensor<T>,
@@ -298,7 +300,15 @@ pub fn mt_rms_norm_wide<T>(
 /// 4 consecutive `Dv`-axis elements; the OOB clamp + mask copies the
 /// `mt_rms_norm` template so a wrong-TPG dispatch fails loudly rather
 /// than silently miscomputing.
-#[kernel]
+#[kernel(
+    bench(
+        op="rms_norm",
+        subop="gated_mixer_norm",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_gated_mixer_norm<T>(
     y: Tensor<f32>,
     z: Tensor<T>,
@@ -352,38 +362,6 @@ pub fn mt_gated_mixer_norm<T>(
         store(out[base + 1u32], ((y1 * rms * w1) * silu1).cast::<T>());
         store(out[base + 2u32], ((y2 * rms * w2) * silu2).cast::<T>());
         store(out[base + 3u32], ((y3 * rms * w3) * silu3).cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rms_norm",
-        subop: "rms_norm_wide",
-        kernel_name: "mt_rms_norm_wide",
-        kernel_ir: mt_rms_norm_wide::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-4,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "rms_norm",
-        subop: "gated_mixer_norm",
-        kernel_name: "mt_gated_mixer_norm",
-        kernel_ir: mt_gated_mixer_norm::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }
 

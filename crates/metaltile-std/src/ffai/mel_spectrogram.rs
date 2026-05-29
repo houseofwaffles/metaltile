@@ -44,12 +44,6 @@
 
 use metaltile::kernel;
 
-use crate::bench_types::DType;
-
-// Keep `DType` referenced so the import survives — the inventory submits
-// use `FLOAT_DTYPES` directly now that all three kernels carry bf16.
-const _: DType = DType::F32;
-
 #[kernel(
     bench(
         op="mel_spectrogram",

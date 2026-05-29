@@ -3,12 +3,6 @@
 //! Unary elementwise benchmark — #[kernel] DSL vs MLX metal/unary.metal
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 #[kernel(
     bench(
@@ -140,7 +134,7 @@ pub fn mt_relu<T>(a: Tensor<T>, out: Tensor<T>) {
         input=Signed,
         // tol=1e-3 — f16 cos drifts by ~2.4e-4 between MT and MLX on
         // adversarial inputs (Apple GPU fast-math handles the last few ULPs
-        // of the f16 mantissa differently). f32 stays comfortably below.
+            // of the f16 mantissa differently). f32 stays comfortably below.
         tol=1e-3,
         mlx="v_Cos{tn}{tn}",
         metal_file="unary.metal",
@@ -332,7 +326,7 @@ pub fn mt_square<T>(a: Tensor<T>, out: Tensor<T>) {
         class=Unary,
         input=Signed,
         // tol=1e-3 — f16 sigmoid drifts by ~4.9e-4 (exp + reciprocal each
-        // pick up ULP-level error, compounds across them).
+            // pick up ULP-level error, compounds across them).
         tol=1e-3,
         mlx="v_Sigmoid{tn}{tn}",
         metal_file="unary.metal",
@@ -635,7 +629,15 @@ pub fn mt_softplus<T>(a: Tensor<T>, out: Tensor<T>) {
 /// the fused GDN prep step is the immediate consumer (its cache state
 /// stays fp32 to avoid the 7-bit-mantissa drift over long decodes, but
 /// the model activations into the kernel are bf16).
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="cast_to_f32",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Elementwise,
+    )
+)]
 pub fn mt_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
     let idx = program_id(0);
     store(out[idx], load(input[idx]).cast::<f32>());
@@ -652,7 +654,16 @@ pub fn mt_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
 ///
 /// Saves T·30 ≈ 15k dispatches per Qwen3.6-A3B prefill at T=512 (one
 /// silu + one cast per GDN-layer per-token iter → one fused dispatch).
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="silu_cast_to_f32",
+        class=GenericEmpty,
+        tol=1e-3,
+        dtypes=&[DType::F16, DType::BF16],
+        kernel_mode=Elementwise,
+    )
+)]
 pub fn mt_silu_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
     let idx = program_id(0);
     let x = load(input[idx]).cast::<f32>();
@@ -676,7 +687,15 @@ pub fn mt_silu_cast_to_f32<T>(input: Tensor<T>, out: Tensor<f32>) {
 /// Inputs are all in model dtype `T` (typically bf16 on Qwen3.6); the
 /// internal accumulation widens to fp32 via the load-side `.cast` to
 /// preserve sigmoid precision near saturation.
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="sigmoid_scalar_fma",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Elementwise,
+    )
+)]
 pub fn mt_sigmoid_scalar_fma<T>(
     gate: Tensor<T>,
     value: Tensor<T>,
@@ -689,22 +708,6 @@ pub fn mt_sigmoid_scalar_fma<T>(
     let v = load(value[idx]).cast::<f32>();
     let b = load(base[idx]).cast::<f32>();
     store(out[idx], (b + g * v).cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "sigmoid_scalar_fma",
-        kernel_name: "mt_sigmoid_scalar_fma",
-        kernel_ir: mt_sigmoid_scalar_fma::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Elementwise),
-    }
 }
 
 /// Fused elementwise sigmoid-scalar FMA WITH residual add. Computes
@@ -763,29 +766,21 @@ pub fn mt_sigmoid_scalar_fma_residual<T>(
 /// Numerical: accumulation widens to f32 via load-side `.cast` to keep
 /// long sums of many small-weight expert outputs precise, then narrows
 /// back to T on store.
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="scalar_fma",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Elementwise,
+    )
+)]
 pub fn mt_scalar_fma<T>(scalar: Tensor<T>, value: Tensor<T>, base: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
     let s = load(scalar[0]).cast::<f32>();
     let v = load(value[idx]).cast::<f32>();
     let b = load(base[idx]).cast::<f32>();
     store(out[idx], (b + s * v).cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "scalar_fma",
-        kernel_name: "mt_scalar_fma",
-        kernel_ir: mt_scalar_fma::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Elementwise),
-    }
 }
 
 /// 8-way fused scalar-FMA chain. Computes
@@ -801,7 +796,15 @@ inventory::submit! {
 /// precision on long sums of small-weight expert outputs, then
 /// narrows back to T on store. Bit-equivalent to the 8-call chain
 /// modulo final-rounding mode.
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="scalar_fma_chain8",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Elementwise,
+    )
+)]
 pub fn mt_scalar_fma_chain8<T>(
     scalar0: Tensor<T>,
     value0: Tensor<T>,
@@ -842,22 +845,6 @@ pub fn mt_scalar_fma_chain8<T>(
     store(out[idx], sum.cast::<T>());
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "scalar_fma_chain8",
-        kernel_name: "mt_scalar_fma_chain8",
-        kernel_ir: mt_scalar_fma_chain8::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Elementwise),
-    }
-}
-
 /// Fused elementwise sigmoid + mul. Computes
 ///   `out[i] = a[i] * sigmoid(b[i])`
 /// in one dispatch. Used by Qwen3 attention layer's output gate:
@@ -868,29 +855,21 @@ inventory::submit! {
 ///
 /// Sigmoid is computed at f32 precision via load-side cast to avoid
 /// bf16 saturation drift near the asymptotes.
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="sigmoid_mul",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Elementwise,
+    )
+)]
 pub fn mt_sigmoid_mul<T>(a: Tensor<T>, b: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
     let av = load(a[idx]).cast::<f32>();
     let bv = load(b[idx]).cast::<f32>();
     let sig = 1.0f32 / (1.0f32 + exp(0.0f32 - bv));
     store(out[idx], (av * sig).cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "sigmoid_mul",
-        kernel_name: "mt_sigmoid_mul",
-        kernel_ir: mt_sigmoid_mul::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Elementwise),
-    }
 }
 
 /// ⚠️ BROKEN — produces NaN/wrong output in FFAI integration test
@@ -920,7 +899,15 @@ inventory::submit! {
 /// residual-add+norm pair × 80 such pairs in Qwen3.6-A3B decode
 /// (2 per layer × 40 layers) = ~1.4 ms / token at 17 µs encoder
 /// overhead each.
-#[kernel]
+#[kernel(
+    bench(
+        op="unary",
+        subop="add_rms_norm",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_add_rms_norm<T>(
     a: Tensor<T>,
     b: Tensor<T>,
@@ -975,53 +962,5 @@ pub fn mt_add_rms_norm<T>(
         store(normed_out[base + 1u32], n1.cast::<T>());
         store(normed_out[base + 2u32], n2.cast::<T>());
         store(normed_out[base + 3u32], n3.cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "add_rms_norm",
-        kernel_name: "mt_add_rms_norm",
-        kernel_ir: mt_add_rms_norm::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "cast_to_f32",
-        kernel_name: "mt_cast_to_f32",
-        kernel_ir: mt_cast_to_f32::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Elementwise),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "unary",
-        subop: "silu_cast_to_f32",
-        kernel_name: "mt_silu_cast_to_f32",
-        kernel_ir: mt_silu_cast_to_f32::kernel_ir_for,
-        dtypes: &[DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Elementwise),
     }
 }

@@ -23,16 +23,19 @@
 //! `tests/hadamard_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[rustfmt::skip]
 macro_rules! hadamard_kernel {
     ($name:ident, $n:literal, $log_n:literal, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="hadamard",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=1e-3,
+                kernel_mode=Reduction,
+            )
+        )]
         pub fn $name<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] scale: f32) {
             let row = program_id::<0>();
             let base = row * $n;
@@ -53,22 +56,6 @@ macro_rules! hadamard_kernel {
             }
 
             store(out[base + tid], (threadgroup_load("buf", tid) * scale).cast::<T>());
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "hadamard",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Reduction),
-            }
         }
     };
 }

@@ -32,13 +32,12 @@
 //!
 //! ## Macro structure
 //!
-//! `dequant_gather_kernel!` emits the entire `#[kernel] pub fn …` + the
-//! `inventory::submit!` block at module scope.  The compiler expands the
-//! outer macro before the `#[kernel]` proc-macro runs, so the body parser
-//! sees concrete tokens with `$bits` already substituted.  Embedding the
-//! body inside an *inner* `macro_rules!` call (the previous shape of this
-//! file) silently produced empty kernels — the proc-macro doesn't expand
-//! inner declarative macros.
+//! `dequant_gather_kernel!` emits the entire `#[kernel(bench(...))] pub fn …`
+//! at module scope.  The compiler expands the outer macro before the
+//! `#[kernel]` proc-macro runs, so the body parser sees concrete tokens
+//! with `$bits` already substituted.  Embedding the body inside an *inner*
+//! `macro_rules!` call (the previous shape of this file) silently produced
+//! empty kernels — the proc-macro doesn't expand inner declarative macros.
 
 use metaltile::kernel;
 

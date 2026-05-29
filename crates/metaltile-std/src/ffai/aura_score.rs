@@ -47,13 +47,6 @@
 
 use metaltile::kernel;
 
-use crate::bench_types::DType;
-
-// Keep `DType` referenced for the inventory submit; `FLOAT_DTYPES`
-// supersedes the old `F32_ONLY` shortlist now that the kernel is generic
-// over `T` (fp32/fp16/bf16) for its I/O dtype.
-const _: DType = DType::F32;
-
 macro_rules! aura_score_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
         #[kernel(

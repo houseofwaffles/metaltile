@@ -64,11 +64,10 @@
 //!
 //! ## Macro structure
 //!
-//! `aura_encode_kernel!` wraps a single `#[kernel] pub fn …` + its
-//! `inventory::submit!` registration at module scope.  Bit-widths get
-//! separate invocations so the compiler expands the outer macro before
-//! the `#[kernel]` proc-macro sees it — required because the proc-macro
-//! does not expand inner declarative macros.
+//! `aura_encode_kernel!` wraps a single `#[kernel(bench(...))] pub fn …`
+//! at module scope.  Bit-widths get separate invocations so the compiler
+//! expands the outer macro before the `#[kernel]` proc-macro sees it —
+//! required because the proc-macro does not expand inner declarative macros.
 
 use metaltile::kernel;
 

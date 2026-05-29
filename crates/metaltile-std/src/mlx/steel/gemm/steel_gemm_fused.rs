@@ -43,9 +43,21 @@ use metaltile::kernel;
 /// only ever sees concrete `u32` literals — never an un-expanded inner
 /// macro call (which would silently emit an empty body; see
 /// `docs/developing.md` kernel-authoring hazards).
+#[rustfmt::skip]
 macro_rules! steel_gemm_fused_kernel {
-    ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $subop:literal) => {
-        #[kernel]
+    ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $tpg:literal, $subop:literal) => {
+        #[kernel(
+            bench(
+                op="steel_gemm_fused",
+                subop=$subop,
+                class=SteelGemm,
+                tol=1e-2,
+                kernel_mode=SimdGroup2D,
+                bm=$bm,
+                bn=$bn,
+                tpg=$tpg,
+            )
+        )]
         pub fn $name<T>(
             a: Tensor<T>,
             b: Tensor<T>,
@@ -154,27 +166,6 @@ macro_rules! steel_gemm_fused_kernel {
                 }
             }
         }
-
-        inventory::submit! { crate::spec::BenchSpec {
-            op: "steel_gemm_fused", subop: $subop,
-            kernel_name: stringify!($name),
-            kernel_ir: $name::kernel_ir_for,
-            dtypes: crate::bench_types::FLOAT_DTYPES, tol: 1e-2f32,
-            mlx_src: Some(include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_fused.metal"))),
-            mlx_pattern: Some(concat!(
-                "steel_gemm_fused_nn_{tn}_{tn}_bm", stringify!($bm),
-                "_bn", stringify!($bn), "_bk16_wm", stringify!($wm),
-                "_wn", stringify!($wn),
-            )),
-            shapes: &[],
-            dispatch: crate::spec::BenchDispatch::SteelGemm {
-                m: 4096, n: 4096, k: 4096,
-                check_m: $bm as usize, check_n: $bn as usize, check_k: 16,
-                bm: $bm as usize, bn: $bn as usize,
-                tpg: ($wm * $wn * 32u32) as usize,
-            },
-            kernel_mode: Some(metaltile_core::ir::KernelMode::SimdGroup2D),
-        }}
     };
 }
 
@@ -190,6 +181,7 @@ steel_gemm_fused_kernel!(
     64u32,
     2u32,
     2u32,
+    128u32,
     "bm64_bn64_bk16_wm2_wn2"
 );
 // 32×32×16 / 2×2 — small-tile shape for skinny M or N (4 simdgroups).
@@ -199,6 +191,7 @@ steel_gemm_fused_kernel!(
     32u32,
     2u32,
     2u32,
+    128u32,
     "bm32_bn32_bk16_wm2_wn2"
 );
 // 64×64×16 / 1×2 — large tile, 2 simdgroups (lower occupancy, N-split only).
@@ -208,6 +201,7 @@ steel_gemm_fused_kernel!(
     64u32,
     1u32,
     2u32,
+    64u32,
     "bm64_bn64_bk16_wm1_wn2"
 );
 // 32×64×16 / 1×2 — wide-tile shape (N-heavy block, 2 simdgroups).
@@ -217,6 +211,7 @@ steel_gemm_fused_kernel!(
     64u32,
     1u32,
     2u32,
+    64u32,
     "bm32_bn64_bk16_wm1_wn2"
 );
 // 64×64×16 / 4×2 — large tile at higher occupancy (8 simdgroups, TPG=256).
@@ -228,6 +223,7 @@ steel_gemm_fused_kernel!(
     64u32,
     4u32,
     2u32,
+    256u32,
     "bm64_bn64_bk16_wm4_wn2"
 );
 // 64×32×16 / 1×2 — M-heavy block (transpose of 32×64; 2 simdgroups).
@@ -239,6 +235,7 @@ steel_gemm_fused_kernel!(
     32u32,
     1u32,
     2u32,
+    64u32,
     "bm64_bn32_bk16_wm1_wn2"
 );
 // 32×32×16 / 1×2 — small tile, 2 simdgroups (skinny problems, low TPG).
@@ -250,5 +247,6 @@ steel_gemm_fused_kernel!(
     32u32,
     1u32,
     2u32,
+    64u32,
     "bm32_bn32_bk16_wm1_wn2"
 );

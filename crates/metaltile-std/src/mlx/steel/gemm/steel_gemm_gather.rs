@@ -52,9 +52,21 @@ use metaltile::kernel;
 /// Expand one `(BM, BN, WM, WN)` block-shape instantiation of the
 /// gather GEMM. The outer `macro_rules!` substitutes the literals
 /// before the `#[kernel]` body parser runs — see `steel_gemm_fused.rs`.
+#[rustfmt::skip]
 macro_rules! steel_gemm_gather_kernel {
-    ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $subop:literal) => {
-        #[kernel]
+    ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $tpg:literal, $subop:literal) => {
+        #[kernel(
+            bench(
+                op="steel_gemm_gather",
+                subop=$subop,
+                class=SteelGemm,
+                tol=1e-2,
+                kernel_mode=SimdGroup2D,
+                bm=$bm,
+                bn=$bn,
+                tpg=$tpg,
+            )
+        )]
         pub fn $name<T>(
             a: Tensor<T>,
             b: Tensor<T>,
@@ -159,27 +171,6 @@ macro_rules! steel_gemm_gather_kernel {
                 }
             }
         }
-
-        inventory::submit! { crate::spec::BenchSpec {
-            op: "steel_gemm_gather", subop: $subop,
-            kernel_name: stringify!($name),
-            kernel_ir: $name::kernel_ir_for,
-            dtypes: crate::bench_types::FLOAT_DTYPES, tol: 1e-2f32,
-            mlx_src: Some(include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_gather.metal"))),
-            mlx_pattern: Some(concat!(
-                "steel_gather_mm_nn_{tn}_{tn}_bm", stringify!($bm),
-                "_bn", stringify!($bn), "_bk16_wm", stringify!($wm),
-                "_wn", stringify!($wn),
-            )),
-            shapes: &[],
-            dispatch: crate::spec::BenchDispatch::SteelGemm {
-                m: 4096, n: 4096, k: 4096,
-                check_m: $bm as usize, check_n: $bn as usize, check_k: 16,
-                bm: $bm as usize, bn: $bn as usize,
-                tpg: ($wm * $wn * 32u32) as usize,
-            },
-            kernel_mode: Some(metaltile_core::ir::KernelMode::SimdGroup2D),
-        }}
     };
 }
 
@@ -191,6 +182,7 @@ steel_gemm_gather_kernel!(
     64u32,
     2u32,
     2u32,
+    128u32,
     "bm64_bn64_bk16_wm2_wn2"
 );
 // 32×32×16 / 2×2 — small-tile shape for skinny M or N (4 simdgroups).
@@ -200,5 +192,6 @@ steel_gemm_gather_kernel!(
     32u32,
     2u32,
     2u32,
+    128u32,
     "bm32_bn32_bk16_wm2_wn2"
 );

@@ -31,17 +31,12 @@
 
 use metaltile::kernel;
 
-use crate::bench_types::DType;
-
-// Keep `DType` referenced — `FLOAT_DTYPES` is the production shortlist now
-// that the kernel is generic over `T` (fp32/fp16/bf16) for its I/O dtype.
-const _: DType = DType::F32;
-
+#[rustfmt::skip]
 macro_rules! aura_value_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
         #[kernel(
-                    bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-                )]
+            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
+        )]
         pub fn $name<T>(
             weights: Tensor<T>,
             packed: Tensor<u32>,

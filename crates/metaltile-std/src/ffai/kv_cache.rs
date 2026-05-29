@@ -12,11 +12,11 @@
 //!            biases  [n_kv_heads, max_seq, head_dim / group_size]  T
 //!
 //! Two macros (`quantize_kv_kernel!`, `bulk_dequant_kv_kernel!`) emit the
-//! `#[kernel] pub fn …` + `inventory::submit!` blocks at module scope,
-//! parameterised by bit-width.  This shape is required: the `#[kernel]`
-//! proc-macro doesn't expand inner declarative macros, so embedding the
-//! shared body inside an *inner* `macro_rules!` call (the previous file
-//! shape) silently produced empty kernels.
+//! `#[kernel(bench(...))] pub fn …` blocks at module scope, parameterised
+//! by bit-width.  This shape is required: the `#[kernel]` proc-macro
+//! doesn't expand inner declarative macros, so embedding the shared body
+//! inside an *inner* `macro_rules!` call (the previous file shape)
+//! silently produced empty kernels.
 //!
 //! Codegen-only. End-to-end correctness validated in FFAI integration
 //! tests against real model decoding.

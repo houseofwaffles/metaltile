@@ -155,11 +155,11 @@ macro_rules! define_moe_down_swiglu_accum_chain8 {
     ) => {
         #[kernel(
             bench(
-                        op="moe_down_swiglu_accum",
-                        subop="int4_chain8",
-                        class=GenericEmpty,
-                        tol=0.0,
-                        kernel_mode=Reduction,
+                op="moe_down_swiglu_accum",
+                subop="int4_chain8",
+                class=GenericEmpty,
+                tol=0.0,
+                kernel_mode=Reduction,
             )
         )]
         #[allow(clippy::too_many_arguments)]

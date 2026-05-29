@@ -31,12 +31,6 @@
 //! `tests/indexing_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// First-axis row gather — `out[r, i] = src[indices[r], i]`.
 ///
@@ -49,7 +43,15 @@ use crate::{
 /// threads past the output (a Grid3D dispatch rounds the thread count
 /// up to a multiple of TPG) early-out — they must not read `indices`
 /// out of bounds or write a stray `out` slot.
-#[kernel]
+#[kernel(
+    bench(
+        op="indexing",
+        subop="gather_front",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_gather_front<T>(
     src: Tensor<T>,
     indices: Tensor<u32>,
@@ -79,7 +81,15 @@ pub fn mt_gather_front<T>(
 /// threads past the update count early-out — without the guard a
 /// stray thread reads `indices` / `updates` out of bounds and scatters
 /// garbage into `out`.
-#[kernel]
+#[kernel(
+    bench(
+        op="indexing",
+        subop="scatter",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_scatter<T>(
     updates: Tensor<T>,
     indices: Tensor<u32>,
@@ -109,7 +119,15 @@ pub fn mt_scatter<T>(
 /// derives `batch_idx` from a `mask_batch_size`; this port flattens to
 /// the single-batch case (`offsets` already absolute into `src`),
 /// which is what the FFAI masked-cache-update path needs.
-#[kernel]
+#[kernel(
+    bench(
+        op="indexing",
+        subop="masked_scatter",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_masked_scatter<T>(
     mask: Tensor<u32>,
     offsets: Tensor<u32>,
@@ -130,53 +148,5 @@ pub fn mt_masked_scatter<T>(
         // since the value is discarded).
         let chosen = select(m > 0u32, picked, prev);
         store(out[idx], chosen);
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "indexing",
-        subop: "gather_front",
-        kernel_name: "mt_gather_front",
-        kernel_ir: mt_gather_front::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "indexing",
-        subop: "scatter",
-        kernel_name: "mt_scatter",
-        kernel_ir: mt_scatter::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "indexing",
-        subop: "masked_scatter",
-        kernel_name: "mt_masked_scatter",
-        kernel_ir: mt_masked_scatter::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
     }
 }

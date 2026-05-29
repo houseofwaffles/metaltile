@@ -37,14 +37,6 @@
 //! `tests/fused_gate_activation_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
 
 // Numeric constants are inlined as literals inside the kernel bodies
 // below — the `#[kernel]` proc-macro parses the body as a token stream
@@ -62,7 +54,15 @@ const ALL_FLOAT_DTYPES: &[DType] = &[DType::F32, DType::F16, DType::BF16];
 /// `gelu_approx_act` in `fused_gate_activation.metal`. Computed in f32
 /// regardless of `T` so the cubic + tanh keep their precision; the
 /// result is cast back to `T` at the store.
-#[kernel]
+#[kernel(
+    bench(
+        op="fused_gate_activation",
+        subop="gelu_approx",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_fused_gate_gelu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
     let idx = program_id::<0>();
     let g = load(gate[idx]).cast::<f32>();
@@ -81,7 +81,15 @@ pub fn mt_fused_gate_gelu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
 /// multiply: `g·sigmoid(1.702·g)·(u + 1)`. Matches `clipped_swiglu`
 /// in `fused_gate_activation.metal`. The clamp is composed from two
 /// `select`s (the DSL has no `clamp` builtin).
-#[kernel]
+#[kernel(
+    bench(
+        op="fused_gate_activation",
+        subop="clipped_swiglu",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_fused_gate_clipped_swiglu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
     let idx = program_id::<0>();
     let g_raw = load(gate[idx]).cast::<f32>();
@@ -97,36 +105,4 @@ pub fn mt_fused_gate_clipped_swiglu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tens
     // up side carries a +1 bias before the multiply.
     let act = g * sig * (u + 1.0f32);
     store(out[idx], act.cast::<T>());
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "fused_gate_activation",
-        subop: "gelu_approx",
-        kernel_name: "mt_fused_gate_gelu",
-        kernel_ir: mt_fused_gate_gelu::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "fused_gate_activation",
-        subop: "clipped_swiglu",
-        kernel_name: "mt_fused_gate_clipped_swiglu",
-        kernel_ir: mt_fused_gate_clipped_swiglu::kernel_ir_for,
-        dtypes: ALL_FLOAT_DTYPES,
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

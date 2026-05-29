@@ -27,12 +27,6 @@
 //!   running-prefix slot at index `n_simd`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 static SCAN_SHAPES: &[(usize, usize)] = &[(1_024, 4_096)];
 
@@ -119,7 +113,15 @@ pub fn mt_scan<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 // the inclusive-sum oracle; correctness is pinned by
 // `tests/scan_exclusive_gpu_correctness.rs` instead.
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_exclusive",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -182,22 +184,6 @@ pub fn mt_scan_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32)
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_exclusive",
-        kernel_name: "mt_scan_exclusive",
-        kernel_ir: mt_scan_exclusive::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── Multi-op scan variants (prod / max / min) ────────────────────────────
 //
 // The same two-level (per-simdgroup + cross-simdgroup) prefix-scan
@@ -248,7 +234,15 @@ inventory::submit! {
 // `out[i] = v[0] * v[1] * … * v[i]`  (inclusive prefix product per row).
 // Identity element is 1.0; out-of-range loads are padded with 1.0.
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_prod",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -307,27 +301,19 @@ pub fn mt_scan_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_prod",
-        kernel_name: "mt_scan_prod",
-        kernel_ir: mt_scan_prod::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── Exclusive product scan ───────────────────────────────────────────────
 //
 // `out[0] = 1`,  `out[i] = v[0] * … * v[i-1]`  (exclusive prefix product).
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_prod_exclusive",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_prod_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -380,28 +366,20 @@ pub fn mt_scan_prod_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n:
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_prod_exclusive",
-        kernel_name: "mt_scan_prod_exclusive",
-        kernel_ir: mt_scan_prod_exclusive::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── Inclusive max scan ───────────────────────────────────────────────────
 //
 // `out[i] = max(v[0], …, v[i])`  (running maximum per row).
 // Identity element is -∞; out-of-range loads are padded with -∞.
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_max",
+        class=GenericEmpty,
+        tol=1e-4,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_max<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -463,27 +441,19 @@ pub fn mt_scan_max<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_max",
-        kernel_name: "mt_scan_max",
-        kernel_ir: mt_scan_max::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-4,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── Exclusive max scan ───────────────────────────────────────────────────
 //
 // `out[0] = -∞`,  `out[i] = max(v[0], …, v[i-1])`  (exclusive max prefix).
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_max_exclusive",
+        class=GenericEmpty,
+        tol=1e-4,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_max_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -542,28 +512,20 @@ pub fn mt_scan_max_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: 
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_max_exclusive",
-        kernel_name: "mt_scan_max_exclusive",
-        kernel_ir: mt_scan_max_exclusive::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-4,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── Inclusive min scan ───────────────────────────────────────────────────
 //
 // `out[i] = min(v[0], …, v[i])`  (running minimum per row).
 // Identity element is +∞; out-of-range loads are padded with +∞.
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_min",
+        class=GenericEmpty,
+        tol=1e-4,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -621,27 +583,19 @@ pub fn mt_scan_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_min",
-        kernel_name: "mt_scan_min",
-        kernel_ir: mt_scan_min::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-4,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ── Exclusive min scan ───────────────────────────────────────────────────
 //
 // `out[0] = +∞`,  `out[i] = min(v[0], …, v[i-1])`  (exclusive min prefix).
 
-#[kernel]
+#[kernel(
+    bench(
+        op="scan",
+        subop="scan_min_exclusive",
+        class=GenericEmpty,
+        tol=1e-4,
+        kernel_mode=Reduction,
+    )
+)]
 pub fn mt_scan_min_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -696,21 +650,5 @@ pub fn mt_scan_min_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: 
             threadgroup_store("sgs", ns, chunk_min);
         }
         threadgroup_barrier();
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "scan",
-        subop: "scan_min_exclusive",
-        kernel_name: "mt_scan_min_exclusive",
-        kernel_ir: mt_scan_min_exclusive::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-4,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
     }
 }

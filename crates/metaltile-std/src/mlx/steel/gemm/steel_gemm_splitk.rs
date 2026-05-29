@@ -58,9 +58,21 @@ use metaltile::kernel;
 /// Expand one `(BM, BN, WM, WN)` block-shape instantiation of the
 /// split-K partial GEMM. The outer `macro_rules!` substitutes the
 /// literals before the `#[kernel]` body parser runs.
+#[rustfmt::skip]
 macro_rules! steel_gemm_splitk_kernel {
-    ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $subop:literal) => {
-        #[kernel]
+    ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $tpg:literal, $subop:literal) => {
+        #[kernel(
+            bench(
+                op="steel_gemm_splitk",
+                subop=$subop,
+                class=SteelGemm,
+                tol=1e-2,
+                kernel_mode=SimdGroup2D,
+                bm=$bm,
+                bn=$bn,
+                tpg=$tpg,
+            )
+        )]
         pub fn $name<T>(
             a: Tensor<T>,
             b: Tensor<T>,
@@ -157,27 +169,6 @@ macro_rules! steel_gemm_splitk_kernel {
                 }
             }
         }
-
-        inventory::submit! { crate::spec::BenchSpec {
-            op: "steel_gemm_splitk", subop: $subop,
-            kernel_name: stringify!($name),
-            kernel_ir: $name::kernel_ir_for,
-            dtypes: crate::bench_types::FLOAT_DTYPES, tol: 1e-2f32,
-            mlx_src: Some(include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_splitk.metal"))),
-            mlx_pattern: Some(concat!(
-                "steel_gemm_splitk_nn_{tn}_{tn}_bm", stringify!($bm),
-                "_bn", stringify!($bn), "_bk16_wm", stringify!($wm),
-                "_wn", stringify!($wn),
-            )),
-            shapes: &[],
-            dispatch: crate::spec::BenchDispatch::SteelGemm {
-                m: 4096, n: 4096, k: 4096,
-                check_m: $bm as usize, check_n: $bn as usize, check_k: 16,
-                bm: $bm as usize, bn: $bn as usize,
-                tpg: ($wm * $wn * 32u32) as usize,
-            },
-            kernel_mode: Some(metaltile_core::ir::KernelMode::SimdGroup2D),
-        }}
     };
 }
 
@@ -188,6 +179,7 @@ steel_gemm_splitk_kernel!(
     64u32,
     2u32,
     2u32,
+    128u32,
     "bm64_bn64_bk16_wm2_wn2"
 );
 // 32×32×16 / 2×2 — small-tile shape (4 simdgroups) — split-K is most
@@ -198,6 +190,7 @@ steel_gemm_splitk_kernel!(
     32u32,
     2u32,
     2u32,
+    128u32,
     "bm32_bn32_bk16_wm2_wn2"
 );
 
@@ -207,7 +200,17 @@ steel_gemm_splitk_kernel!(
 /// (fp32) into the final `[M, N]` output. One thread per output
 /// element. This is the plain-sum form of MLX's
 /// `steel_gemm_splitk_accum`.
-#[kernel]
+#[kernel(
+    bench(
+        op="steel_gemm_splitk",
+        subop="accum",
+        class=GenericEmpty,
+        tol=1e-3f32,
+        kernel_mode=Elementwise,
+        mlx="steel_gemm_splitk_accum_{tn}_float32",
+        metal_file="steel/gemm/steel_gemm_splitk.metal",
+    )
+)]
 pub fn mt_steel_gemm_splitk_accum<T>(
     partials: Tensor<f32>,
     mut out: Tensor<T>,
@@ -227,22 +230,20 @@ pub fn mt_steel_gemm_splitk_accum<T>(
     store(out[idx], acc.cast::<T>());
 }
 
-inventory::submit! { crate::spec::BenchSpec {
-    op: "steel_gemm_splitk", subop: "accum",
-    kernel_name: "mt_steel_gemm_splitk_accum",
-    kernel_ir: mt_steel_gemm_splitk_accum::kernel_ir_for,
-    dtypes: crate::bench_types::FLOAT_DTYPES, tol: 1e-3f32,
-    mlx_src: Some(include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_splitk.metal"))),
-    mlx_pattern: Some("steel_gemm_splitk_accum_{tn}_float32"),
-    shapes: &[],
-    dispatch: crate::spec::BenchDispatch::Generic,
-    kernel_mode: Some(metaltile_core::ir::KernelMode::Elementwise),
-}}
-
 /// Split-K accumulation, `axpby` form: `out = α·(Σ partials) + β·c_in`.
 /// The fused-bias / residual variant of MLX's
 /// `steel_gemm_splitk_accum_*_axbpy`. One thread per output element.
-#[kernel]
+#[kernel(
+    bench(
+        op="steel_gemm_splitk",
+        subop="accum_axpby",
+        class=GenericEmpty,
+        tol=1e-3f32,
+        kernel_mode=Elementwise,
+        mlx="steel_gemm_splitk_accum_{tn}_float32_axbpy",
+        metal_file="steel/gemm/steel_gemm_splitk.metal",
+    )
+)]
 pub fn mt_steel_gemm_splitk_accum_axpby<T>(
     partials: Tensor<f32>,
     c_in: Tensor<T>,
@@ -264,15 +265,3 @@ pub fn mt_steel_gemm_splitk_accum_axpby<T>(
     let res = alpha * acc + beta * prev;
     store(out[idx], res.cast::<T>());
 }
-
-inventory::submit! { crate::spec::BenchSpec {
-    op: "steel_gemm_splitk", subop: "accum_axpby",
-    kernel_name: "mt_steel_gemm_splitk_accum_axpby",
-    kernel_ir: mt_steel_gemm_splitk_accum_axpby::kernel_ir_for,
-    dtypes: crate::bench_types::FLOAT_DTYPES, tol: 1e-3f32,
-    mlx_src: Some(include_str!(concat!(env!("OUT_DIR"), "/metal/steel/gemm/steel_gemm_splitk.metal"))),
-    mlx_pattern: Some("steel_gemm_splitk_accum_{tn}_float32_axbpy"),
-    shapes: &[],
-    dispatch: crate::spec::BenchDispatch::Generic,
-    kernel_mode: Some(metaltile_core::ir::KernelMode::Elementwise),
-}}

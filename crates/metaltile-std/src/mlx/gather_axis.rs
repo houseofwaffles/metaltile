@@ -24,14 +24,16 @@
 //! `tests/gather_axis_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-#[kernel]
+#[kernel(
+    bench(
+        op="indexing",
+        subop="gather_axis",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_gather_axis<T>(
     src: Tensor<T>,
     indices: Tensor<u32>,
@@ -49,20 +51,4 @@ pub fn mt_gather_axis<T>(
     let gathered = load(indices[idx]);
     let src_off = (o * axis_size + gathered) * inner + i;
     store(out[idx], load(src[src_off]));
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "indexing",
-        subop: "gather_axis",
-        kernel_name: "mt_gather_axis",
-        kernel_ir: mt_gather_axis::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

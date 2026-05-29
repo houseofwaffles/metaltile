@@ -37,13 +37,6 @@
 
 use metaltile::kernel;
 
-use crate::bench_types::DType;
-
-// Keep `DType` referenced — the bf16-only shortlist was a legacy default;
-// now that the partials and output are all `Tensor<T>` the kernel handles
-// fp32/fp16/bf16.
-const _: DType = DType::F32;
-
 macro_rules! aura_flash_pass2_kernel {
     ($name:ident, $dims_per_lane:literal, $subop:literal) => {
         #[kernel(

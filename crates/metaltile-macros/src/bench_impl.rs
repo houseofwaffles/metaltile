@@ -50,6 +50,9 @@ pub enum ClassKind {
     /// variant (Decode | PrefillTile), tpg.  For PrefillTile variant,
     /// also requires bq, bk, wm, wn.
     SdpaBatchedDecode,
+    /// Steel GEMM tile geometry.
+    /// Requires: bm, bn, tpg.
+    SteelGemm,
 }
 
 pub enum InputKind {
@@ -127,6 +130,9 @@ pub struct BenchArgs {
     // SdpaBatchedDecode
     pub batch_q: Option<LitInt>,
     pub variant: Option<BatchedDecodeVariantArg>,
+    // SteelGemm
+    pub bm: Option<LitInt>,
+    pub bn: Option<LitInt>,
 }
 
 fn parse_input(s: &str, span: proc_macro2::Span) -> syn::Result<InputKind> {
@@ -190,6 +196,8 @@ impl Parse for BenchArgs {
         let mut pass2_kernel_field: Option<Ident> = None;
         let mut batch_q_field: Option<LitInt> = None;
         let mut variant_field: Option<BatchedDecodeVariantArg> = None;
+        let mut bm_field: Option<LitInt> = None;
+        let mut bn_field: Option<LitInt> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -227,6 +235,7 @@ impl Parse for BenchArgs {
                         "GenericEmpty" => ClassKind::GenericEmpty,
                         "SdpaVector2Pass" => ClassKind::SdpaVector2Pass,
                         "SdpaBatchedDecode" => ClassKind::SdpaBatchedDecode,
+                        "SteelGemm" => ClassKind::SteelGemm,
                         o => {
                             return Err(syn::Error::new(id.span(), format!("unknown class `{o}`")));
                         },
@@ -317,6 +326,8 @@ impl Parse for BenchArgs {
                     };
                     variant_field = Some(var);
                 },
+                "bm" => bm_field = Some(input.parse()?),
+                "bn" => bn_field = Some(input.parse()?),
                 o => {
                     return Err(syn::Error::new(key.span(), format!("unknown bench arg: `{o}`")));
                 },
@@ -373,6 +384,8 @@ impl Parse for BenchArgs {
             pass2_kernel: pass2_kernel_field,
             batch_q: batch_q_field,
             variant: variant_field,
+            bm: bm_field,
+            bn: bn_field,
         })
     }
 }
@@ -1076,25 +1089,48 @@ pub fn generate_submit(fn_name: &syn::Ident, a: &BenchArgs, is_generic: bool) ->
                 }
             })
         },
+        // ── Complex: SteelGemm ────────────────────────────────
+        ClassKind::SteelGemm => {
+            let bm_val = a.bm.as_ref().expect("SteelGemm requires bm");
+            let bn_val = a.bn.as_ref().expect("SteelGemm requires bn");
+            let tpg_val = a.tpg.as_ref().expect("SteelGemm requires tpg");
+            (quote! { &[] }, quote! {
+                crate::spec::BenchDispatch::SteelGemm {
+                    m: 4096usize,
+                    n: 4096usize,
+                    k: 4096usize,
+                    check_m: #bm_val as usize,
+                    check_n: #bn_val as usize,
+                    check_k: 16usize,
+                    bm: #bm_val as usize,
+                    bn: #bn_val as usize,
+                    tpg: #tpg_val as usize,
+                }
+            })
+        },
     };
 
     let km_ts = kernel_mode_ts(&a.kernel_mode);
 
     quote! {
-        ::inventory::submit! {
-            crate::spec::BenchSpec {
-                op:          #op,
-                subop:       #subop,
-                kernel_name: #fn_str,
-                kernel_ir:   #kernel_ir_expr,
-                dtypes:      #dtypes,
-                tol:         #tol as f32,
-                mlx_src:     #mlx_src,
-                mlx_pattern: #mlx_pat,
-                shapes:      #shapes_ts,
-                dispatch:    #dispatch_ts,
-                kernel_mode: #km_ts,
+        const _: () = {
+            #[allow(unused_imports)]
+            use crate::bench_types::DType;
+            ::inventory::submit! {
+                crate::spec::BenchSpec {
+                    op:          #op,
+                    subop:       #subop,
+                    kernel_name: #fn_str,
+                    kernel_ir:   #kernel_ir_expr,
+                    dtypes:      #dtypes,
+                    tol:         #tol as f32,
+                    mlx_src:     #mlx_src,
+                    mlx_pattern: #mlx_pat,
+                    shapes:      #shapes_ts,
+                    dispatch:    #dispatch_ts,
+                    kernel_mode: #km_ts,
+                }
             }
-        }
+        };
     }
 }

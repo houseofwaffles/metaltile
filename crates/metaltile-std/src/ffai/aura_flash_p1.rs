@@ -66,13 +66,7 @@
 
 use metaltile::kernel;
 
-use crate::bench_types::DType;
-
-// Keep `DType` referenced for the inventory submit; `FLOAT_DTYPES`
-// supersedes the old `F32_ONLY` shortlist now that the kernel handles
-// fp32/fp16/bf16 via the generic `T` I/O dtype.
-const _: DType = DType::F32;
-
+#[rustfmt::skip]
 macro_rules! aura_flash_p1_kernel {
     (
         $name:ident,
@@ -85,8 +79,8 @@ macro_rules! aura_flash_p1_kernel {
         $subop:literal
     ) => {
         #[kernel(
-                    bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-                )]
+            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
+        )]
         pub fn $name<T>(
             q_rot: Tensor<T>,
             key_packed: Tensor<u32>,

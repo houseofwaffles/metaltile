@@ -26,14 +26,16 @@
 //! `tests/scatter_axis_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-#[kernel]
+#[kernel(
+    bench(
+        op="indexing",
+        subop="scatter_axis",
+        class=GenericEmpty,
+        tol=0.0,
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_scatter_axis<T>(
     updates: Tensor<T>,
     indices: Tensor<u32>,
@@ -48,20 +50,4 @@ pub fn mt_scatter_axis<T>(
     let scattered = load(indices[idx]);
     let out_off = (o * axis_size + scattered) * inner + i;
     store(out[out_off], load(updates[idx]));
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "indexing",
-        subop: "scatter_axis",
-        kernel_name: "mt_scatter_axis",
-        kernel_ir: mt_scatter_axis::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 0.0,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
 }

@@ -40,12 +40,6 @@
 //!   - KernelMode::Reduction
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 // ─── mt_fp4_qmm_mma — fp4 E2M1 simdgroup-matrix MMA ─────────────────────────
 //
@@ -59,7 +53,15 @@ use crate::{
 /// `w [n, k/8]` fp4 E2M1 packed (8 codes/u32, MSB = sign),
 /// `scales [n, k/group_size]` T (scale-only, group_size=32),
 /// `x [m, k]` T, `out [m, n]` T.
-#[kernel]
+#[kernel(
+    bench(
+        op="fp_quantized",
+        subop="fp4_qmm_mma",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fp4_qmm_mma<T>(
     w: Tensor<u32>,
@@ -258,22 +260,6 @@ pub fn mt_fp4_qmm_mma<T>(
     );
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "fp_quantized",
-        subop: "fp4_qmm_mma",
-        kernel_name: "mt_fp4_qmm_mma",
-        kernel_ir: mt_fp4_qmm_mma::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 // ─── mt_fp8_e4m3_qmm_mma — fp8 E4M3 simdgroup-matrix MMA ────────────────────
 //
 // Dense GEMM with fp8 E4M3 weights. W packed as 4 codes/u32 (8 bits each).
@@ -295,7 +281,15 @@ inventory::submit! {
 /// `w [n, k/4]` fp8 E4M3 packed (4 codes/u32),
 /// `scales [n, k/group_size]` T (scale-only, group_size=32),
 /// `x [m, k]` T, `out [m, n]` T.
-#[kernel]
+#[kernel(
+    bench(
+        op="fp_quantized",
+        subop="fp8_e4m3_qmm_mma",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fp8_e4m3_qmm_mma<T>(
     w: Tensor<u32>,
@@ -513,20 +507,4 @@ pub fn mt_fp8_e4m3_qmm_mma<T>(
         out[(out_m_base + 8u32 + fm) * n + out_n_base + 8u32 + fn1],
         simdgroup_elem_load(c_f11, 1).cast::<T>(),
     );
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "fp_quantized",
-        subop: "fp8_e4m3_qmm_mma",
-        kernel_name: "mt_fp8_e4m3_qmm_mma",
-        kernel_ir: mt_fp8_e4m3_qmm_mma::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
 }

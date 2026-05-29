@@ -58,20 +58,23 @@
 //! Codegen-only; correctness pinned by `tests/fft_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
 
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
+#[rustfmt::skip]
 macro_rules! fft_kernel {
     ($name:ident, $n:literal, $log_n:literal, $inv_n:literal, $subop:literal) => {
         /// Radix-2 FFT of one length-`N` row. `in_re` / `in_im` are the
         /// real / imaginary input planes, `out_re` / `out_im` the
         /// outputs; `inv` is `0` for the forward transform, `1` for the
         /// inverse (conjugated twiddles + `1/N` scale).
-        #[kernel]
+        #[kernel(
+            bench(
+                op="fft",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=1e-3,
+                kernel_mode=Reduction,
+            )
+        )]
         pub fn $name<T>(
             in_re: Tensor<T>,
             in_im: Tensor<T>,
@@ -141,22 +144,6 @@ macro_rules! fft_kernel {
             let res_im = threadgroup_load("im", tid) * scale;
             store(out_re[base + tid], res_re.cast::<T>());
             store(out_im[base + tid], res_im.cast::<T>());
-        }
-
-        inventory::submit! {
-            BenchSpec {
-                op: "fft",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Reduction),
-            }
         }
     };
 }
@@ -235,7 +222,15 @@ fft_kernel!(mt_fft_n1024, 1024u32, 10u32, 0.000_976_562_5f32, "n1024");
 /// dispatches `ceil(rows*M/tpg)` workgroups and the trailing threads
 /// must skip OOB writes (Apple Silicon silently lands OOB writes into
 /// adjacent buffer slots and corrupts the output).
-#[kernel]
+#[kernel(
+    bench(
+        op="fft",
+        subop="bluestein_preprocess",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Grid3D,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_preprocess<T>(
     in_re: Tensor<T>,
@@ -286,22 +281,6 @@ pub fn mt_fft_bluestein_preprocess<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "fft",
-        subop: "bluestein_preprocess",
-        kernel_name: "mt_fft_bluestein_preprocess",
-        kernel_ir: mt_fft_bluestein_preprocess::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 /// Bluestein step 2: build the chirp convolution filter in the time domain.
 ///
 /// Computes `a[m]` for the circular convolution `filter_re / filter_im`
@@ -320,7 +299,16 @@ inventory::submit! {
 ///
 /// The caller FFTs this filter once and stores it for reuse across all
 /// rows/frames.
-#[kernel]
+#[kernel(
+    bench(
+        op="fft",
+        subop="bluestein_chirp_filter",
+        class=GenericEmpty,
+        tol=1e-3,
+        dtypes=&[DType::F32],
+        kernel_mode=Grid3D,
+    )
+)]
 pub fn mt_fft_bluestein_chirp_filter(
     mut filter_re: Tensor<f32>,
     mut filter_im: Tensor<f32>,
@@ -349,28 +337,6 @@ pub fn mt_fft_bluestein_chirp_filter(
     }
 }
 
-/// Wrapper satisfying the `fn(DType) -> Kernel` BenchSpec signature.
-/// The chirp filter is always f32, so the DType argument is ignored.
-fn mt_fft_bluestein_chirp_filter_ir(_: DType) -> metaltile_core::ir::Kernel {
-    mt_fft_bluestein_chirp_filter::kernel_ir_for()
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "fft",
-        subop: "bluestein_chirp_filter",
-        kernel_name: "mt_fft_bluestein_chirp_filter",
-        kernel_ir: mt_fft_bluestein_chirp_filter_ir,
-        dtypes: &[DType::F32],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 /// Bluestein convolution step: element-wise complex multiply of two `[rows, M]`
 /// frequency-domain arrays. Performed between the two FFT calls:
 ///
@@ -379,7 +345,15 @@ inventory::submit! {
 /// Both inputs are `[rows, M]`; `filter_re / filter_im` are `[1, M]` and
 /// broadcast across rows. Generic over `T` for the per-row input;
 /// the filter is always f32 (pre-computed once as f32).
-#[kernel]
+#[kernel(
+    bench(
+        op="fft",
+        subop="bluestein_cmul",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Grid3D,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_cmul<T>(
     y_re: Tensor<T>,
@@ -408,22 +382,6 @@ pub fn mt_fft_bluestein_cmul<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "fft",
-        subop: "bluestein_cmul",
-        kernel_name: "mt_fft_bluestein_cmul",
-        kernel_ir: mt_fft_bluestein_cmul::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
-    }
-}
-
 /// Bluestein step 3: post-multiply and extract N outputs from M-length IFFT.
 ///
 /// For each row and each output bin `k ∈ [0, N)`:
@@ -437,7 +395,15 @@ inventory::submit! {
 ///   - Output is `[rows, N]` (truncated to the first N bins).
 ///
 /// Grid3D: one thread per element of `[rows, N]`.
-#[kernel]
+#[kernel(
+    bench(
+        op="fft",
+        subop="bluestein_postprocess",
+        class=GenericEmpty,
+        tol=1e-3,
+        kernel_mode=Grid3D,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_postprocess<T>(
     conv_re: Tensor<T>,
@@ -473,21 +439,5 @@ pub fn mt_fft_bluestein_postprocess<T>(
         let scale = select(inv == 0u32, 1.0f32, 1.0f32 / n_len_f);
         store(out_re[idx], (pr * scale).cast::<T>());
         store(out_im[idx], (pi_v * scale).cast::<T>());
-    }
-}
-
-inventory::submit! {
-    BenchSpec {
-        op: "fft",
-        subop: "bluestein_postprocess",
-        kernel_name: "mt_fft_bluestein_postprocess",
-        kernel_ir: mt_fft_bluestein_postprocess::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 1e-3,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Grid3D),
     }
 }

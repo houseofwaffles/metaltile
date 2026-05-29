@@ -29,37 +29,20 @@
 //! `tests/ssm_replay_gpu_correctness.rs`.
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
-
-macro_rules! ssm_replay_spec {
-    ($name:ident, $subop:literal) => {
-        inventory::submit! {
-            BenchSpec {
-                op: "ssm_replay",
-                subop: $subop,
-                kernel_name: stringify!($name),
-                kernel_ir: $name::kernel_ir_for,
-                dtypes: &[DType::F32, DType::F16, DType::BF16],
-                tol: 1e-3,
-                mlx_src: None,
-                mlx_pattern: None,
-                shapes: &[],
-                dispatch: BenchDispatch::Generic,
-                kernel_mode: Some(KernelMode::Grid3D),
-            }
-        }
-    };
-}
 
 // ── SSD forward step with (dA, dBx) tape capture ────────────────────────────
+#[rustfmt::skip]
 macro_rules! ssm_step_record {
     ($name:ident, $dh:literal, $ds:literal, $h:literal, $g:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="ssm_replay",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=1e-3,
+                kernel_mode=Grid3D,
+            )
+        )]
         pub fn $name<T>(
             x: Tensor<T>,
             a_log: Tensor<T>,
@@ -133,14 +116,22 @@ macro_rules! ssm_step_record {
                 store(state_out[state_base + $n_per_t * ds_lane + i], st.cast::<T>());
             }
         }
-        ssm_replay_spec!($name, $subop);
     };
 }
 
 // ── Tape replay: re-fold the first k log entries onto a snapshot ────────────
+#[rustfmt::skip]
 macro_rules! ssm_replay {
     ($name:ident, $dh:literal, $ds:literal, $h:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel]
+        #[kernel(
+            bench(
+                op="ssm_replay",
+                subop=$subop,
+                class=GenericEmpty,
+                tol=1e-3,
+                kernel_mode=Grid3D,
+            )
+        )]
         pub fn $name<T>(
             state_snapshot: Tensor<T>,
             da_log: Tensor<T>,
@@ -186,7 +177,6 @@ macro_rules! ssm_replay {
                 store(state_after_k[state_base + $n_per_t * ds_lane + i], st.cast::<T>());
             }
         }
-        ssm_replay_spec!($name, $subop);
     };
 }
 

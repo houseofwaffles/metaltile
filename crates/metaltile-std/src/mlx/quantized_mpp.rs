@@ -40,18 +40,20 @@
 //! slot of `OutScratch`, then all 32 lanes coop-write it to `out` (cast to T).
 
 use metaltile::kernel;
-use metaltile_core::ir::KernelMode;
-
-use crate::{
-    bench_types::DType,
-    spec::{BenchDispatch, BenchSpec},
-};
 
 /// MPP int4 quantized matmul `Out = X · dequant(W)`. Params:
 ///   `w [n, k/8]` int4 packed (8 nibbles/u32),
 ///   `scales`/`biases [n, k/group_size]` (T),
 ///   `x [m, k]` (T), `out [m, n]` (T). group_size = 64.
-#[kernel]
+#[kernel(
+    bench(
+        op="quantized",
+        subop="qmm_mma_mpp",
+        class=GenericEmpty,
+        tol=5e-2,
+        kernel_mode=Reduction,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_qmm_mma_mpp<T>(
     w: Tensor<u32>,
@@ -147,26 +149,10 @@ pub fn mt_qmm_mma_mpp<T>(
     }
 }
 
-inventory::submit! {
-    BenchSpec {
-        op: "quantized",
-        subop: "qmm_mma_mpp",
-        kernel_name: "mt_qmm_mma_mpp",
-        kernel_ir: mt_qmm_mma_mpp::kernel_ir_for,
-        dtypes: &[DType::F32, DType::F16, DType::BF16],
-        tol: 5e-2,
-        mlx_src: None,
-        mlx_pattern: None,
-        shapes: &[],
-        dispatch: BenchDispatch::Generic,
-        kernel_mode: Some(KernelMode::Reduction),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use metaltile_codegen::msl::MslGenerator;
-    use metaltile_core::ir::Op;
+    use metaltile_core::{dtype::DType, ir::Op};
 
     use super::*;
 

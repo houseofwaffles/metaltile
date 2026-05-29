@@ -35,10 +35,9 @@
 //!
 //! Outer `aura_dequant_rotated_clean!` (for bits ∈ {2,4,8}) and
 //! `aura_dequant_rotated_odd!` (for bits=3) emit the entire
-//! `#[kernel] pub fn …` + the `inventory::submit!` registration at
-//! module scope.  Required because the `#[kernel]` proc-macro doesn't
-//! expand inner `macro_rules!` invocations (see CLAUDE.md note about
-//! PR #19's macro regression).
+//! `#[kernel(bench(...))] pub fn …` at module scope.  Required because
+//! the `#[kernel]` proc-macro doesn't expand inner `macro_rules!`
+//! invocations (see CLAUDE.md note about PR #19's macro regression).
 
 use metaltile::kernel;
 
@@ -47,11 +46,12 @@ use metaltile::kernel;
 // Each thread owns one packed word w covering DIMS_PER_WORD = 32/bits
 // dim slots starting at `d_base = w * DIMS_PER_WORD`.  One u32 load
 // amortises across all dims in the pack.
+#[rustfmt::skip]
 macro_rules! aura_dequant_rotated_clean {
     ($name:ident, $bits:literal, $subop:literal) => {
         #[kernel(
-                    bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-                )]
+            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
+        )]
         pub fn $name<T>(
             packed: Tensor<u32>,
             norms: Tensor<f32>,
@@ -103,11 +103,12 @@ macro_rules! aura_dequant_rotated_clean {
 // `ceil(32 / bits)` outputs per thread; `d_base = w * DIMS_PER_WORD`
 // for the iteration but the bit-offset arithmetic is keyed on the
 // absolute dim index `d`, so cross-word spills resolve correctly.
+#[rustfmt::skip]
 macro_rules! aura_dequant_rotated_odd {
     ($name:ident, $bits:literal, $subop:literal) => {
         #[kernel(
-                    bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-                )]
+            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
+        )]
         pub fn $name<T>(
             packed: Tensor<u32>,
             norms: Tensor<f32>,

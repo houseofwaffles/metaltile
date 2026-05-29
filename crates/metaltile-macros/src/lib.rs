@@ -18,7 +18,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use sig_parser::{extract_constexprs_typed, extract_param_names, parse_kernel_params_generic};
-use syn::{ItemFn, parse_macro_input};
+use syn::{ItemFn, Token, parse_macro_input};
 
 // ---------------------------------------------------------------------------
 // Attribute parsing — unified #[kernel(bench(...))]
@@ -26,36 +26,49 @@ use syn::{ItemFn, parse_macro_input};
 
 /// Arguments parsed from the `#[kernel(...)]` attribute.
 ///
-/// Supports two forms:
+/// Supports three forms:
 /// - `#[kernel]` — no bench args, just kernel expansion
-/// - `#[kernel(bench(op="...", subop="...", ...))]` — kernel expansion + BenchSpec submission
+/// - `#[kernel(bench(op="...", subop="...", ...))]` — kernel expansion + one BenchSpec
+/// - `#[kernel(bench(...), bench(...), ...)]` — kernel expansion + multiple BenchSpecs
 struct KernelAttr {
-    bench: Option<BenchArgs>,
+    benches: Vec<BenchArgs>,
 }
 
 impl syn::parse::Parse for KernelAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         if input.is_empty() {
-            return Ok(KernelAttr { bench: None });
+            return Ok(KernelAttr { benches: Vec::new() });
         }
 
-        let ident: syn::Ident = input.parse()?;
-        if ident != "bench" {
-            return Err(syn::Error::new(
-                ident.span(),
-                "expected `bench(...)` as the only #[kernel] argument",
-            ));
-        }
+        let mut benches = Vec::new();
+        loop {
+            let ident: syn::Ident = input.parse()?;
+            if ident != "bench" {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "expected `bench(...)` as #[kernel] argument",
+                ));
+            }
 
-        let content;
-        syn::parenthesized!(content in input);
-        let bench_args = content.parse::<BenchArgs>()?;
+            let content;
+            syn::parenthesized!(content in input);
+            benches.push(content.parse::<BenchArgs>()?);
+
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+                if input.is_empty() {
+                    break; // allow trailing comma after last bench(...)
+                }
+            } else {
+                break;
+            }
+        }
 
         if !input.is_empty() {
-            return Err(syn::Error::new(input.span(), "unexpected tokens after `bench(...)`"));
+            return Err(syn::Error::new(input.span(), "unexpected tokens after bench(...)"));
         }
 
-        Ok(KernelAttr { bench: Some(bench_args) })
+        Ok(KernelAttr { benches })
     }
 }
 
@@ -72,13 +85,13 @@ impl syn::parse::Parse for KernelAttr {
 struct KernelMacroBuilder {
     /// The parsed kernel function.
     input_fn: ItemFn,
-    /// Optional bench args for automatic benchmark registration.
-    bench_args: Option<BenchArgs>,
+    /// Bench specs for automatic benchmark registration (one per `bench(...)` block).
+    bench_args: Vec<BenchArgs>,
 }
 
 impl KernelMacroBuilder {
-    /// Create a new builder from the parsed function and optional bench args.
-    fn new(input_fn: ItemFn, bench_args: Option<BenchArgs>) -> Self {
+    /// Create a new builder from the parsed function and bench specs.
+    fn new(input_fn: ItemFn, bench_args: Vec<BenchArgs>) -> Self {
         KernelMacroBuilder { input_fn, bench_args }
     }
 
@@ -139,11 +152,9 @@ impl KernelMacroBuilder {
             &body_ir,
         );
 
-        // ── 6. Optionally generate the BenchSpec submission ───────────
-        let bench_submit = match &self.bench_args {
-            Some(args) => generate_submit(fn_name, args, is_generic),
-            None => TokenStream2::new(),
-        };
+        // ── 6. Generate BenchSpec submissions (one per bench(...) block) ──
+        let bench_submit: TokenStream2 =
+            self.bench_args.iter().map(|args| generate_submit(fn_name, args, is_generic)).collect();
 
         quote! {
             #kernel_module
@@ -429,7 +440,7 @@ pub fn strided(_attr: TokenStream, item: TokenStream) -> TokenStream { item }
 pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     let kernel_attr = parse_macro_input!(attr as KernelAttr);
     let input_fn = parse_macro_input!(item as ItemFn);
-    let builder = KernelMacroBuilder::new(input_fn, kernel_attr.bench);
+    let builder = KernelMacroBuilder::new(input_fn, kernel_attr.benches);
     TokenStream::from(builder.expand())
 }
 
@@ -572,7 +583,7 @@ mod tests {
     #[test]
     fn kernel_attr_parses_empty() {
         let attr: KernelAttr = syn::parse_quote! {};
-        assert!(attr.bench.is_none());
+        assert!(attr.benches.is_empty());
     }
 
     #[test]
@@ -580,10 +591,21 @@ mod tests {
         let attr: KernelAttr = syn::parse_quote! {
             bench(op="unary", subop="exp", class=Unary, tol=1e-4)
         };
-        assert!(attr.bench.is_some());
-        let bench = attr.bench.unwrap();
-        assert_eq!(bench.op.value(), "unary");
-        assert_eq!(bench.subop.value(), "exp");
+        assert_eq!(attr.benches.len(), 1);
+        let args = &attr.benches[0];
+        assert_eq!(args.op.value(), "unary");
+        assert_eq!(args.subop.value(), "exp");
+    }
+
+    #[test]
+    fn kernel_attr_parses_multiple_bench() {
+        let attr: KernelAttr = syn::parse_quote! {
+            bench(op="sdpa", subop="prefill", class=SdpaPrefill, h=128, n_heads=32, gqa_factor=4, batch=1, q_len=512, k_len=512, bq=32, bk=16, wm=4, wn=1, tpg=128, tol=2e-2),
+            bench(op="sdpa", subop="batched_q8", class=SdpaBatchedDecode, h=128, n_kv=4096, n_heads=32, gqa_factor=4, batch_q=8, variant=PrefillTile, bq=32, bk=16, wm=4, wn=1, tpg=128, tol=2e-2, kernel_mode=SimdGroup2D)
+        };
+        assert_eq!(attr.benches.len(), 2);
+        assert_eq!(attr.benches[0].subop.value(), "prefill");
+        assert_eq!(attr.benches[1].subop.value(), "batched_q8");
     }
 
     fn assert_param_output(tokens: &str, name: &str, expected: bool) {

@@ -40,12 +40,11 @@
 //!
 //! ## Macro structure
 //!
-//! `conv2d_kernel!` emits the whole `#[kernel] pub fn …` plus its
-//! `inventory::submit!` at module scope. The compiler expands the outer
-//! macro before the `#[kernel]` proc-macro runs, so the body parser sees
-//! concrete `$kh / $kw / $stride` tokens — never an inner `macro_rules!`
-//! inside a kernel body (which silently empties the kernel; see
-//! `dequant_gather.rs`).
+//! `conv2d_kernel!` emits the whole `#[kernel(bench(...))] pub fn …` at
+//! module scope. The compiler expands the outer macro before the `#[kernel]`
+//! proc-macro runs, so the body parser sees concrete `$kh / $kw / $stride`
+//! tokens — never an inner `macro_rules!` inside a kernel body (which
+//! silently empties the kernel; see `dequant_gather.rs`).
 //!
 //! Codegen-only. Correctness validated by `conv2d_gpu_correctness`.
 
