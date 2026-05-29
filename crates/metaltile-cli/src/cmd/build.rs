@@ -30,11 +30,8 @@ use metaltile_codegen::{
     generator_for_mode,
     passes::{PassStats, PipelineBuilder, run_passes_with_stats},
 };
-use metaltile_core::ir::Kernel;
-use metaltile_std::{
-    bench_types::DType,
-    spec::{BenchSpec, all_specs, effective_mode},
-};
+use metaltile_core::{all_benches, bench::KernelBench, ir::Kernel};
+use metaltile_std::{bench_types::DType, spec::all_specs};
 
 use crate::{
     BuildArgs,
@@ -50,6 +47,10 @@ fn col_sep() -> String { paint_stdout("│", Style::new().fg(Color::BrightBlack)
 fn pad_left(text: &str, width: usize) -> String { format!("{text:<width$}") }
 
 fn pad_right(text: &str, width: usize) -> String { format!("{text:>width$}") }
+
+/// A kernel to emit: its bench (carrying IR + mode + grid) and the union of
+/// dtypes it should be monomorphized over.
+type EmitKernel = (&'static dyn KernelBench, Vec<DType>);
 
 pub fn run(args: &BuildArgs) -> Result<(), CliError> {
     let _span = tracing::info_span!("build", filter = ?args.filter, emit = ?args.emit).entered();
@@ -99,19 +100,28 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
         .as_ref()
         .map(|s| s.split(',').filter_map(|t| t.trim().parse::<DType>().ok()).collect());
 
-    // Collect unique kernel specs.
-    let mut kernels: BTreeMap<&str, (&BenchSpec, Vec<DType>)> = BTreeMap::new();
-    for spec in all_specs() {
-        let entry = kernels.entry(spec.kernel_name).or_insert_with(|| (spec, Vec::new()));
-        for &dt in spec.dtypes {
-            if !entry.1.contains(&dt) {
-                entry.1.push(dt);
+    // Collect unique kernels from the new `#[bench]` registry. Each bench's
+    // setup carries the kernel IR (with mode applied via `.mode()`), the dtype
+    // set, and the threadgroup geometry — everything emission needs — so the
+    // emitted kernel set no longer depends on the legacy `BenchSpec` inventory.
+    // (`BenchBuffer`s are lazy metadata, so building a setup just to read its
+    // kernel/grid is cheap.) Keyed by the kernel's generic name; a kernel with
+    // multiple benches unions their dtype sets.
+    let mut kernels: BTreeMap<String, EmitKernel> = BTreeMap::new();
+    for entry in all_benches() {
+        let bench = entry.bench();
+        let Some(&first_dt) = bench.dtypes().first() else { continue };
+        let base_name = bench.setup(first_dt).kernel().name.to_string();
+        let e = kernels.entry(base_name).or_insert((bench, Vec::new()));
+        for &dt in bench.dtypes() {
+            if !e.1.contains(&dt) {
+                e.1.push(dt);
             }
         }
     }
 
-    let mut sorted: Vec<(&str, (&BenchSpec, Vec<DType>))> = kernels.into_iter().collect();
-    sorted.sort_unstable_by_key(|(name, _)| *name);
+    let mut sorted: Vec<(String, EmitKernel)> = kernels.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     // Header.
     println!(
@@ -167,8 +177,8 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
     let mut ok = 0u32;
     let mut errors = 0u32;
 
-    for (name, (spec, dtypes)) in &sorted {
-        if !matches_filter(filter.as_deref(), name) {
+    for (name, (bench, dtypes)) in &sorted {
+        if !matches_filter(filter.as_deref(), name.as_str()) {
             continue;
         }
         let _kspan = tracing::debug_span!("kernel", name).entered();
@@ -180,17 +190,17 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
             None => dtypes.clone(),
         };
 
-        // Determine the kernel mode. Explicit override beats inference.
-        let mode = effective_mode(spec);
-
         let mut dtypes_ok = Vec::new();
         let mut dtypes_err = Vec::new();
         for &dt in &dtypes_to_check {
-            let mut k = (spec.kernel_ir)(dt);
-            k.mode = mode;
+            // The bench's setup carries the kernel IR with its dispatch mode
+            // already applied (via `.mode()`) and the threadgroup geometry.
+            let setup = bench.setup(dt);
+            let mut k = setup.kernel().clone();
+            let mode = k.mode;
             // Monomorphize per-dtype name (e.g. `mt_add` → `mt_add_f32`),
-            // unless the spec is already dtype-specialized (e.g. `mt_argmax_f32`).
-            k.name = monomorphized_name(spec.kernel_name, dt, dtypes.len());
+            // unless the kernel is already dtype-specialized (e.g. `mt_argmax_f32`).
+            k.name = monomorphized_name(name, dt, dtypes.len());
 
             // Codegen hint so the emitted MSL matches exactly what `tile
             // bench` measures (and what production callers will dispatch
@@ -201,8 +211,9 @@ pub fn run(args: &BuildArgs) -> Result<(), CliError> {
             //   3. `None` (a few Grid3D/Elementwise variants with no fixed
             //      TPG) → safe slow path. Reduction-mode kernels with no TPG
             //      signal anywhere fall through to the conservative emit.
-            let expected_tpg =
-                spec.shapes.first().map(|s| s.tpg as u32).or_else(|| spec.dispatch.tpg_hint());
+            // Threadgroup-size hint for codegen comes straight from the bench's
+            // dispatch geometry, matching exactly what `tile bench` measures.
+            let expected_tpg = Some(setup.grid().tpg[0]);
             let generator = generator_for_mode(mode, expected_tpg);
 
             // Compile-check via generate.
