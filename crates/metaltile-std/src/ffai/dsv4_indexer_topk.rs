@@ -1,4 +1,4 @@
-//! Copyright 2026 Tom Turney (@TheTom)
+//! Copyright 2026 0xClandestine, Ekryski, TheTom, Ambisphaeric
 //! SPDX-License-Identifier: Apache-2.0
 //! DSv4 Lightning Indexer — top-k index selection over per-position
 //! aggregate scores.

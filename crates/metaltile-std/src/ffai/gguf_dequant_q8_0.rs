@@ -1,4 +1,4 @@
-//! Copyright 2026 Tom Turney (@TheTom)
+//! Copyright 2026 0xClandestine, Ekryski, TheTom, Ambisphaeric
 //! SPDX-License-Identifier: Apache-2.0
 //! GGUF Q8_0 block dequant — `out[i] = qs[i] * d[i/32]`.
 //!

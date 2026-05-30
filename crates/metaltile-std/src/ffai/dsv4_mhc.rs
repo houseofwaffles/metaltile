@@ -1,4 +1,4 @@
-//! Copyright 2026 Tom Turney (@TheTom)
+//! Copyright 2026 0xClandestine, Ekryski, TheTom, Ambisphaeric
 //! SPDX-License-Identifier: Apache-2.0
 //! DeepSeek V4 Manifold-Constrained Hyper-Connections (mHC).
 //!

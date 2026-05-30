@@ -1,4 +1,4 @@
-//! Copyright 2026 Tom Turney (@TheTom)
+//! Copyright 2026 0xClandestine, Ekryski, TheTom, Ambisphaeric
 //! SPDX-License-Identifier: Apache-2.0
 //! Single-token SDPA decode for `head_dim == 512` with **GPT-OSS-style
 //! attention sink** — a per-head learnable scalar that participates in

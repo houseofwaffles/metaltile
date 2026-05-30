@@ -1,4 +1,4 @@
-//! Copyright 2026 Tom Turney (@TheTom)
+//! Copyright 2026 0xClandestine, Ekryski, TheTom, Ambisphaeric
 //! SPDX-License-Identifier: Apache-2.0
 //! Block-FP8 e4m3 dequant — DeepSeek V3/V4 attention + router weight format.
 //!
