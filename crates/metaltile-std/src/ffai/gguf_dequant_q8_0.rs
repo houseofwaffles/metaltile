@@ -48,14 +48,13 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="gguf_dequant",
-        subop="q8_0",
-        class=GenericEmpty,
-        tol=1e-3,
-    )
-)]
+// Bare `#[kernel]` — kernel mixes concrete-dtype packed-byte inputs
+// with a generic `Tensor<T>` output, which doesn't fit the legacy
+// `bench(...)` registration's `GenericEmpty` dispatch shape. The new
+// declarative `#[bench]` attribute on the `kernel_benches::bench_q8_0`
+// fn below registers this kernel for `tile bench` without the legacy
+// path.
+#[kernel]
 pub fn ffai_gguf_dequant_q8_0<T>(
     qs_signed: Tensor<u8>,
     scales: Tensor<f32>,

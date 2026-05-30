@@ -52,14 +52,9 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="gguf_dequant",
-        subop="q2_k",
-        class=GenericEmpty,
-        tol=1e-3,
-    )
-)]
+// Bare `#[kernel]` — see Q8_0 sibling for why; mixed concrete +
+// generic param dtype set doesn't fit the legacy `bench(...)` shape.
+#[kernel]
 pub fn ffai_gguf_dequant_q2_k<T>(
     qs_packed: Tensor<u32>,
     scales: Tensor<u8>,
