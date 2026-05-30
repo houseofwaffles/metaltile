@@ -48,8 +48,8 @@ use metaltile::kernel;
 pub fn ffai_moe_router_sqrtsoftplus(
     logits: Tensor<f32>,
     bias: Tensor<f32>,
-    score_unbiased: Tensor<f32>,
-    score_biased: Tensor<f32>,
+    mut score_unbiased: Tensor<f32>,
+    mut score_biased: Tensor<f32>,
 ) {
     let idx = tid;
     let x = load(logits[idx]);
