@@ -69,6 +69,7 @@ pub mod moe_mpp_bm8;
 pub mod moe_mpp_bm8_int8;
 pub mod moe_mpp_int8;
 pub mod moe_mpp_shared;
+pub mod moe_router_sqrtsoftplus;
 pub mod patch_embed;
 pub mod patch_embed_mma;
 pub mod rms_norm_qgemv;
