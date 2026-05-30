@@ -28,7 +28,13 @@
 //!   this kernel's bandwidth, so it follows the model dtype (cast-to-f32 at
 //!   load, f32 accumulation). f16/bf16 Π rounding (~1e-3) is far below the
 //!   2–4-bit quantization bin width that consumes the rotated value.
-//! - `boundaries [2**bits - 1]`         T    — Lloyd-Max thresholds.
+//! - `boundaries [2**bits - 1]`         f32  — Lloyd-Max thresholds. Kept f32
+//!   (not T) because the buffer is `2^bits - 1` floats per scheme — `60
+//!   bytes` at 4-bit, ~`1 KB` worst-case at 8-bit. The bandwidth argument that
+//!   moves Π to T does not apply here, and at 4-bit aura the bf16 boundary
+//!   rounding flips a small but measurable fraction of borderline bin
+//!   assignments — costs ~0.3 nats KLD on Qwen3-0.6B-4bit aura4v4 with no
+//!   bandwidth payback. See FFAI's `AuraKLDIntegrationTests` for the gate.
 //! - `codebook   [2**bits]`             T    — centroid values, dtype matched
 //!   to the decoder cache so the same buffer feeds both paths with no
 //!   per-call cast.
@@ -79,8 +85,10 @@ use metaltile::kernel;
 
 macro_rules! aura_encode_kernel {
     ($name:ident, $bits:literal, $levels:literal, $subop:literal) => {
-        // All buffers are the model dtype T (bf16/f16 in production, f32
-        // in tests) — we cast each load to f32 and accumulate in f32.
+        // `input` / `rotation` / `codebook` / `norms_out` are model dtype
+        // T (bf16/f16 in production, f32 in tests) — we cast each load
+        // to f32 and accumulate in f32.
+        //
         // The f32 *accumulation* is load-bearing and stays: the L2-norm
         // reductions (Stages 1 & 5) and the dim-length rotation matmul
         // (Stage 2) each sum up to `dim` (≤512) terms, and the resulting
@@ -88,18 +96,28 @@ macro_rules! aura_encode_kernel {
         // in the decoder — f16 accumulation there drifts enough to hurt.
         // The *storage* precision is what was overkill: the dim×dim
         // rotation matrix dominates this kernel's bandwidth, so storing
-        // it (and the other operands) in T halves the dominant read. Its
-        // f16/bf16 rounding (~1e-3) is far below the 2–4-bit quant bin
-        // the rotated value lands in, and the decoder's inverse rotation
-        // is already a model-dtype gemm — so f32 Π here was strictly more
-        // precise than the round-trip it feeds.
+        // it (and the codebook + norms_out) in T halves the dominant
+        // read. Its f16/bf16 rounding (~1e-3) is far below the 2–4-bit
+        // quant bin the rotated value lands in, and the decoder's
+        // inverse rotation is already a model-dtype gemm — so f32 Π
+        // here was strictly more precise than the round-trip it feeds.
+        //
+        // `boundaries` stays f32. The buffer is `2^bits - 1` floats per
+        // scheme — 60 bytes at 4-bit, ~1 KB at 8-bit — so the bandwidth
+        // argument for narrowing Π does not apply, and at 4-bit aura
+        // the bf16 rounding flips a small fraction of borderline bin
+        // assignments at the Stage-3 branchless compare. Measured on
+        // FFAI's KLD harness (Qwen3-0.6B-4bit, 61-position): T-typed
+        // boundaries → aura4v4 compressed-flash KLD 1.76; f32 boundaries
+        // → 1.40 (mirror baseline 1.41). The 0.3-nat gap maps cleanly
+        // to the bf16 boundary rounding flipping borderline bins.
         #[kernel(
             bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
         )]
         pub fn $name<T>(
             input: Tensor<T>,
             rotation: Tensor<T>,
-            boundaries: Tensor<T>,
+            boundaries: Tensor<f32>,
             codebook: Tensor<T>,
             mut packed_out: Tensor<u32>,
             mut norms_out: Tensor<T>,
@@ -152,7 +170,7 @@ macro_rules! aura_encode_kernel {
             // exceeds.
             let mut idx = 0u32;
             for b in range(0u32, $levels - 1u32, 1u32) {
-                idx = idx + (rotated > load(boundaries[b]).cast::<f32>()).cast::<u32>();
+                idx = idx + (rotated > load(boundaries[b])).cast::<u32>();
             }
 
             // ── Stage 4: pack the index into the u32 stream via
@@ -243,12 +261,14 @@ aura_encode_kernel!(aura_encode_int8, 8u32, 256u32, "encode_int8");
 /// unit_val` exactly (no reorder ambiguity in the quant index), and a smooth
 /// input chosen to land each rotated coordinate comfortably mid-bin — so the
 /// codebook index feeding `norms_out` is stable under input dtype rounding.
-/// All data operands are now `Tensor<T>` (`input`/`codebook`/`norms_out` from
-/// #212, and `rotation`/`boundaries` from the storage-precision follow-up), so
-/// every one is dtype-rounded here to match the kernel's cast-at-load. The
-/// identity rotation is exact in all dtypes; `norms_out` is compared at the
-/// per-dtype tol. `packed_out` is provided but NOT expected (fast-math packing
-/// — the legacy f32 A/B test owns the bit-exact check).
+/// `input` / `rotation` / `codebook` / `norms_out` are `Tensor<T>` and
+/// dtype-rounded here to match the kernel's cast-at-load. The identity rotation
+/// is exact in all dtypes; `norms_out` is compared at the per-dtype tol.
+/// `boundaries` stays `Tensor<f32>` — the 60-byte 4-bit (~1 KB worst-case
+/// 8-bit) buffer isn't bandwidth-bound, and the bf16-boundary rounding
+/// measurably degrades 4-bit AURA quality at decode time. `packed_out` is
+/// provided but NOT expected (fast-math packing — the legacy f32 A/B test owns
+/// the bit-exact check).
 ///
 /// Grid (Reduction, TPG = dim): `grid_3d(rows, 1, 1, [dim,1,1])`.
 pub mod kernel_tests {
@@ -331,20 +351,21 @@ pub mod kernel_tests {
         // through `dt`, so round the expectation through `dt` too.
         let input_r = unpack_f32(&pack_f32(&input, dt), dt);
         let codebook_r = unpack_f32(&pack_f32(&codebook, dt), dt);
-        // rotation/boundaries are now Tensor<T> too; round the oracle's
-        // copies to match the kernel's cast-at-load. The identity rotation
-        // (0/1 entries) is exact in every dtype, so only `boundaries`
-        // actually rounds — and the mid-bin inputs keep the quant index
-        // stable regardless.
-        let boundaries_r = unpack_f32(&pack_f32(&boundaries, dt), dt);
-        let expected_norms_f32 = norms_oracle(&input_r, &boundaries_r, &codebook_r, rows, dim);
+        // rotation rounds through dt at cast-at-load (identity is exact in
+        // every dtype so it's a no-op here). `boundaries` is Tensor<f32>
+        // — no rounding, the GPU loads the same float the oracle reads.
+        let expected_norms_f32 = norms_oracle(&input_r, &boundaries, &codebook_r, rows, dim);
         let expected_norms = unpack_f32(&pack_f32(&expected_norms_f32, dt), dt);
 
         TestSetup::new(aura_encode_int4::kernel_ir_for(dt))
             .mode(KernelMode::Reduction)
             .input(TestBuffer::from_vec("input", pack_f32(&input, dt), dt))
             .input(TestBuffer::from_vec("rotation", pack_f32(&rotation, dt), dt))
-            .input(TestBuffer::from_vec("boundaries", pack_f32(&boundaries, dt), dt))
+            .input(TestBuffer::from_vec(
+                "boundaries",
+                pack_f32(&boundaries, DType::F32),
+                DType::F32,
+            ))
             .input(TestBuffer::from_vec("codebook", pack_f32(&codebook, dt), dt))
             .input(TestBuffer::from_vec(
                 "packed_out",
