@@ -677,9 +677,12 @@ pub mod kernel_tests {
     }
 
     // e4m3 byte → exact value: 0x00→0, 0x30→0.5, 0x34→0.75, 0x38→1.0,
-    // 0x3C→1.5, 0x40→2.0, 0xB8→-1.0, 0xC0→-2.0. (f32 tol allows the GPU
-    // exp2's ~1-ulp drift in the decode; f16/bf16 round it away.)
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-5, 1e-3, 1e-2])]
+    // 0x3C→1.5, 0x40→2.0, 0xB8→-1.0, 0xC0→-2.0. The decode is exact
+    // arithmetic on paper, but the kernel reconstructs the magnitude with
+    // `exp2()` (a Metal fast-math transcendental), which is ~1 ULP off even
+    // for integer arguments — so f32 carries a 1-ULP band (max |val| = 2 →
+    // 1 ULP ≈ 2.4e-7); f16/bf16 round that sub-ULP drift away and stay exact.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-6, 0.0, 0.0])]
     fn test_bulk_dequant_kv_fp8_e4m3(dt: DType) -> TestSetup {
         let palette: [(u8, f32); 8] = [
             (0x00, 0.0),
@@ -695,8 +698,9 @@ pub mod kernel_tests {
     }
 
     // e5m2 byte → exact value: 0x00→0, 0x34→0.25, 0x38→0.5, 0x3C→1.0,
-    // 0x40→2.0, 0x44→4.0, 0xBC→-1.0, 0xB8→-0.5.
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-5, 1e-3, 1e-2])]
+    // 0x40→2.0, 0x44→4.0, 0xBC→-1.0, 0xB8→-0.5. f32 carries the same 1-ULP
+    // `exp2()` band as e4m3 (max |val| = 4 → 1 ULP ≈ 4.8e-7); f16/bf16 exact.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-6, 0.0, 0.0])]
     fn test_bulk_dequant_kv_fp8_e5m2(dt: DType) -> TestSetup {
         let palette: [(u8, f32); 8] = [
             (0x00, 0.0),

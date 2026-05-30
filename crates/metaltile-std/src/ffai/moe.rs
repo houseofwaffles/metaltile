@@ -3883,8 +3883,15 @@ pub mod kernel_tests {
         // Expert-sorted rows: 16 contiguous rows per expert.
         let per = t_rows / n_experts;
         let indices: Vec<u32> = (0..t_rows).map(|r| (r / per) as u32).collect();
+        // Normalise the scale by the code range so `code·scale` (hence the
+        // output magnitude) is comparable across bit-widths — without this,
+        // int8 codes (0..255) make the dequant ~17× larger than int4, which
+        // would force a loose f16/bf16 tolerance to absorb the half-precision
+        // rounding of big values. Keeping outputs O(1) lets every width share
+        // the same tight tolerance.
+        let s_norm = 15.0 / mask as f32;
         let scales_f: Vec<f32> =
-            (0..n_experts * n_out * gspr).map(|i| 0.01 + 0.001 * (i as f32)).collect();
+            (0..n_experts * n_out * gspr).map(|i| (0.01 + 0.001 * (i as f32)) * s_norm).collect();
         let biases_f: Vec<f32> =
             (0..n_experts * n_out * gspr).map(|i| -0.05 + 0.002 * (i as f32)).collect();
         let x_f: Vec<f32> = (0..t_rows * k_in).map(|i| 0.1 * ((i as f32 * 0.17).sin())).collect();
@@ -3918,9 +3925,9 @@ pub mod kernel_tests {
     fn test_moe_gather_qmm_mma_int4_bm16(dt: DType) -> TestSetup {
         mma_setup(mt_moe_gather_qmm_mma_int4_bm16::kernel_ir_for(dt), 4, 16, 64, dt)
     }
-    // int8 codes span 0..255 → larger dequant magnitudes; the half-precision
-    // MMA tiles widen the f16/bf16 error bands accordingly.
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 2e-1, 1.5])]
+    // int8 (codes 0..255): the scale is range-normalised in mma_setup so the
+    // output stays O(1) like int4, keeping the same tight tolerance.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-3, 5e-2, 2e-1])]
     fn test_moe_gather_qmm_mma_int8(dt: DType) -> TestSetup {
         mma_setup(mt_moe_gather_qmm_mma_int8::kernel_ir_for(dt), 8, 32, 128, dt)
     }

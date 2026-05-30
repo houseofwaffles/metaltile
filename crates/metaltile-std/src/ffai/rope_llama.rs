@@ -154,14 +154,13 @@ pub mod kernel_tests {
     fn test_rope_llama(dt: DType) -> TestSetup { rope_llama_setup(dt, 100, 1.0, 1.0, 1.0, 1.0e9) }
 
     // Llama-3 frequency-band scaling ON (scale 8, low/high factors 1/4,
-    // original_max 8192) at a far position — different pairs land in the
-    // low-freq (scaled), high-freq (unscaled), and smoothed-medium branches,
-    // exercising the band-interpolation the disabled config leaves dormant.
-    // Far position 16000 → large `theta = pos·inv_freq`, so the GPU cos/sin
-    // diverge a few ulp from the CPU oracle; widen f32 a touch.
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 1e-2, 5e-2])]
+    // original_max 8192). The band a pair lands in (low-freq scaled, high-freq
+    // unscaled, smoothed-medium) is selected by the frequency index, NOT the
+    // position — so a small position keeps `theta = pos·inv_freq` (hence the
+    // cos/sin precision) tight while still exercising all three branches.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 5e-2])]
     fn test_rope_llama_llama3_banding(dt: DType) -> TestSetup {
-        rope_llama_setup(dt, 16000, 8.0, 1.0, 4.0, 8192.0)
+        rope_llama_setup(dt, 100, 8.0, 1.0, 4.0, 8192.0)
     }
 }
 

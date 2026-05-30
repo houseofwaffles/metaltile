@@ -134,14 +134,13 @@ pub mod kernel_tests {
     fn test_rope_yarn(dt: DType) -> TestSetup { rope_yarn_setup(dt, 100, 4.0, 16.0, 24.0, 1.0) }
 
     // Nemotron-style aggressive YaRN: factor 16 (strong interp band) with a
-    // non-unit attn_factor (mscale) — exercises both the deeper
-    // extrap/interp ramp and the `cos/sin * attn_factor` scaling that the
-    // attn=1 config leaves as a no-op.
-    // Larger position + aggressive interp → larger `theta`, so the GPU's
-    // cos/sin diverge a few ulp more from the CPU oracle; widen f32 a touch.
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [5e-4, 1e-2, 5e-2])]
+    // non-unit attn_factor (mscale) — exercises both the deeper extrap/interp
+    // ramp and the `cos/sin * attn_factor` scaling the attn=1 config leaves as
+    // a no-op. The ramp is selected by the frequency index, not the position,
+    // so a small position keeps the cos/sin precision tight.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 1e-2, 5e-2])]
     fn test_rope_yarn_nemotron(dt: DType) -> TestSetup {
-        rope_yarn_setup(dt, 4000, 16.0, 20.0, 37.0, 1.13)
+        rope_yarn_setup(dt, 100, 16.0, 20.0, 37.0, 1.13)
     }
 }
 
