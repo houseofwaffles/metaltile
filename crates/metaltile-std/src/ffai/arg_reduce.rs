@@ -115,6 +115,39 @@ pub mod kernel_tests {
     // n > lsize exercises the chunked outer loop (4 chunks of 256).
     #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.5)]
     fn test_ffai_argmax_multi_chunk(dt: DType) -> TestSetup { setup(1000, 813, dt) }
+
+    /// Tie-break test: many positions share the maximum value; argmax must
+    /// return the SMALLEST such index (NumPy/PyTorch/MLX semantics). The
+    /// kernel encodes this in both the per-lane scan (strict `>`) and every
+    /// tree-merge step (`(ov > tv) | (ov == tv & oi < ti)`); a regression to
+    /// `>=` would return a larger index. `tie_lo`/`tie_hi` bracket a run of
+    /// equal maxima that straddles lane boundaries (positions chosen so the
+    /// run spans more than one 256-lane chunk + crosses tree-reduction
+    /// strides), so the expected answer is exactly `tie_lo`.
+    fn tie_setup(n: usize, tie_lo: usize, tie_hi: usize, dt: DType) -> TestSetup {
+        assert!(tie_lo < tie_hi && tie_hi < n);
+        let mut inp = vec![0.5f32; n];
+        for v in inp.iter_mut().take(tie_hi + 1).skip(tie_lo) {
+            *v = 1.0; // a plateau of equal maxima
+        }
+        TestSetup::new(ffai_argmax::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("inp", pack_f32(&inp, dt), dt))
+            .input(TestBuffer::zeros("out", 1, DType::U32))
+            .constexpr("n", n as u32)
+            .expect(TestBuffer::from_vec("out", pack_f32(&[tie_lo as f32], DType::U32), DType::U32))
+            .grid_3d(1, 1, 1, [256, 1, 1])
+    }
+
+    // Plateau of equal maxima spanning lanes 100..400 (crosses the 256-lane
+    // chunk boundary + several tree strides) — must resolve to index 100.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.5)]
+    fn test_ffai_argmax_ties_take_smallest(dt: DType) -> TestSetup { tie_setup(512, 100, 400, dt) }
+
+    // Production vocab size (Qwen ~152k): one threadgroup loops ~595 chunks.
+    // Spike near the end exercises the full chunked scan at realistic scale.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = 0.5)]
+    fn test_ffai_argmax_vocab_152k(dt: DType) -> TestSetup { setup(152_064, 151_900, dt) }
 }
 
 /// New-syntax benchmark for `ffai_argmax` — an MLX-less reduction kernel that
