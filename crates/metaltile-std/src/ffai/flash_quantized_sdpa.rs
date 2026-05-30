@@ -654,7 +654,7 @@ pub mod kernel_tests {
 
     // Shared q/k/v fixture: 2 q-heads / 1 kv-head, 8 tokens, given dim.
     // Returns (q, sinks, k_packed, k_scales, k_biases, k_deq, v_*).
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn fixture(
         q_heads: usize,
         kv_heads: usize,
