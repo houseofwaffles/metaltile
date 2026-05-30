@@ -240,7 +240,7 @@ pub fn mt_ssm_step<T>(
 pub mod kernel_tests {
     use metaltile::{test::*, test_kernel};
 
-    use super::{conv1d_causal_step, ssm_step};
+    use super::{conv1d_causal_step, mt_ssm_step, ssm_step, ssm_step_a2d};
     use crate::utils::pack_f32;
 
     // ── conv1d_causal_step ──────────────────────────────────────────────
@@ -374,6 +374,195 @@ pub mod kernel_tests {
     // f32 so it must track tightly across all dtype runs.
     #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-5, 5e-3, 5e-2])]
     fn test_ssm_step(dt: DType) -> TestSetup { ssm_step_setup(4, 16, 8, dt) }
+
+    // ── ssm_step_a2d (Mamba 1 / Jamba: 2-D per-(channel,state) A_log) ────
+
+    /// CPU oracle for the 2-D-A_log selective-scan step. Per state element
+    /// `(h, d, n)`: `A = -exp(A_log[(h*head_dim+d), n])`, `decay = exp(A·dt[h])`,
+    /// `h' = decay·h_old + dt[h]·B[n]·x[h,d]`, `y[h,d] = Σ_n C[n]·h'`.
+    /// `h` is f32; returns `(y, h_new)`.
+    #[allow(clippy::too_many_arguments)]
+    fn ssm_step_a2d_oracle(
+        x: &[f32],
+        a_log: &[f32],
+        b_vec: &[f32],
+        c_vec: &[f32],
+        dt_in: &[f32],
+        h_state: &[f32],
+        n_heads: usize,
+        head_dim: usize,
+        state_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut y = vec![0.0_f32; n_heads * head_dim];
+        let mut h = h_state.to_vec();
+        for hh in 0..n_heads {
+            let h_base = hh * state_dim * head_dim;
+            for d in 0..head_dim {
+                let chan = hh * head_dim + d;
+                let row_base = chan * state_dim;
+                let x_d = x[hh * head_dim + d];
+                let mut y_d = 0.0_f32;
+                for n in 0..state_dim {
+                    let a_val = -(a_log[row_base + n].exp());
+                    let decay = (a_val * dt_in[hh]).exp();
+                    let h_idx = h_base + n * head_dim + d;
+                    let new_h = decay * h_state[h_idx] + dt_in[hh] * b_vec[n] * x_d;
+                    h[h_idx] = new_h;
+                    y_d += c_vec[n] * new_h;
+                }
+                y[hh * head_dim + d] = y_d;
+            }
+        }
+        (y, h)
+    }
+
+    fn ssm_step_a2d_setup(
+        n_heads: usize,
+        head_dim: usize,
+        state_dim: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let x: Vec<f32> =
+            (0..n_heads * head_dim).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+        // A_log is the raw log-parameter, one per (channel, state) pair; keep
+        // it small/positive so `-exp(A_log)` stays in a stable decay range.
+        let a_log: Vec<f32> = (0..n_heads * head_dim * state_dim)
+            .map(|i| -1.0 + ((i as f32) * 0.017).sin() * 0.5)
+            .collect();
+        let b_vec: Vec<f32> = (0..state_dim).map(|i| 0.1 + (i as f32) * 0.05).collect();
+        let c_vec: Vec<f32> = (0..state_dim).map(|i| 0.2 - (i as f32) * 0.02).collect();
+        let dt_in: Vec<f32> = (0..n_heads).map(|i| 0.01 + (i as f32) * 0.003).collect();
+        let h_state: Vec<f32> =
+            (0..n_heads * state_dim * head_dim).map(|i| ((i as f32) * 0.011).cos() * 0.1).collect();
+
+        let (y_exp, h_exp) = ssm_step_a2d_oracle(
+            &x, &a_log, &b_vec, &c_vec, &dt_in, &h_state, n_heads, head_dim, state_dim,
+        );
+
+        TestSetup::new(ssm_step_a2d::kernel_ir_for(dt))
+            .mode(KernelMode::Grid3D)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("a_log", pack_f32(&a_log, dt), dt))
+            .input(TestBuffer::from_vec("b", pack_f32(&b_vec, dt), dt))
+            .input(TestBuffer::from_vec("c", pack_f32(&c_vec, dt), dt))
+            .input(TestBuffer::from_vec("dt", pack_f32(&dt_in, dt), dt))
+            .input(TestBuffer::from_vec("h", pack_f32(&h_state, DType::F32), DType::F32))
+            .input(TestBuffer::zeros("y", n_heads * head_dim, dt))
+            .constexpr("head_dim", head_dim as u32)
+            .constexpr("state_dim", state_dim as u32)
+            .expect(TestBuffer::from_vec("y", pack_f32(&y_exp, dt), dt))
+            .expect(TestBuffer::from_vec("h", pack_f32(&h_exp, DType::F32), DType::F32))
+            .grid_3d((n_heads * head_dim) as u32, 1, 1, [1, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-5, 5e-3, 5e-2])]
+    fn test_ssm_step_a2d(dt: DType) -> TestSetup { ssm_step_a2d_setup(4, 16, 8, dt) }
+
+    // ── mt_ssm_step (MLX-aligned ssm_step<T,Dh,Ds,H,G>) ─────────────────
+    //
+    // Distinct from `ssm_step`: separate `state_in`/`state_out` buffers (not
+    // in-place), a `d_skip` residual (`out = Σ C·state' + x·D`), GQA per-group
+    // B/C sharing (`g = n/heads_per_group`), and a per-state simd_sum across
+    // a 32-thread group (`ds % 32 == 0`, each thread owns `ds/32` states).
+    // Grid: `(dh, n_heads*batch, 1)` threadgroups of 32.
+
+    /// CPU oracle mirroring `mt_ssm_step` exactly (batch folded into `n`).
+    #[allow(clippy::too_many_arguments)]
+    fn mt_ssm_step_oracle(
+        x: &[f32],
+        a_log: &[f32],
+        b_mat: &[f32],
+        c_mat: &[f32],
+        d_skip: &[f32],
+        dt_in: &[f32],
+        state_in: &[f32],
+        n: usize,
+        dh: usize,
+        ds: usize,
+        n_heads: usize,
+        heads_per_group: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut out = vec![0.0_f32; n * dh];
+        let mut state_out = state_in.to_vec();
+        for nn in 0..n {
+            let h_idx = nn % n_heads;
+            let g_idx = nn / heads_per_group;
+            let dt_val = dt_in[nn];
+            let da = (-(a_log[h_idx].exp()) * dt_val).exp();
+            let bc_base = g_idx * ds;
+            for d in 0..dh {
+                let x_val = x[nn * dh + d];
+                let state_base = nn * dh * ds + d * ds;
+                let mut acc = 0.0_f32;
+                for s in 0..ds {
+                    let idx = state_base + s;
+                    let new_state = da * state_in[idx] + x_val * dt_val * b_mat[bc_base + s];
+                    state_out[idx] = new_state;
+                    acc += new_state * c_mat[bc_base + s];
+                }
+                out[nn * dh + d] = acc + x_val * d_skip[h_idx];
+            }
+        }
+        (out, state_out)
+    }
+
+    fn mt_ssm_step_setup(
+        n: usize,
+        dh: usize,
+        ds: usize,
+        n_heads: usize,
+        heads_per_group: usize,
+        dt: DType,
+    ) -> TestSetup {
+        let n_groups = n_heads / heads_per_group;
+        let x: Vec<f32> = (0..n * dh).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+        let a_log: Vec<f32> = (0..n_heads).map(|i| -1.0 + (i as f32) * 0.1).collect();
+        let b_mat: Vec<f32> = (0..n_groups * ds).map(|i| 0.1 + (i as f32) * 0.03).collect();
+        let c_mat: Vec<f32> = (0..n_groups * ds).map(|i| 0.2 - (i as f32) * 0.01).collect();
+        let d_skip: Vec<f32> = (0..n_heads).map(|i| 0.05 + (i as f32) * 0.02).collect();
+        let dt_in: Vec<f32> = (0..n).map(|i| 0.01 + (i as f32) * 0.003).collect();
+        let state_in: Vec<f32> =
+            (0..n * dh * ds).map(|i| ((i as f32) * 0.011).cos() * 0.1).collect();
+
+        let (out_exp, state_exp) = mt_ssm_step_oracle(
+            &x,
+            &a_log,
+            &b_mat,
+            &c_mat,
+            &d_skip,
+            &dt_in,
+            &state_in,
+            n,
+            dh,
+            ds,
+            n_heads,
+            heads_per_group,
+        );
+
+        TestSetup::new(mt_ssm_step::kernel_ir_for(dt))
+            .mode(KernelMode::Reduction)
+            .input(TestBuffer::from_vec("x", pack_f32(&x, dt), dt))
+            .input(TestBuffer::from_vec("a_log", pack_f32(&a_log, dt), dt))
+            .input(TestBuffer::from_vec("b_mat", pack_f32(&b_mat, dt), dt))
+            .input(TestBuffer::from_vec("c_mat", pack_f32(&c_mat, dt), dt))
+            .input(TestBuffer::from_vec("d_skip", pack_f32(&d_skip, dt), dt))
+            .input(TestBuffer::from_vec("dt", pack_f32(&dt_in, dt), dt))
+            .input(TestBuffer::from_vec("state_in", pack_f32(&state_in, dt), dt))
+            .input(TestBuffer::zeros("state_out", n * dh * ds, dt))
+            .input(TestBuffer::zeros("out", n * dh, dt))
+            .constexpr("dh", dh as u32)
+            .constexpr("ds", ds as u32)
+            .constexpr("n_heads", n_heads as u32)
+            .constexpr("heads_per_group", heads_per_group as u32)
+            .expect(TestBuffer::from_vec("state_out", pack_f32(&state_exp, dt), dt))
+            .expect(TestBuffer::from_vec("out", pack_f32(&out_exp, dt), dt))
+            .grid_3d(dh as u32, n as u32, 1, [32, 1, 1])
+    }
+
+    // batch folded into n: n_heads=4 (1 batch row), dh=16, ds=32 (=32 so one
+    // thread per state, ds%32==0), heads_per_group=2.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-4, 5e-3, 5e-2])]
+    fn test_mt_ssm_step(dt: DType) -> TestSetup { mt_ssm_step_setup(4, 16, 32, 4, 2, dt) }
 }
 
 /// New-syntax benchmarks for all four `ffai::ssm` kernels. `conv1d_causal_step`
