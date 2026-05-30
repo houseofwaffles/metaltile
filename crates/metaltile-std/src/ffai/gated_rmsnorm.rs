@@ -51,15 +51,7 @@ use metaltile::kernel;
 /// `out[r, i] = w[i] · y[r, i] · rsqrt(mean(y[r]²) + eps) · silu(z[r, i])`.
 ///
 /// `y` is fp32 (the GDN recurrence output); `z`, `w`, `out` are `T`.
-#[kernel(
-    bench(
-        op="gated_rmsnorm",
-        subop="gated_rmsnorm",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_gated_rmsnorm<T>(
     y: Tensor<f32>,
     z: Tensor<T>,

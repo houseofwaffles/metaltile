@@ -80,24 +80,7 @@ mod heuristic_tests {
 
 // ── Pass 1: per-block partials, GQA co-load ──────────────────────────────
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_decode_2pass",
-        class=SdpaVector2Pass,
-        h=128,
-        n_kv=4096,
-        n_heads=32,
-        gqa_factor=4,
-        batch=1,
-        blocks=32,
-        pass2_kernel=sdpa_decode_2pass_pass2,
-        tol=1e-3,
-        mlx="sdpa_vector_{tn}_128_128",
-        metal_file="scaled_dot_product_attention.metal",
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn sdpa_decode_2pass_pass1<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -198,15 +181,7 @@ pub fn sdpa_decode_2pass_pass1<T>(
 
 // ── Pass 2: 32-sg × 32-lane merge, MLX-style ─────────────────────────────
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_decode_2pass_pass2",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn sdpa_decode_2pass_pass2<T>(
     partial_o: Tensor<T>,
     partial_m: Tensor<f32>,

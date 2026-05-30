@@ -45,15 +45,7 @@ use metaltile::kernel;
 ///   `w [n, k/8]` int4 packed (8 nibbles/u32),
 ///   `scales`/`biases [n, k/group_size]` (T),
 ///   `x [m, k]` (T), `out [m, n]` (T). group_size = 64.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma_mpp",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_qmm_mma_mpp<T>(
     w: Tensor<u32>,

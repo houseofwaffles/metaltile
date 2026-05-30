@@ -55,15 +55,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="vocoder",
-        subop="istft",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn vocoder_istft<T>(
     spec_re: Tensor<T>,
     spec_im: Tensor<T>,

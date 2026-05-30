@@ -46,15 +46,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="kokoro",
-        subop="lstm_cell",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn lstm_cell<T>(
     x: Tensor<T>,
     h_prev: Tensor<T>,
@@ -132,15 +124,7 @@ pub fn lstm_cell<T>(
     }
 }
 
-#[kernel(
-    bench(
-        op="kokoro",
-        subop="adain1d",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn adain1d<T>(
     x: Tensor<T>,
     gamma: Tensor<T>,

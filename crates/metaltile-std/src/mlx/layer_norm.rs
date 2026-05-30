@@ -4,23 +4,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="layer_norm",
-        subop="layer_norm",
-        class=RowNorm,
-        b=1024,
-        n=4096,
-        tpg=1024,
-        reads=2,
-        pre_weight=1.0,
-        pre_bias=0.0,
-        post_eps=1e-5,
-        tol=1e-4,
-        mlx="layer_norm_looped{tn}",
-        metal_file="layer_norm.metal",
-    )
-)]
+#[kernel]
 pub fn mt_layer_norm<T>(
     x: Tensor<T>,
     w: Tensor<T>,

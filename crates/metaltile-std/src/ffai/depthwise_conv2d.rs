@@ -39,15 +39,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="depthwise_conv2d",
-        subop="depthwise_conv2d",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn depthwise_conv2d<T>(
     input: Tensor<T>,
     weight: Tensor<T>,

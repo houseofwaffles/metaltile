@@ -43,15 +43,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_multi",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_multi<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -208,15 +200,7 @@ pub fn ffai_sdpa_multi<T>(
 //
 // Dispatch invariants — IDENTICAL to `ffai_sdpa_multi`. TPG=1024,
 // head_dim=128 hard, grid `[n_q_heads * n_query * 1024, 1, 1]`.
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_multi_tree_mask",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_multi_tree_mask<T>(
     q: Tensor<T>,
     k: Tensor<T>,

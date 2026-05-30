@@ -49,15 +49,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="gated_delta",
-        subop="step",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_gated_delta_step<T>(
     q: Tensor<T>,             // [B, Hk, Dk]   flat: (b * Hk + hk_idx) * Dk + dk_offset
     k: Tensor<T>,             // [B, Hk, Dk]   same layout as q
@@ -171,15 +163,7 @@ pub fn mt_gated_delta_step<T>(
 /// - **`t_len` is a runtime u32** (passed as a scalar buffer, not a
 ///   constexpr) so a single PSO compiles for all chunk sizes the
 ///   scheduler picks.
-#[kernel(
-    bench(
-        op="gated_delta",
-        subop="chunk",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_gated_delta_chunk<T>(
     q: Tensor<T>,             // [B, T, Hk, Dk]
     k: Tensor<T>,             // [B, T, Hk, Dk]

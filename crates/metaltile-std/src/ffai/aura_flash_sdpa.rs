@@ -68,9 +68,7 @@ macro_rules! aura_flash_sdpa_kernel {
         $dims_per_lane:literal,
         $subop:literal
     ) => {
-        #[kernel(
-            bench(op="aura", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             q_rot: Tensor<T>,
             key_packed: Tensor<u32>,
@@ -114,11 +112,7 @@ macro_rules! aura_flash_sdpa_kernel {
             stack_alloc("q_vals", $dims_per_lane, "f32");
             for i in range(0u32, $dims_per_lane, 1u32) {
                 let d = lane + i * 32u32;
-                let v = select(
-                    d < dim,
-                    load(q_rot[q_idx * dim + d]).cast::<f32>(),
-                    0.0f32,
-                );
+                let v = select(d < dim, load(q_rot[q_idx * dim + d]).cast::<f32>(), 0.0f32);
                 stack_store("q_vals", i, v);
             }
 

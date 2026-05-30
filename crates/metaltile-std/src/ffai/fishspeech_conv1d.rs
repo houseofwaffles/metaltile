@@ -34,15 +34,7 @@ use metaltile::kernel;
 // Tap `kx` of output `op` reads padded input index
 // `op*stride + kx*dilation`, valid iff it lies in `[pad, pad+in_len)`.
 
-#[kernel(
-    bench(
-        op="fishspeech_conv1d",
-        subop="conv1d_dilated",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn conv1d_dilated<T>(
     input: Tensor<T>,
     weight: Tensor<T>,
@@ -96,15 +88,7 @@ pub fn conv1d_dilated<T>(
 // the numerator is non-negative, divisible by `stride`, and `ip <
 // in_len`. One thread per output element; no scatter / no atomics.
 
-#[kernel(
-    bench(
-        op="fishspeech_conv1d",
-        subop="conv1d_transpose",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn conv1d_transpose<T>(
     input: Tensor<T>,
     weight: Tensor<T>,

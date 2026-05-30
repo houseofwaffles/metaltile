@@ -35,15 +35,7 @@
 use metaltile::kernel;
 
 /// Fused RMSNorm + paired-layout RoPE for one Q/K head per threadgroup.
-#[kernel(
-    bench(
-        op="rms_norm_rope",
-        subop="rms_norm_rope",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_rms_norm_rope<T>(
     x: Tensor<T>,
     w: Tensor<T>,

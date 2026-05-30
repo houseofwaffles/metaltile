@@ -52,15 +52,7 @@ use metaltile::kernel;
 /// NAX gather GEMM `C[m,n] = Σ_k A[lhs[m], k] · B[rhs[n/32], k, n]`.
 /// Params: `a [n_a_rows, k]`, `b [n_b_mats, k, n]`, `lhs_indices [m]`,
 /// `rhs_indices [n/32]`, `out [m, n]`.
-#[kernel(
-    bench(
-        op="steel_gemm",
-        subop="gather_nax",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_steel_gemm_gather_nax<T>(
     a: Tensor<T>,

@@ -87,22 +87,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_decode_batched_q2",
-        class=SdpaBatchedDecode,
-        h=128,
-        n_kv=4096,
-        n_heads=32,
-        gqa_factor=4,
-        batch_q=2,
-        variant=Decode,
-        tpg=1024,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn sdpa_decode_batched_q2<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -372,22 +357,7 @@ pub fn sdpa_decode_batched_q2<T>(
 // duplicate body matches the pattern established in
 // `sdpa_decode`'s sink + window passes.
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_decode_batched_q4",
-        class=SdpaBatchedDecode,
-        h=128,
-        n_kv=4096,
-        n_heads=32,
-        gqa_factor=4,
-        batch_q=4,
-        variant=Decode,
-        tpg=512,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn sdpa_decode_batched_q4<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -736,22 +706,7 @@ pub fn sdpa_decode_batched_q4<T>(
 // `#[kernel]` proc-macro does not expand `macro_rules!` invocations.
 // Each phase's body duplicates the established pattern.
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_decode_batched_q8",
-        class=SdpaBatchedDecode,
-        h=128,
-        n_kv=4096,
-        n_heads=32,
-        gqa_factor=4,
-        batch_q=8,
-        variant=Decode,
-        tpg=256,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn sdpa_decode_batched_q8<T>(
     q: Tensor<T>,
     k: Tensor<T>,

@@ -12,23 +12,7 @@ use metaltile::kernel;
 static QUANTIZED_SHAPES: &[(usize, usize)] =
     &[(4096, 4096), (5120, 5120), (14336, 5120), (5120, 14336), (27648, 5120)];
 
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmv",
-        class=QuantizedMatVec,
-        shapes=&QUANTIZED_SHAPES,
-        group_size=64,
-        // tpg=64 = 2 simdgroups × 32 lanes. Kernel processes 8 output rows
-        // per TG (each simdgroup handles 4 rows independently, indexed by
-            // simd_id). Dispatcher grid is `m/8` TGs — matches MLX qmv_fast.
-        tpg=64,
-        tol=1e-3,
-        mlx="affine_qmv_fast_float16_t_gs_64_b_4_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmv<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -363,32 +347,7 @@ pub fn mt_qmv<T>(
 // across M-rows (W is loaded fresh per (M-row, N-tile) pair). The
 // natural v3 step is a BM × BN output tile with W cached in TG
 // memory and amortised across BM M-rows.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        // M=4 = canonical small-batch prefill token count (covers
-            // single-prompt prefill chunks + small batched serving). Larger
-        // M values exposed via the #[ignore] `mt_qmm_perf_bench_*` test.
-        m=4,
-        group_size=64,
-        // tpg=64 same as mt_qmv (2 SG × 32 lanes). Each TG produces 8
-        // outputs at one (m_row, n_tile).
-        tpg=64,
-        // bf16 round-trip on int4-quantized matmul: max_q=15 × group_size=64
-        // × bf16's 7-bit mantissa drifts ~7-8e-3 at large K (per
-            // crates/metaltile-std/src/mlx/binary.rs precedent — "bf16 drifts
-            // ~7.8e-3 on signed"). Tighter than 1e-2 trips the bench cosine
-        // check at production shapes (M=4096+, K=4096+) on Apple Paravirtual
-        // CI. tol=1e-2 keeps f32/f16 cells tight while passing bf16.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -695,40 +654,7 @@ pub fn mt_qmm<T>(
 // At M < 2 the caller should dispatch `mt_qmm` (BM=1) instead — this
 // kernel asserts `m % 2 == 0` via the grid dim. v4 BM=4 is the next
 // step if M=32 still doesn't beat MLX after this lands; see #55.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_bm2",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        // M=8 = larger-batch prefill where W-reuse matters most. M=2 / 4
-        // also benefit (W reload halved); M=1 should keep dispatching
-        // mt_qmm (v2) since the BM=2 tile would burn TG slots on unused
-        // outputs.
-        // M=8 is a representative mid-M cell. Clean median-of-5 head-to-head
-        // bm2/v2 (25 cells per M, both rigs): bm2 wins 350/350 across
-        // M ∈ {2,4,6,8,12,16,32}. Speedups grow with M: 1.09× at M=2
-        // → 1.24× M5 / 1.30× M2 at M=32. vs MLX `affine_qmm_t`, the M=8
-        // bench cell measures 1.7-2.5× M5 / 1.4-1.7× f16 M2 (3-run M5
-            // drift ≤3pt). Selector `mt_qmm_for` routes every even M ≥ 2
-        // to bm2. Neither kernel beats MLX at M ≥ 16 (MLX's BM=BN=32
-            // simdgroup-matrix tile dominates large-M); closing that gap is
-        // the BM=4/BM=8 follow-up.
-        m=8,
-        group_size=64,
-        tpg=64,
-        // bf16 round-trip on int4-quantized matmul: max_q=15 × group_size=64
-        // × bf16's 7-bit mantissa drifts ~7-8e-3 at large K (per
-            // crates/metaltile-std/src/mlx/binary.rs precedent — "bf16 drifts
-            // ~7.8e-3 on signed"). Tighter than 1e-2 trips the bench cosine
-        // check at production shapes (M=4096+, K=4096+) on Apple Paravirtual
-        // CI. tol=1e-2 keeps f32/f16 cells tight while passing bf16.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_bm2<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -1150,30 +1076,7 @@ pub fn mt_qmm_bm2<T>(
 // W-reads at M=32 = 8W per TG, matching MLX's 8W cache footprint.
 // Predicted: ~half of MLX's M=16-32 gap recovered without simdgroup-
 // matrix primitives.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_bm4",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        // M=16 is the cell where bm4's W-bw advantage compounds — bm2 at
-        // M=16 hits ~50% MT MLX; bm4 halves W bw so a 1.5-1.8× speedup
-        // over bm2 is plausible. Selector routes m % 4 == 0 to bm4.
-        m=8,
-        group_size=64,
-        tpg=64,
-        // bf16 round-trip on int4-quantized matmul: max_q=15 × group_size=64
-        // × bf16's 7-bit mantissa drifts ~7-8e-3 at large K (per
-            // crates/metaltile-std/src/mlx/binary.rs precedent — "bf16 drifts
-            // ~7.8e-3 on signed"). Tighter than 1e-2 trips the bench cosine
-        // check at production shapes (M=4096+, K=4096+) on Apple Paravirtual
-        // CI. tol=1e-2 keeps f32/f16 cells tight while passing bf16.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_bm4<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -1576,25 +1479,7 @@ pub fn mt_qmm_bm4<T>(
 //   x       [k]                    T
 //   out     [m]                    T
 
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmv_int8_fast",
-        class=QuantizedMatVec,
-        shapes=&QUANTIZED_SHAPES,
-        group_size=64,
-        tpg=64,
-        // bits=8: drives `run_quantized_mat_vec`'s W pack-factor (4
-            // bytes/u32) + the bit-stream extract in the correctness oracle.
-        // Without this the runner defaults to bits=4 and the int8 kernel
-        // reads 2× the int4-sized W buffer.
-        bits=8,
-        tol=1e-3,
-        mlx="affine_qmv_fast_float16_t_gs_64_b_8_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmv_int8_fast<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -1721,22 +1606,7 @@ pub fn mt_qmv_int8_fast<T>(
 //   x       [m, k]                 T
 //   out     [m, n]                 T
 
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_int8_fast",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        m=4,
-        group_size=64,
-        tpg=64,
-        bits=8,
-        tol=1e-2,
-        mlx="affine_qmm_fast_float16_t_gs_64_b_8_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_int8_fast<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -1853,22 +1723,7 @@ pub fn mt_qmm_int8_fast<T>(
 //   x       [m, k]                 T
 //   out     [m, n]                 T
 
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_bm2_int8_fast",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        m=8,
-        group_size=64,
-        tpg=64,
-        bits=8,
-        tol=1e-2,
-        mlx="affine_qmm_fast_float16_t_gs_64_b_8_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_bm2_int8_fast<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -2019,22 +1874,7 @@ pub fn mt_qmm_bm2_int8_fast<T>(
 //   x       [m, k]                 T
 //   out     [m, n]                 T
 
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_bm4_int8_fast",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        m=8,
-        group_size=64,
-        tpg=64,
-        bits=8,
-        tol=1e-2,
-        mlx="affine_qmm_fast_float16_t_gs_64_b_8_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_bm4_int8_fast<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -2270,30 +2110,7 @@ pub fn mt_qmm_bm4_int8_fast<T>(
 // Predicted on the QUANTIZED_SHAPES grid: ≥ 100% MT MLX at M=32 (M5)
 // / ≥ 80% MT MLX (M2). M=8/16 stays on bm4 — MMA tile is 75%/50% empty
 // at those Ms (would waste 1024-output budget).
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        // M=32 = the cell where the simdgroup-matrix MMA pays for itself.
-        // M < 32 leaves >= 50% of the 32×32 tile padded (wasted ALU); bm4
-        // keeps winning there. Selector routes M >= 32 && M %% 32 == 0 to mma.
-        m=32,
-        group_size=64,
-        tpg=128,
-        // bf16 round-trip on int4-quantized matmul: max_q=15 × group_size=64
-        // × bf16's 7-bit mantissa drifts ~7-8e-3 at large K (per
-            // crates/metaltile-std/src/mlx/binary.rs precedent — "bf16 drifts
-            // ~7.8e-3 on signed"). Tighter than 1e-2 trips the bench cosine
-        // check at production shapes (M=4096+, K=4096+) on Apple Paravirtual
-        // CI. tol=1e-2 keeps f32/f16 cells tight while passing bf16.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_mma<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -2595,31 +2412,7 @@ pub fn mt_qmm_mma<T>(
 // At M < 16 this kernel padding-wastes >= 50% of the tile (would route
 // to bm2/bm4). At M = 32 use mt_qmm_mma (full tile, 2× the output
 // budget). Selector route: `m == 16` → mt_qmm_mma_m16.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma_m16",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        // M=16 = the bm4 weak cell. bm4 wins moderate-N M=16 cells but
-        // loses wide-N on M2 (76-94% MT MLX). Half-height MMA targets this
-        // exact gap: zero padding waste at M=16 (vs MMA's 32×32 tile which
-            // would be 50% empty here), MMA-class ALU, N-amortized W reuse.
-        m=16,
-        group_size=64,
-        tpg=64,
-        // bf16 round-trip on int4-quantized matmul: max_q=15 × group_size=64
-        // × bf16's 7-bit mantissa drifts ~7-8e-3 at large K (per
-            // crates/metaltile-std/src/mlx/binary.rs precedent — "bf16 drifts
-            // ~7.8e-3 on signed"). Tighter than 1e-2 trips the bench cosine
-        // check at production shapes (M=4096+, K=4096+) on Apple Paravirtual
-        // CI. tol=1e-2 keeps f32/f16 cells tight while passing bf16.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_4_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_mma_m16<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -2942,25 +2735,7 @@ pub fn mt_qmm_mma_m16<T>(
 // TG memory layout: identical Xs[32×36] / Ws[32×36] shape (skew=4).
 // X load: same as mt_qmm_mma (8 contiguous K elems per lane, vec4 fusion).
 // MMA inner loop: identical to mt_qmm_mma (4 k-inner × 4 frags = 16 MMAs/SG).
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma_int8",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        m=32,
-        group_size=64,
-        tpg=128,
-        bits=8,
-        // int8 max_q=255 amplifies bf16 round-trip drift further than int4's 15.
-        // At production shapes (M=4096+, K=4096+) bf16 cosine drifts ~8-9e-3.
-        // tol=1e-2 keeps f32/f16 cells tight while passing bf16.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_8_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_mma_int8<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -3219,23 +2994,7 @@ pub fn mt_qmm_mma_int8<T>(
 // the 512-element Xs tile). Same as int4.
 //
 // MMA inner loop: identical to mt_qmm_mma_m16 (no A/B barrier; 4 k-inner).
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma_m16_int8",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        m=16,
-        group_size=64,
-        tpg=64,
-        bits=8,
-        // Same bf16 tolerance rationale as mt_qmm_mma_int8.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_8_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_mma_m16_int8<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -3575,26 +3334,7 @@ pub fn mt_qmm_mma_m16_int8<T>(
 // is the loosest of any variant — bench tol matches int4/int8 at 1e-2;
 // cosine similarity at production shapes is the relevant signal, not abs
 // error (small element magnitudes dominate).
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma_int2",
-        class=QuantizedMatMul,
-        shapes=&QUANTIZED_SHAPES,
-        m=32,
-        group_size=64,
-        tpg=128,
-        bits=2,
-        // int2 max_q=3: only 4 quant levels → per-group error is the highest of
-        // the affine family. Cosine similarity at production shapes (M=4096+,
-        // K=4096+) is what the bench harness asserts, not pointwise error.
-        // tol=1e-2 matches int4/int8.
-        tol=1e-2,
-        mlx="affine_qmm_t_{tn}_gs_64_b_2_alN_true_batch_0",
-        metal_file="quantized.metal",
-        dtypes=&[metaltile_core::dtype::DType::F32, metaltile_core::dtype::DType::F16, metaltile_core::dtype::DType::BF16],
-    )
-)]
+#[kernel]
 pub fn mt_qmm_mma_int2<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -3839,22 +3579,7 @@ pub fn mt_qmm_mma_int2<T>(
 // `quantized.h`. Both kernels read the same byte stream and produce the
 // same output (MLX views weights as `uint8_t*`, ours as `Tensor<u32>` —
 // same bits, different lens).
-#[kernel(
-    bench(
-        op="affine",
-        subop="dequantize_int4",
-        class=AffineDequantize,
-        bits=4,
-        group_size=64,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        // tol=1e-2 — bf16 round-trip error scales with max_q (= 15). At
-        // n_groups=4096 the worst-case absolute drift is ~3e-3.
-        tol=1e-2,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_dequantize_int4<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -3908,20 +3633,7 @@ pub fn mt_affine_dequantize_int4<T>(
 // (`group_size / 32 = 2` values per thread, 8 nibbles per uint32).
 // Bigger group sizes or other bit widths follow the same template with
 // different constants.
-#[kernel(
-    bench(
-        op="affine",
-        subop="quantize_int4",
-        class=AffineQuantize,
-        bits=4,
-        group_size=64,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_quantize_int4<T>(
     w: Tensor<T>,
     mut out: Tensor<u32>,
@@ -3973,22 +3685,7 @@ pub fn mt_affine_quantize_int4<T>(
 // shifts by multiples of 8 instead of 4.
 //
 // Faithful port of MLX `affine_dequantize<T, group_size, 8>`.
-#[kernel(
-    bench(
-        op="affine",
-        subop="dequantize_int8",
-        class=AffineDequantize,
-        bits=8,
-        group_size=64,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        // tol=1e-1 — int8 max_q=255 amplifies bf16 round-trip drift; the
-        // worst case at n_groups=4096 is ~5e-2.
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_dequantize_int8<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -4014,20 +3711,7 @@ pub fn mt_affine_dequantize_int8<T>(
 }
 
 // ─── mt_affine_quantize_int8 ───────────────────────────────────────────
-#[kernel(
-    bench(
-        op="affine",
-        subop="quantize_int8",
-        class=AffineQuantize,
-        bits=8,
-        group_size=64,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_quantize_int8<T>(
     w: Tensor<T>,
     mut out: Tensor<u32>,
@@ -4082,22 +3766,7 @@ pub fn mt_affine_quantize_int8<T>(
 //
 // Faithful port of MLX `affine_dequantize<T, group_size, 2>` from
 // `quantized.h`.
-#[kernel(
-    bench(
-        op="affine",
-        subop="dequantize_int2",
-        class=AffineDequantize,
-        bits=2,
-        group_size=64,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        // tol=5e-3 — int2 max_q=3; tightest of the dequant family, the
-        // worst-case bf16 round-trip drift at n_groups=4096 is ~1e-3.
-        tol=5e-3,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_dequantize_int2<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -4128,20 +3797,7 @@ pub fn mt_affine_dequantize_int2<T>(
 //
 // n_bins = 3 (`2^2 - 1`). Same template as `mt_affine_quantize_int4`
 // with the pack width widened from 8 nibbles to 16 two-bit fields.
-#[kernel(
-    bench(
-        op="affine",
-        subop="quantize_int2",
-        class=AffineQuantize,
-        bits=2,
-        group_size=64,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_quantize_int2<T>(
     w: Tensor<T>,
     mut out: Tensor<u32>,
@@ -4219,20 +3875,7 @@ pub fn mt_affine_quantize_int2<T>(
 // ## DISPATCH INVARIANTS
 // - Reduction mode (simd_min / simd_max). TPG = 32 (one simdgroup).
 // - Grid: [n_groups, 1, 1].
-#[kernel(
-    bench(
-        op="affine",
-        subop="quantize_int3",
-        class=AffineQuantize,
-        bits=3,
-        group_size=32,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_quantize_int3<T>(
     w: Tensor<T>,
     mut out: Tensor<u32>,
@@ -4296,20 +3939,7 @@ pub fn mt_affine_quantize_int3<T>(
 // ## DISPATCH INVARIANTS
 // - Reduction mode (simd_min / simd_max). TPG = 32 (one simdgroup).
 // - Grid: [n_groups, 1, 1].
-#[kernel(
-    bench(
-        op="affine",
-        subop="quantize_int5",
-        class=AffineQuantize,
-        bits=5,
-        group_size=32,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_quantize_int5<T>(
     w: Tensor<T>,
     mut out: Tensor<u32>,
@@ -4379,20 +4009,7 @@ pub fn mt_affine_quantize_int5<T>(
 // ## DISPATCH INVARIANTS
 // - Reduction mode (simd_min / simd_max). TPG = 32 (one simdgroup).
 // - Grid: [n_groups, 1, 1].
-#[kernel(
-    bench(
-        op="affine",
-        subop="quantize_int6",
-        class=AffineQuantize,
-        bits=6,
-        group_size=32,
-        n_groups=4096,
-        batch=1,
-        tpg=32,
-        tol=1e-1,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_quantize_int6<T>(
     w: Tensor<T>,
     mut out: Tensor<u32>,
@@ -4468,22 +4085,7 @@ pub fn mt_affine_quantize_int6<T>(
 // Bit layouts match MLX `affine_dequantize<T, group_size, {3,5,6}>`
 // exactly.
 
-#[kernel(
-    bench(
-        op="affine",
-        subop="dequantize_int3",
-        class=AffineDequantize,
-        bits=3,
-        group_size=32,
-        n_groups=4096,
-        batch=1,
-        tpg=16,
-        // tol=5e-3 — int3 max_q=7; worst-case bf16 drift at n_groups=4096
-        // is ~1e-3.
-        tol=5e-3,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_dequantize_int3<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -4529,20 +4131,7 @@ pub fn mt_affine_dequantize_int3<T>(
     store(out[oindex + 7u32], (scale * q7.cast::<f32>() + bias).cast::<T>());
 }
 
-#[kernel(
-    bench(
-        op="affine",
-        subop="dequantize_int5",
-        class=AffineDequantize,
-        bits=5,
-        group_size=32,
-        n_groups=4096,
-        batch=1,
-        tpg=16,
-        tol=1e-2,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_dequantize_int5<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -4594,22 +4183,7 @@ pub fn mt_affine_dequantize_int5<T>(
     store(out[oindex + 7u32], (scale * q7.cast::<f32>() + bias).cast::<T>());
 }
 
-#[kernel(
-    bench(
-        op="affine",
-        subop="dequantize_int6",
-        class=AffineDequantize,
-        bits=6,
-        group_size=32,
-        n_groups=4096,
-        batch=1,
-        tpg=16,
-        // tol=5e-2 — int6 max_q=63; worst-case bf16 drift at n_groups=4096
-        // is ~1.3e-2.
-        tol=5e-2,
-        metal_file="quantized.metal",
-    )
-)]
+#[kernel]
 pub fn mt_affine_dequantize_int6<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -4706,15 +4280,7 @@ pub fn mt_affine_dequantize_int6<T>(
 #[rustfmt::skip]
 macro_rules! qmv_pow2 {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="quantized",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=5e-2,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             w: Tensor<u32>,
             scales: Tensor<T>,
@@ -4774,15 +4340,7 @@ macro_rules! qmv_pow2 {
 #[rustfmt::skip]
 macro_rules! qmv_odd {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="quantized",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=5e-2,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             w: Tensor<u32>,
             scales: Tensor<T>,
@@ -4846,15 +4404,7 @@ macro_rules! qmv_odd {
 #[rustfmt::skip]
 macro_rules! qvm_pow2 {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="quantized",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=5e-2,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             w: Tensor<u32>,
             scales: Tensor<T>,
@@ -4909,15 +4459,7 @@ macro_rules! qvm_pow2 {
 #[rustfmt::skip]
 macro_rules! qvm_odd {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="quantized",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=5e-2,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             w: Tensor<u32>,
             scales: Tensor<T>,
@@ -5044,15 +4586,7 @@ qvm_odd!(mt_qvm_b6, 6u32, "qvm_b6");
 /// Each simdgroup handles 4 consecutive output columns. Lane-strided over
 /// K: each lane covers `K/32` K-positions. Grid: `[N/8, 1, 1]`, TPG = 64,
 /// group_size = 64.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qvm_int4_fast",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_qvm_int4_fast<T>(
     w: Tensor<u32>,
     scales: Tensor<T>,
@@ -5193,15 +4727,7 @@ pub fn mt_qvm_int4_fast<T>(
 #[rustfmt::skip]
 macro_rules! qmm_mma_bitwidth {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="quantized",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=5e-2,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         #[allow(clippy::too_many_arguments)]
         pub fn $name<T>(
             w: Tensor<u32>,

@@ -66,15 +66,7 @@ macro_rules! fft_kernel {
         /// real / imaginary input planes, `out_re` / `out_im` the
         /// outputs; `inv` is `0` for the forward transform, `1` for the
         /// inverse (conjugated twiddles + `1/N` scale).
-        #[kernel(
-            bench(
-                op="fft",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=1e-3,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             in_re: Tensor<T>,
             in_im: Tensor<T>,
@@ -222,15 +214,7 @@ fft_kernel!(mt_fft_n1024, 1024u32, 10u32, 0.000_976_562_5f32, "n1024");
 /// dispatches `ceil(rows*M/tpg)` workgroups and the trailing threads
 /// must skip OOB writes (Apple Silicon silently lands OOB writes into
 /// adjacent buffer slots and corrupts the output).
-#[kernel(
-    bench(
-        op="fft",
-        subop="bluestein_preprocess",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_preprocess<T>(
     in_re: Tensor<T>,
@@ -299,16 +283,7 @@ pub fn mt_fft_bluestein_preprocess<T>(
 ///
 /// The caller FFTs this filter once and stores it for reuse across all
 /// rows/frames.
-#[kernel(
-    bench(
-        op="fft",
-        subop="bluestein_chirp_filter",
-        class=GenericEmpty,
-        tol=1e-3,
-        dtypes=&[DType::F32],
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_fft_bluestein_chirp_filter(
     mut filter_re: Tensor<f32>,
     mut filter_im: Tensor<f32>,
@@ -345,15 +320,7 @@ pub fn mt_fft_bluestein_chirp_filter(
 /// Both inputs are `[rows, M]`; `filter_re / filter_im` are `[1, M]` and
 /// broadcast across rows. Generic over `T` for the per-row input;
 /// the filter is always f32 (pre-computed once as f32).
-#[kernel(
-    bench(
-        op="fft",
-        subop="bluestein_cmul",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_cmul<T>(
     y_re: Tensor<T>,
@@ -395,15 +362,7 @@ pub fn mt_fft_bluestein_cmul<T>(
 ///   - Output is `[rows, N]` (truncated to the first N bins).
 ///
 /// Grid3D: one thread per element of `[rows, N]`.
-#[kernel(
-    bench(
-        op="fft",
-        subop="bluestein_postprocess",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fft_bluestein_postprocess<T>(
     conv_re: Tensor<T>,

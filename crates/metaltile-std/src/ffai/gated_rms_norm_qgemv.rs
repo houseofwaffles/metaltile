@@ -86,15 +86,7 @@ use metaltile::kernel;
 /// eps) * silu(z[r, d])` into `tg_inner` (fp32). Phase 2 runs the
 /// int4 GEMV reading the staged activation. Grid: `[out_dim/8, 1, 1]`,
 /// TPG = 64. See module doc for invariants.
-#[kernel(
-    bench(
-        op="gated_rms_norm_qgemv",
-        subop="int4_fast",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn ffai_gated_rms_norm_qgemv_int4_fast<T>(
     y: Tensor<f32>,

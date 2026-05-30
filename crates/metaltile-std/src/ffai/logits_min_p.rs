@@ -32,15 +32,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="logits_processors",
-        subop="min_p_mask",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn logits_min_p_mask<T>(
     inp: Tensor<T>,
     out: Tensor<T>,

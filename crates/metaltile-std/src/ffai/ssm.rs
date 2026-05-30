@@ -38,15 +38,7 @@ use metaltile::kernel;
 // Grid: n_channels threads (one per channel). For Mamba 2 with conv_dim
 // ~1500 channels and K=4 this is a tiny dispatch. Activation (Mamba 2
 // follows the conv with SiLU) is the caller's concern — kept separate.
-#[kernel(
-    bench(
-        op="ssm",
-        subop="conv1d_causal_step",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn conv1d_causal_step<T>(
     x: Tensor<T>,
     w: Tensor<T>,
@@ -94,15 +86,7 @@ pub fn conv1d_causal_step<T>(
 //
 // This is the decode form. Chunked prefill uses a parallel-scan
 // variant — separate kernel, not in this drop.
-#[kernel(
-    bench(
-        op="ssm",
-        subop="step",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn ssm_step<T>(
     x: Tensor<T>,
     a: Tensor<T>,
@@ -161,15 +145,7 @@ pub fn ssm_step<T>(
 // cross-thread sync because each `(head, d)` column of `h` is owned by
 // exactly one thread. The state `h` runs in fp32 (the recurrence
 // drifts in bf16 within a few dozen decode steps).
-#[kernel(
-    bench(
-        op="ssm",
-        subop="step_a2d",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn ssm_step_a2d<T>(
     x: Tensor<T>,
     a_log: Tensor<T>,
@@ -215,15 +191,7 @@ pub fn ssm_step_a2d<T>(
 //
 // `heads_per_group` is MLX's `G`: number of Q heads sharing one (B, C)
 // slot. Total distinct (B, C) groups = n_heads / heads_per_group.
-#[kernel(
-    bench(
-        op="ssm",
-        subop="mt_step",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_ssm_step<T>(
     x: Tensor<T>,             // [n_heads*batch, dh]
     a_log: Tensor<T>,         // [n_heads]

@@ -71,15 +71,7 @@ use metaltile::kernel;
 ///   no division happens on the hot path.
 ///
 /// Codegen-only; correctness pinned by `conv3d_gpu_correctness`.
-#[kernel(
-    bench(
-        op="conv3d",
-        subop="generic",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_generic<T>(
     input: Tensor<T>,
@@ -201,15 +193,7 @@ pub fn conv3d_generic<T>(
 ///   `groups` itself is not needed inside the body.
 ///
 /// Codegen-only; correctness pinned by `conv3d_gpu_correctness`.
-#[kernel(
-    bench(
-        op="conv3d",
-        subop="grouped",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_grouped<T>(
     input: Tensor<T>,

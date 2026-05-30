@@ -34,15 +34,7 @@ use metaltile::kernel;
 #[rustfmt::skip]
 macro_rules! ssm_step_record {
     ($name:ident, $dh:literal, $ds:literal, $h:literal, $g:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="ssm_replay",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=1e-3,
-                kernel_mode=Grid3D,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             x: Tensor<T>,
             a_log: Tensor<T>,
@@ -123,15 +115,7 @@ macro_rules! ssm_step_record {
 #[rustfmt::skip]
 macro_rules! ssm_replay {
     ($name:ident, $dh:literal, $ds:literal, $h:literal, $n_per_t:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="ssm_replay",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=1e-3,
-                kernel_mode=Grid3D,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             state_snapshot: Tensor<T>,
             da_log: Tensor<T>,

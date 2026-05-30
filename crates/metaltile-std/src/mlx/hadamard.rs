@@ -27,15 +27,7 @@ use metaltile::kernel;
 #[rustfmt::skip]
 macro_rules! hadamard_kernel {
     ($name:ident, $n:literal, $log_n:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="hadamard",
-                subop=$subop,
-                class=GenericEmpty,
-                tol=1e-3,
-                kernel_mode=Reduction,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] scale: f32) {
             let row = program_id::<0>();
             let base = row * $n;

@@ -44,15 +44,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="kv_cache",
-        subop="update_many",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn kv_cache_update_many<T>(
     src: Tensor<T>,
     positions: Tensor<u32>,

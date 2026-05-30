@@ -28,27 +28,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_prefill",
-        class=SdpaPrefill,
-        h=128,
-        n_heads=32,
-        gqa_factor=4,
-        batch=1,
-        q_len=512,
-        k_len=512,
-        bq=32,
-        bk=16,
-        wm=4,
-        wn=1,
-        tpg=128,
-        tol=2e-2,
-        metal_file="steel/attn/steel_attention.metal",
-        mlx="steel_attention_float32_bq32_bk16_bd128_wm4_wn1_maskfloat32",
-    )
-)]
+#[kernel]
 pub fn mt_sdpa_prefill<T>(
     q: Tensor<T>,
     k: Tensor<T>,

@@ -58,15 +58,7 @@ use metaltile::kernel;
 
 // ─── head_dim = 64 (SigLIP base/large, CLIP-L) ─────────────────────
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_bidirectional_d64",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_bidirectional_d64<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -172,15 +164,7 @@ pub fn ffai_sdpa_bidirectional_d64<T>(
 
 // ─── head_dim = 32 (FastViT-HD) ────────────────────────────────────
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_bidirectional_d32",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_bidirectional_d32<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -276,15 +260,7 @@ pub fn ffai_sdpa_bidirectional_d32<T>(
 // `simd_sum` / `simd_max`, which is what makes the geometry valid on
 // a 32-wide simdgroup.
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_bidirectional_d72",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_bidirectional_d72<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -417,15 +393,7 @@ pub fn ffai_sdpa_bidirectional_d72<T>(
 // `head_dim` differs at the call site, and that's already gated by
 // the same per-element bounds masks.
 
-#[kernel(
-    bench(
-        op="sdpa",
-        subop="sdpa_bidirectional_d80",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_bidirectional_d80<T>(
     q: Tensor<T>,
     k: Tensor<T>,
@@ -543,15 +511,7 @@ pub fn ffai_sdpa_bidirectional_d80<T>(
 // per lane. Distinct from d72 because that variant has the ragged
 // 24-active-lane geometry; here every lane participates.
 
-#[kernel(
-    bench(
-        op = "sdpa",
-        subop = "sdpa_bidirectional_d96",
-        class = GenericEmpty,
-        tol = 1e-3,
-        kernel_mode = Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_bidirectional_d96<T>(
     q: Tensor<T>,
     k: Tensor<T>,

@@ -33,15 +33,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="gemm",
-        subop="gemm",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_gemm<T>(
     weight: Tensor<T>,
     input: Tensor<T>,

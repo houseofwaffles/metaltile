@@ -57,15 +57,7 @@ use metaltile::kernel;
 /// NAX split-K partial GEMM. Each `tgid_z` computes the partial
 /// `[M, N]` product over `[k_start, k_end)` and writes (fp32) to
 /// `partials[split, :, :]`.
-#[kernel(
-    bench(
-        op="steel_gemm",
-        subop="splitk_nax",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_steel_gemm_splitk_nax<T>(
     a: Tensor<T>,
@@ -154,15 +146,7 @@ pub fn mt_steel_gemm_splitk_nax<T>(
 
 /// NAX split-K accumulator. One thread per `[M, N]` output element;
 /// sums `n_splits` partial slabs into the final `out` tensor.
-#[kernel(
-    bench(
-        op="steel_gemm",
-        subop="splitk_accum_nax",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_steel_gemm_splitk_accum_nax<T>(
     partials: Tensor<f32>,
     mut out: Tensor<T>,

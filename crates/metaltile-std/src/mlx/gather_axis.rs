@@ -25,15 +25,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="indexing",
-        subop="gather_axis",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_gather_axis<T>(
     src: Tensor<T>,
     indices: Tensor<u32>,

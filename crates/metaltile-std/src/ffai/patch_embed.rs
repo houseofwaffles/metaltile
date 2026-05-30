@@ -45,15 +45,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="patch_embed",
-        subop="patch_embed",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn patch_embed<T>(
     image: Tensor<T>,
     weight: Tensor<T>,

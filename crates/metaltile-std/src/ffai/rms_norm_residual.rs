@@ -29,15 +29,7 @@
 use metaltile::kernel;
 
 /// `out[r, i] = residual[r, i] + w[i] * x[r, i] * rsqrt(mean(x[r]²) + eps)`.
-#[kernel(
-    bench(
-        op="rms_norm_residual",
-        subop="rms_norm_residual",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_rms_norm_residual<T>(
     x: Tensor<T>,
     residual: Tensor<T>,

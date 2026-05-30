@@ -51,15 +51,7 @@ use metaltile::kernel;
 //   the full logits length. Threads with `program_id::<0>() >= n` would
 //   read/write out of bounds; the runtime should size the dispatch so the
 //   total thread count exactly matches the logits length.
-#[kernel(
-    bench(
-        op="logits_processors",
-        subop="temperature",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn logits_temperature<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] temperature: f32) {
     let i = program_id::<0>();
     let inv_t = 1.0f32 / temperature;
@@ -96,15 +88,7 @@ pub fn logits_temperature<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] temper
 //   small contexts) is the tested geometry.
 // - **No `threadgroup_*` / `simd_*` cooperation** — every thread is
 //   independent. The only invariant is the dedupe contract above.
-#[kernel(
-    bench(
-        op="logits_processors",
-        subop="repetition_penalty",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn logits_repetition_penalty<T>(
     mut logits: Tensor<T>,
     token_ids: Tensor<u32>,

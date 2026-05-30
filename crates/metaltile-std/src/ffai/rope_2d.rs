@@ -43,15 +43,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="rope",
-        subop="rope_2d",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn ffai_rope_2d<T>(
     qk: Tensor<T>,
     positions: Tensor<u32>,

@@ -27,15 +27,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="indexing",
-        subop="scatter_axis",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_scatter_axis<T>(
     updates: Tensor<T>,
     indices: Tensor<u32>,

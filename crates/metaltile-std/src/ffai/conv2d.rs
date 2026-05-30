@@ -40,7 +40,7 @@
 //!
 //! ## Macro structure
 //!
-//! `conv2d_kernel!` emits the whole `#[kernel(bench(...))] pub fn …` at
+//! `conv2d_kernel!` emits the whole `#[kernel] pub fn …` at
 //! module scope. The compiler expands the outer macro before the `#[kernel]`
 //! proc-macro runs, so the body parser sees concrete `$kh / $kw / $stride`
 //! tokens — never an inner `macro_rules!` inside a kernel body (which
@@ -57,9 +57,7 @@ use metaltile::kernel;
 /// pan-and-scan tiles can carry a small pad.
 macro_rules! conv2d_kernel {
     ($name:ident, $subop:literal, $kh:expr, $kw:expr, $sh:expr, $sw:expr) => {
-        #[kernel(
-            bench(op="conv2d", subop=$subop, class=GenericEmpty, tol=1e-3, kernel_mode=Grid3D,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             input: Tensor<T>,
             weight: Tensor<T>,
@@ -195,15 +193,7 @@ conv2d_kernel!(conv2d_generic, "generic", kh, kw, stride_h, stride_w);
 ///   constexprs so no division happens on the hot path.
 ///
 /// Codegen-only; correctness pinned by `conv2d_gpu_correctness`.
-#[kernel(
-    bench(
-        op="conv2d",
-        subop="grouped",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_grouped<T>(
     input: Tensor<T>,

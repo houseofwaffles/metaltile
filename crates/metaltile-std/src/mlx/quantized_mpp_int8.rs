@@ -37,15 +37,7 @@ use metaltile::kernel;
 ///   `w [n, k/4]` int8 packed (4 bytes/u32),
 ///   `scales`/`biases [n, k/group_size]` (T),
 ///   `x [m, k]` (T), `out [m, n]` (T). group_size = 32.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_mma_mpp_int8",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_qmm_mma_mpp_int8<T>(
     w: Tensor<u32>,

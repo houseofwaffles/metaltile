@@ -54,15 +54,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="dequant_gemv_expert_indexed",
-        subop="int4",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn dequant_gemv_int4_expert_indexed<T>(
     weights_stacked: Tensor<u32>,
     scales_stacked: Tensor<T>,

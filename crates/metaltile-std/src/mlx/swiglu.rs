@@ -42,16 +42,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="swiglu",
-        subop="swiglu",
-        class=Binary,
-        input_a=Signed,
-        input_b=Signed,
-        tol=1e-3,
-    )
-)]
+#[kernel]
 pub fn mt_swiglu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
     let idx = tid;
     let g = load(gate[idx]).cast::<f32>();

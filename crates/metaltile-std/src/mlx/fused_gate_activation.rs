@@ -54,15 +54,7 @@ use metaltile::kernel;
 /// `gelu_approx_act` in `fused_gate_activation.metal`. Computed in f32
 /// regardless of `T` so the cubic + tanh keep their precision; the
 /// result is cast back to `T` at the store.
-#[kernel(
-    bench(
-        op="fused_gate_activation",
-        subop="gelu_approx",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_fused_gate_gelu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
     let idx = program_id::<0>();
     let g = load(gate[idx]).cast::<f32>();
@@ -81,15 +73,7 @@ pub fn mt_fused_gate_gelu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
 /// multiply: `g·sigmoid(1.702·g)·(u + 1)`. Matches `clipped_swiglu`
 /// in `fused_gate_activation.metal`. The clamp is composed from two
 /// `select`s (the DSL has no `clamp` builtin).
-#[kernel(
-    bench(
-        op="fused_gate_activation",
-        subop="clipped_swiglu",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_fused_gate_clipped_swiglu<T>(gate: Tensor<T>, up: Tensor<T>, out: Tensor<T>) {
     let idx = program_id::<0>();
     let g_raw = load(gate[idx]).cast::<f32>();

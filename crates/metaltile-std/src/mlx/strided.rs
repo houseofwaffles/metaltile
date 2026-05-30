@@ -4,19 +4,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="strided_copy",
-        subop="strided_copy",
-        class=StridedCopy,
-        m=1024,
-        n=4096,
-        pad=128,
-        tol=0.0,
-        mlx="copy_g_nd2{tn}{tn}",
-        metal_file="copy.metal",
-    )
-)]
+#[kernel]
 pub fn mt_strided_copy<T>(#[strided] src: Tensor<T>, out: Tensor<T>, #[constexpr] cols: u32) {
     let row = program_id::<0>();
     let col = program_id::<1>();
@@ -68,15 +56,7 @@ pub fn mt_strided_copy<T>(#[strided] src: Tensor<T>, out: Tensor<T>, #[constexpr
 //   remainder is divided by `shape[d]` from `d = rank-1` down to `0`,
 //   so `strides` is interpreted in the same major-to-minor order as
 //   `shape` (row-major logical indexing).
-#[kernel(
-    bench(
-        op="strided_copy",
-        subop="strided_copy_nd",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_strided_copy_nd<T>(
     src: Tensor<T>,
     shape: Tensor<u32>,

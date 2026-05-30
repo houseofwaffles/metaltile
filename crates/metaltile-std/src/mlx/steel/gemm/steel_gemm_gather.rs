@@ -55,18 +55,7 @@ use metaltile::kernel;
 #[rustfmt::skip]
 macro_rules! steel_gemm_gather_kernel {
     ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $tpg:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="steel_gemm_gather",
-                subop=$subop,
-                class=SteelGemm,
-                tol=1e-2,
-                kernel_mode=SimdGroup2D,
-                bm=$bm,
-                bn=$bn,
-                tpg=$tpg,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             a: Tensor<T>,
             b: Tensor<T>,

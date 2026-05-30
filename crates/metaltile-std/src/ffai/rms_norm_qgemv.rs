@@ -49,15 +49,7 @@ use metaltile::kernel;
 /// `y[row] = Σ_i (q[row,i]·scale + bias) · (x[i]·norm_weight[i]·inv_rms)`,
 /// with `inv_rms = rsqrt(mean(x²) + eps)`, weights int4-packed.
 /// One output row per threadgroup (original correctness-first variant).
-#[kernel(
-    bench(
-        op="rms_norm_qgemv",
-        subop="rms_norm_qgemv",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_rms_norm_qgemv<T>(
     x: Tensor<T>,
     norm_weight: Tensor<T>,
@@ -132,15 +124,7 @@ pub fn ffai_rms_norm_qgemv<T>(
 ///
 /// Grid: `[out_dim/8, 1, 1]`. out_dim must be a multiple of 8;
 /// in_dim must be a multiple of 512; group_size must be 64.
-#[kernel(
-    bench(
-        op="rms_norm_qgemv",
-        subop="rms_norm_qgemv_fast",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_rms_norm_qgemv_fast<T>(
     x: Tensor<T>,
     norm_weight: Tensor<T>,
@@ -471,15 +455,7 @@ pub fn ffai_rms_norm_qgemv_fast<T>(
 ///
 /// int8 variant of `ffai_rms_norm_qgemv_fast`. Byte-extract (4 vals/pack),
 /// algebraic-split accumulator. Grid: `[out_dim/8, 1, 1]`.
-#[kernel(
-    bench(
-        op="rms_norm_qgemv",
-        subop="rms_norm_qgemv_int8_fast",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_rms_norm_qgemv_int8_fast<T>(
     x: Tensor<T>,
     norm_weight: Tensor<T>,
