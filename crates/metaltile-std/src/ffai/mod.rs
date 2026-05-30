@@ -38,6 +38,7 @@ pub mod depthwise_conv2d;
 pub mod dequant_gather;
 pub mod dequant_gemv;
 pub mod dequant_gemv_expert_indexed;
+pub mod dsv4_mxfp4_dequant;
 pub mod fishspeech_conv1d;
 pub mod flash_quantized_sdpa;
 pub mod gated_delta;
