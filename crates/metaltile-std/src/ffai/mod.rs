@@ -44,6 +44,7 @@ pub mod dsv4_fp8_block_dequant;
 pub mod dsv4_indexer_score;
 pub mod dsv4_indexer_topk;
 pub mod dsv4_mhc;
+pub mod dsv4_mhc_sinkhorn_split;
 pub mod dsv4_mxfp4_dequant;
 pub mod fishspeech_conv1d;
 pub mod flash_quantized_sdpa;

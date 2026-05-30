@@ -2,10 +2,9 @@
 //! SPDX-License-Identifier: Apache-2.0
 //! MXFP4 (OCP FP4 e2m1) block dequant.
 //!
-//! DeepSeek V4's MoE expert weights ship as native MXFP4 in the
-//! upstream `deepseek-ai/DeepSeek-V4-Flash` safetensors (separate
-//! code path from the GGUF IQ2_XXS recompression). MXFP4 is the OCP
-//! Microscaling spec format:
+//! DSv4 MoE expert weights ship as native MXFP4 in the safetensors
+//! checkpoint (separate code path from the GGUF IQ2_XXS recompression).
+//! MXFP4 is the OCP Microscaling spec format:
 //!
 //! ```text
 //!   struct block_mxfp4 {
@@ -63,11 +62,10 @@
 //! - 1 thread per output value. Adjacent threads in a simdgroup
 //!   read consecutive nibbles within the same u32 word → coalesced
 //!   loads.
-//! - MLX's published MXFP4 path on DSv3.2-arch ran at 0.27 tok/s vs
-//!   16 tok/s expected because dequant→fp16→GEMM never fused. This
-//!   kernel is the dequant primitive; the fused-with-routing variant
-//!   lands in `dsv4_mxfp4_moe_gemv.rs` as a follow-up (Apple-MoE
-//!   fusion is its own design).
+//! - This kernel is the dequant primitive; a fused-with-routing
+//!   MoE-GEMV variant lands in `dsv4_mxfp4_moe_gemv.rs` as a
+//!   follow-up (dequant→fp16→GEMM materialization is the perf wall
+//!   for MoE matmul, so the fused path skips the intermediate).
 
 use metaltile::kernel;
 

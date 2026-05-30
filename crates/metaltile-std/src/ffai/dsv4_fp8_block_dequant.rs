@@ -1,11 +1,9 @@
 //! Copyright 2026 0xClandestine, Ekryski, TheTom, Ambisphaeric
 //! SPDX-License-Identifier: Apache-2.0
-//! Block-FP8 e4m3 dequant — DeepSeek V3/V4 attention + router weight format.
+//! Block-FP8 e4m3 dequant — DSv4 attention + router weight format.
 //!
-//! DeepSeek V3 introduced and V4 inherits a 1-byte-per-weight FP8
-//! e4m3 storage with **per-(128×128)-block fp32 scales**. The official
-//! `deepseek-ai/DeepSeek-V3/inference/kernel.py` is the canonical
-//! reference; vLLM exposes it as `FP8_BLOCK 128×128`.
+//! DSv4 attention + router weights ship as 1-byte-per-weight FP8
+//! e4m3 storage with **per-(128×128)-block fp32 scales**.
 //!
 //! ```text
 //!   weight    [M, N]                                 u8    — fp8 e4m3 bytes
