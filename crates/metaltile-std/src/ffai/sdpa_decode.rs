@@ -381,10 +381,15 @@ pub mod kernel_tests {
     use super::ffai_sdpa_decode;
     use crate::utils::{pack_f32, unpack_f32};
 
-    /// Dense triple-loop SDPA reference: `O = softmax(Q·Kᵀ·scale)·V` per
-    /// Q head, GQA via `kv_head = q_head / heads_per_group`, fp32. K/V are
-    /// laid out `[n_kv_heads, kv_stride, head_dim]`; the loop walks the
-    /// filled prefix `[0, n_kv)`.
+    /// Triple-loop SDPA reference with the kernel's sliding-window + sink
+    /// masking. `O = softmax(Q·Kᵀ·scale)·V` per Q head, GQA via
+    /// `kv_head = q_head / heads_per_group`, fp32. K/V are laid out
+    /// `[n_kv_heads, kv_stride, head_dim]`. The attended positions are the
+    /// union `[0, sink_end) ∪ [window_start, n_kv)` (dense path sets
+    /// `sink_end = window_start = 0`, attending the whole `[0, n_kv)`). When
+    /// `has_sink`, a learned per-head sink joins the softmax as a virtual key
+    /// with score `sink_logit` and value 0 — it widens the denominator but
+    /// contributes nothing to the output.
     #[allow(clippy::too_many_arguments)]
     fn naive_sdpa(
         q: &[f32],
@@ -395,34 +400,44 @@ pub mod kernel_tests {
         head_dim: usize,
         n_kv: usize,
         kv_stride: usize,
+        sink_end: usize,
+        window_start: usize,
+        has_sink: bool,
+        sink_logit: f32,
         scale: f32,
     ) -> Vec<f32> {
         let gqa = n_q_heads / n_kv_heads;
+        // Attended KV positions: the sink-token prefix then the window suffix.
+        let attended: Vec<usize> = (0..sink_end).chain(window_start..n_kv).collect();
         let mut out = vec![0.0f32; n_q_heads * head_dim];
         for qh in 0..n_q_heads {
             let kvh = qh / gqa;
             let q_off = qh * head_dim;
             let kv_slab = kvh * kv_stride * head_dim;
-            let mut scores = vec![0.0f32; n_kv];
-            for (t, score) in scores.iter_mut().enumerate() {
+            let mut scores: Vec<(usize, f32)> = Vec::with_capacity(attended.len());
+            for &t in &attended {
                 let k_off = kv_slab + t * head_dim;
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     dot += q[q_off + d] * k[k_off + d];
                 }
-                *score = dot * scale;
+                scores.push((t, dot * scale));
             }
-            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for s in scores.iter_mut() {
+            // Running max also covers the virtual sink key when present.
+            let mut m = scores.iter().map(|&(_, s)| s).fold(f32::NEG_INFINITY, f32::max);
+            if has_sink {
+                m = m.max(sink_logit);
+            }
+            let mut sum = if has_sink { (sink_logit - m).exp() } else { 0.0f32 };
+            for (_, s) in scores.iter_mut() {
                 *s = (*s - m).exp();
                 sum += *s;
             }
             let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
             for d in 0..head_dim {
                 let mut acc = 0.0f32;
-                for (t, s) in scores.iter().enumerate() {
-                    acc += *s * inv * v[kv_slab + t * head_dim + d];
+                for &(t, s) in &scores {
+                    acc += s * inv * v[kv_slab + t * head_dim + d];
                 }
                 out[q_off + d] = acc;
             }
@@ -430,10 +445,20 @@ pub mod kernel_tests {
         out
     }
 
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
-    fn test_ffai_sdpa_decode(dt: DType) -> TestSetup {
+    /// Build an `ffai_sdpa_decode` test for a given window/sink config.
+    /// `sink_end`/`window_start` drive the sliding-window mask (both 0 = dense);
+    /// `has_sink`/`sink_logit` drive the learned attention sink.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_setup(
+        dt: DType,
+        n_kv: usize,
+        kv_stride: usize,
+        sink_end: usize,
+        window_start: usize,
+        has_sink: bool,
+        sink_logit: f32,
+    ) -> TestSetup {
         let (n_q_heads, n_kv_heads, head_dim) = (8usize, 4usize, 128usize);
-        let (n_kv, kv_stride) = (64usize, 64usize);
         let heads_per_group = n_q_heads / n_kv_heads;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -444,8 +469,21 @@ pub mod kernel_tests {
             unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.011, -0.5), dt), dt);
         let v =
             unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
-        let expected =
-            naive_sdpa(&q, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale);
+        let expected = naive_sdpa(
+            &q,
+            &k,
+            &v,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            n_kv,
+            kv_stride,
+            sink_end,
+            window_start,
+            has_sink,
+            sink_logit,
+            scale,
+        );
 
         TestSetup::new(ffai_sdpa_decode::kernel_ir_for(dt))
             .mode(KernelMode::Reduction)
@@ -457,13 +495,37 @@ pub mod kernel_tests {
             .constexpr("n_kv", n_kv as u32)
             .constexpr("kv_stride", kv_stride as u32)
             .constexpr("heads_per_group", heads_per_group as u32)
-            .constexpr("sink_end", 0u32)
-            .constexpr("window_start", 0u32)
-            .constexpr("has_sink", 0u32)
-            .constexpr("sink_logit", 0.0f32)
+            .constexpr("sink_end", sink_end as u32)
+            .constexpr("window_start", window_start as u32)
+            .constexpr("has_sink", u32::from(has_sink))
+            .constexpr("sink_logit", sink_logit)
             .constexpr("scale", scale)
             .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
             .grid_3d(n_q_heads as u32, 1, 1, [1024, 1, 1])
+    }
+
+    // Dense full-attention decode.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_decode(dt: DType) -> TestSetup { decode_setup(dt, 64, 64, 0, 0, false, 0.0) }
+
+    // Sliding window + sink tokens: attend `[0, 2) ∪ [8, 16)`. Exercises both
+    // the sink-token pass and the windowed pass (the masked range is skipped).
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_decode_swa_sink(dt: DType) -> TestSetup {
+        decode_setup(dt, 16, 16, 2, 8, false, 0.0)
+    }
+
+    // Sliding window, no sink tokens: attend `[8, 16)` only.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_decode_swa(dt: DType) -> TestSetup {
+        decode_setup(dt, 16, 16, 0, 8, false, 0.0)
+    }
+
+    // Learned per-head attention sink on the dense path — the sink logit joins
+    // the softmax denominator as a virtual zero-valued key.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_decode_learned_sink(dt: DType) -> TestSetup {
+        decode_setup(dt, 64, 64, 0, 0, true, 2.5)
     }
 
     /// Deterministic ramp generator for test inputs: `start + i*step`,

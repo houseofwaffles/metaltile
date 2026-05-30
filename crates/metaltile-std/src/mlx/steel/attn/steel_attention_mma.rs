@@ -695,3 +695,128 @@ pub fn mt_sdpa_prefill_mma<T>(
         (simdgroup_elem_load(o_ff, 1) * is_row).cast::<T>(),
     );
 }
+
+/// New-syntax correctness for the prefill-tile SDPA kernel
+/// (`mt_sdpa_prefill_mma`). This MMA kernel powers M7's K=8/16 batched-Q
+/// speculative-decode-verify path: a `q_len`-row query block attends a
+/// `k_len`-slot K/V cache under a hardcoded causal mask, where row `qi`
+/// attends `[0, q_len_off + qi + 1)` with `q_len_off = k_len - q_len`.
+///
+/// Dispatch contract (mirrors the legacy `run_sdpa_prefill` path): mode
+/// `SimdGroup2D`, `bfloat_reinterpret_cast = true` (one narrowing cast per
+/// output store, as inference dispatches it), grid `[1, n_q_heads, 1]`, tpg
+/// 128. head_dim is fixed at 128 and `q_len = 32` (the MMA Q-tile). f32-only:
+/// the O(q_len·n_q_heads·k_len·head_dim) oracle is dtype-independent, and the
+/// decode-form tests cover f16/bf16 rounding elsewhere.
+pub mod kernel_tests {
+    use metaltile::{test::*, test_kernel};
+
+    use super::mt_sdpa_prefill_mma;
+    use crate::utils::{pack_f32, unpack_f32};
+
+    const HEAD_DIM: usize = 128;
+    const Q_LEN: usize = 32;
+
+    fn ramp(n: usize, modulus: usize, offset: f32) -> Vec<f32> {
+        (0..n).map(|i| ((i % modulus) as f32 - offset) * 0.05).collect()
+    }
+
+    /// Causal-prefix SDPA reference: query row `qi` (head `qh`, GQA group
+    /// `qh / gqa`) attends `[0, min(q_len_off + qi + 1, k_len))`, softmax over
+    /// those scores, weighted V sum. fp32. Mirrors the legacy
+    /// `naive_sdpa_causal_prefix_f32`.
+    #[allow(clippy::too_many_arguments)]
+    fn naive_causal_prefix(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        q_len: usize,
+        k_len: usize,
+        head_dim: usize,
+        q_len_off: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let gqa = n_q_heads / n_kv_heads;
+        let mut out = vec![0.0f32; n_q_heads * q_len * head_dim];
+        for qh in 0..n_q_heads {
+            let kvh = qh / gqa;
+            let kv_slab = kvh * k_len * head_dim;
+            let q_head_off = qh * q_len * head_dim;
+            for qi in 0..q_len {
+                let q_off = q_head_off + qi * head_dim;
+                let visible_end = (q_len_off + qi + 1).min(k_len);
+                let mut scores = vec![0.0f32; visible_end];
+                for (t, score) in scores.iter_mut().enumerate() {
+                    let k_off = kv_slab + t * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] * k[k_off + d];
+                    }
+                    *score = dot * scale;
+                }
+                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    sum += *s;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (t, s) in scores.iter().enumerate() {
+                        acc += *s * inv * v[kv_slab + t * head_dim + d];
+                    }
+                    out[q_off + d] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    /// `q_len = 32` query rows attend a `k_len`-slot causal-prefix cache.
+    /// `q_len_off = k_len - q_len`, so the first query row already sees the
+    /// `n_kv = k_len - q_len` prefix plus itself.
+    fn prefill_setup(dt: DType, n_q_heads: usize, n_kv_heads: usize, k_len: usize) -> TestSetup {
+        let gqa_factor = n_q_heads / n_kv_heads;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let q_len_off = k_len - Q_LEN;
+
+        let q = unpack_f32(&pack_f32(&ramp(n_q_heads * Q_LEN * HEAD_DIM, 17, 8.0), dt), dt);
+        let k = unpack_f32(&pack_f32(&ramp(n_kv_heads * k_len * HEAD_DIM, 13, 6.0), dt), dt);
+        let v = unpack_f32(&pack_f32(&ramp(n_kv_heads * k_len * HEAD_DIM, 19, 9.0), dt), dt);
+        let expected = naive_causal_prefix(
+            &q, &k, &v, n_q_heads, n_kv_heads, Q_LEN, k_len, HEAD_DIM, q_len_off, scale,
+        );
+
+        // The prefill kernel narrows once per store (inference dispatches it
+        // with the bfloat reinterpret-cast path enabled).
+        let mut ir = mt_sdpa_prefill_mma::kernel_ir_for(dt);
+        ir.bfloat_reinterpret_cast = true;
+
+        TestSetup::new(ir)
+            .mode(KernelMode::SimdGroup2D)
+            .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
+            .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
+            .input(TestBuffer::from_vec("v", pack_f32(&v, dt), dt))
+            .input(TestBuffer::zeros("out", n_q_heads * Q_LEN * HEAD_DIM, dt))
+            .constexpr("q_len", Q_LEN as u32)
+            .constexpr("k_len", k_len as u32)
+            .constexpr("gqa_factor", gqa_factor as u32)
+            .constexpr("n_q_heads", n_q_heads as u32)
+            .constexpr("n_kv_heads", n_kv_heads as u32)
+            .constexpr("scale", scale)
+            .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
+            .grid_3d(1, n_q_heads as u32, 1, [128, 1, 1])
+    }
+
+    // MHA, short prefix: k_len = 96 (6 KV-tiles of 16), 2 heads, 1 KV head.
+    #[test_kernel(dtypes = [f32], tol = [5e-3])]
+    fn test_mt_sdpa_prefill_mma(dt: DType) -> TestSetup { prefill_setup(dt, 2, 1, 96) }
+
+    // GQA fan-out 4: 8 Q heads over 2 KV heads — exercises the kv-head
+    // mapping in the prefill tile.
+    #[test_kernel(dtypes = [f32], tol = [5e-3])]
+    fn test_mt_sdpa_prefill_mma_gqa(dt: DType) -> TestSetup { prefill_setup(dt, 8, 2, 96) }
+}

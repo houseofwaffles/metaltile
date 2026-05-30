@@ -618,7 +618,13 @@ pub fn ffai_sdpa_bidirectional_d96<T>(
 pub mod kernel_tests {
     use metaltile::{test::*, test_kernel};
 
-    use super::{ffai_sdpa_bidirectional_d64, ffai_sdpa_bidirectional_d96};
+    use super::{
+        ffai_sdpa_bidirectional_d32,
+        ffai_sdpa_bidirectional_d64,
+        ffai_sdpa_bidirectional_d72,
+        ffai_sdpa_bidirectional_d80,
+        ffai_sdpa_bidirectional_d96,
+    };
     use crate::utils::{pack_f32, unpack_f32};
 
     // Per (query, q_head): softmax(Q·Kᵀ·scale)·V over `[0, base_kv +
@@ -711,9 +717,29 @@ pub mod kernel_tests {
             .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
     }
 
+    // head_dim 32 — exactly one element per lane (32 / 32 = 1).
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_bidirectional_d32(dt: DType) -> TestSetup {
+        setup(ffai_sdpa_bidirectional_d32::kernel_ir_for(dt), 32, dt)
+    }
+
     #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
     fn test_ffai_sdpa_bidirectional_d64(dt: DType) -> TestSetup {
         setup(ffai_sdpa_bidirectional_d64::kernel_ir_for(dt), 64, dt)
+    }
+
+    // head_dim 72 — ragged: 72 = 32·2 + 8, so the first 8 lanes own a third
+    // element and the rest must bounds-mask it. Exercises the partial-lane
+    // masking the clean-fit dims leave dormant.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_bidirectional_d72(dt: DType) -> TestSetup {
+        setup(ffai_sdpa_bidirectional_d72::kernel_ir_for(dt), 72, dt)
+    }
+
+    // head_dim 80 — ragged: 80 = 32·2 + 16, partial-lane bounds masking.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_bidirectional_d80(dt: DType) -> TestSetup {
+        setup(ffai_sdpa_bidirectional_d80::kernel_ir_for(dt), 80, dt)
     }
 
     #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]

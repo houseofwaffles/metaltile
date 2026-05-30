@@ -398,8 +398,7 @@ pub mod kernel_tests {
         (0..n).map(|i| ((start + i as f32 * step) % 2.0) - 1.0).collect()
     }
 
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
-    fn test_ffai_sdpa_multi(dt: DType) -> TestSetup {
+    fn multi_setup(dt: DType, causal: bool) -> TestSetup {
         let (n_q_heads, n_kv_heads, head_dim) = (8usize, 4usize, 128usize);
         let (base_kv, n_query) = (56usize, 8usize);
         let kv_stride = base_kv + n_query; // 64
@@ -412,7 +411,7 @@ pub mod kernel_tests {
         let v =
             unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
         let expected = naive_sdpa_multi(
-            &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, false, scale,
+            &q, &k, &v, n_q_heads, n_kv_heads, head_dim, base_kv, n_query, kv_stride, causal, scale,
         );
 
         TestSetup::new(ffai_sdpa_multi::kernel_ir_for(dt))
@@ -427,11 +426,20 @@ pub mod kernel_tests {
             .constexpr("n_query", n_query as u32)
             .constexpr("kv_stride", kv_stride as u32)
             .constexpr("heads_per_group", heads_per_group as u32)
-            .constexpr("causal", 0u32)
+            .constexpr("causal", u32::from(causal))
             .constexpr("scale", scale)
             .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
             .grid_3d((n_q_heads * n_query) as u32, 1, 1, [1024, 1, 1])
     }
+
+    // Full (bidirectional) attention: every query attends `[0, base_kv + n_query)`.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_multi(dt: DType) -> TestSetup { multi_setup(dt, false) }
+
+    // Causal: query row `r` attends `[0, base_kv + r + 1)` — exercises the
+    // within-block causal mask the full-mode test leaves dormant.
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_ffai_sdpa_multi_causal(dt: DType) -> TestSetup { multi_setup(dt, true) }
 }
 
 /// New-syntax benchmark for `ffai_sdpa_multi` (`class=GenericEmpty`).

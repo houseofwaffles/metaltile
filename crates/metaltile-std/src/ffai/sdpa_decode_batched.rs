@@ -1444,7 +1444,7 @@ mod tests {
 pub mod kernel_tests {
     use metaltile::{test::*, test_kernel};
 
-    use super::sdpa_decode_batched_q2;
+    use super::{sdpa_decode_batched_q2, sdpa_decode_batched_q4, sdpa_decode_batched_q8};
     use crate::utils::{pack_f32, unpack_f32};
 
     // Dense SDPA for a single Q slot: `[n_q_heads, head_dim]` query,
@@ -1499,39 +1499,62 @@ pub mod kernel_tests {
         (0..n).map(|i| ((start + i as f32 * step) % 2.0) - 1.0).collect()
     }
 
-    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
-    fn test_sdpa_decode_batched_q2(dt: DType) -> TestSetup {
+    /// Build a batched-decode test: `batch_q` independent single-token decodes
+    /// sharing one K/V cache, packed into the kernel's `[n_q_heads, batch_q,
+    /// head_dim]` layout. Each Q slot must reproduce its standalone decode
+    /// (`naive_sdpa_one`) — the batching is purely a layout/throughput change.
+    ///
+    /// `tpg` is the threads-per-group: q2 tolerates the full 1024, but q4/q8
+    /// carry more per-thread register state and MUST dispatch at 512 (16
+    /// simdgroups) — at 1024 their register pressure silently miscomputes on
+    /// M-class GPUs (the hazard the legacy file guarded with a divergence
+    /// regression test).
+    fn batched_setup(
+        ir: metaltile::core::ir::Kernel,
+        batch_q: usize,
+        tpg: u32,
+        dt: DType,
+    ) -> TestSetup {
         let (n_q_heads, n_kv_heads, head_dim) = (8usize, 4usize, 128usize);
         let (n_kv, kv_stride) = (64usize, 64usize);
-        let batch_q = 2usize;
         let heads_per_group = n_q_heads / n_kv_heads;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-        // Two independent Q slots; interleave into [n_q_heads, batch_q, head_dim].
-        let q_a = unpack_f32(&pack_f32(&ramp(n_q_heads * head_dim, 0.013, -0.4), dt), dt);
-        let q_b = unpack_f32(&pack_f32(&ramp(n_q_heads * head_dim, 0.017, -0.2), dt), dt);
+        // `batch_q` independent Q slots with distinct ramps.
+        let q_slots: Vec<Vec<f32>> = (0..batch_q)
+            .map(|b| {
+                let step = 0.013 + 0.004 * b as f32;
+                let start = -0.4 + 0.1 * b as f32;
+                unpack_f32(&pack_f32(&ramp(n_q_heads * head_dim, step, start), dt), dt)
+            })
+            .collect();
         let k =
             unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.011, -0.5), dt), dt);
         let v =
             unpack_f32(&pack_f32(&ramp(n_kv_heads * kv_stride * head_dim, 0.007, -0.3), dt), dt);
 
+        // Interleave Q slots into [n_q_heads, batch_q, head_dim].
         let mut q = Vec::with_capacity(n_q_heads * batch_q * head_dim);
         for h in 0..n_q_heads {
-            q.extend_from_slice(&q_a[h * head_dim..(h + 1) * head_dim]);
-            q.extend_from_slice(&q_b[h * head_dim..(h + 1) * head_dim]);
+            for slot in &q_slots {
+                q.extend_from_slice(&slot[h * head_dim..(h + 1) * head_dim]);
+            }
         }
 
-        let out_a =
-            naive_sdpa_one(&q_a, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale);
-        let out_b =
-            naive_sdpa_one(&q_b, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale);
+        let outs: Vec<Vec<f32>> = q_slots
+            .iter()
+            .map(|qs| {
+                naive_sdpa_one(qs, &k, &v, n_q_heads, n_kv_heads, head_dim, n_kv, kv_stride, scale)
+            })
+            .collect();
         let mut expected = Vec::with_capacity(n_q_heads * batch_q * head_dim);
         for h in 0..n_q_heads {
-            expected.extend_from_slice(&out_a[h * head_dim..(h + 1) * head_dim]);
-            expected.extend_from_slice(&out_b[h * head_dim..(h + 1) * head_dim]);
+            for out in &outs {
+                expected.extend_from_slice(&out[h * head_dim..(h + 1) * head_dim]);
+            }
         }
 
-        TestSetup::new(sdpa_decode_batched_q2::kernel_ir_for(dt))
+        TestSetup::new(ir)
             .mode(KernelMode::Reduction)
             .input(TestBuffer::from_vec("q", pack_f32(&q, dt), dt))
             .input(TestBuffer::from_vec("k", pack_f32(&k, dt), dt))
@@ -1543,7 +1566,24 @@ pub mod kernel_tests {
             .constexpr("heads_per_group", heads_per_group as u32)
             .constexpr("scale", scale)
             .expect(TestBuffer::from_vec("out", pack_f32(&expected, dt), dt))
-            .grid_3d(n_q_heads as u32, 1, 1, [1024, 1, 1])
+            .grid_3d(n_q_heads as u32, 1, 1, [tpg, 1, 1])
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_sdpa_decode_batched_q2(dt: DType) -> TestSetup {
+        batched_setup(sdpa_decode_batched_q2::kernel_ir_for(dt), 2, 1024, dt)
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_sdpa_decode_batched_q4(dt: DType) -> TestSetup {
+        batched_setup(sdpa_decode_batched_q4::kernel_ir_for(dt), 4, 512, dt)
+    }
+
+    #[test_kernel(dtypes = [f32, f16, bf16], tol = [1e-3, 2e-3, 1e-2])]
+    fn test_sdpa_decode_batched_q8(dt: DType) -> TestSetup {
+        // q8 carries the most per-thread state — dispatch at 256 (8 simdgroups)
+        // to stay within the Apple GPU register file (512 still miscomputes).
+        batched_setup(sdpa_decode_batched_q8::kernel_ir_for(dt), 8, 256, dt)
     }
 }
 
