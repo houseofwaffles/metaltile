@@ -37,7 +37,7 @@
 //!
 //! Outer `aura_dequant_rotated_clean!` (for bits ∈ {2,4,8}) and
 //! `aura_dequant_rotated_odd!` (for bits=3) emit the entire
-//! `#[kernel(bench(...))] pub fn …` at module scope.  Required because
+//! `#[kernel] pub fn …` at module scope.  Required because
 //! the `#[kernel]` proc-macro doesn't expand inner `macro_rules!`
 //! invocations (see CLAUDE.md note about PR #19's macro regression).
 
@@ -51,9 +51,7 @@ use metaltile::kernel;
 #[rustfmt::skip]
 macro_rules! aura_dequant_rotated_clean {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             packed: Tensor<u32>,
             norms: Tensor<T>,
@@ -108,9 +106,7 @@ macro_rules! aura_dequant_rotated_clean {
 #[rustfmt::skip]
 macro_rules! aura_dequant_rotated_odd {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             packed: Tensor<u32>,
             norms: Tensor<T>,

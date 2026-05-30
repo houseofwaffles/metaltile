@@ -37,15 +37,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="logits_processors",
-        subop="topk_mask",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn logits_topk_mask<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] threshold: f32) {
     let i = program_id::<0>();
     let v = load(inp[i]).cast::<f32>();

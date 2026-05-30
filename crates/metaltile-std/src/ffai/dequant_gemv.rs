@@ -51,9 +51,7 @@ use metaltile::kernel;
 // `$bits` must divide 32 evenly (i.e. 2, 4, or 8).
 macro_rules! dequant_gemv_pow2 {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="dequant_gemv", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             weight: Tensor<u32>,
             scales: Tensor<T>,
@@ -110,9 +108,7 @@ macro_rules! dequant_gemv_pow2 {
 // Adjacent threads access adjacent elements → same u32 words → L1 multicast.
 macro_rules! dequant_gemv_odd {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="dequant_gemv", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             weight: Tensor<u32>,
             scales: Tensor<T>,
@@ -212,15 +208,7 @@ dequant_gemv_odd!(dequant_gemv_int6, 6u32, "int6");
 /// `stack_alloc` accumulators are required because the DSL doesn't lower
 /// runtime-indexed `let mut [T; N]` arrays (see the `_m{16,32}` notes in
 /// `ffai/moe.rs` for the same constraint).
-#[kernel(
-    bench(
-        op="dequant_gemv",
-        subop="int4_fast",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn dequant_gemv_int4_fast<T>(
     weight: Tensor<u32>,
     scales: Tensor<T>,

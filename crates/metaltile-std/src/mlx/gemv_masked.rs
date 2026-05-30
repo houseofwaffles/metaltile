@@ -4,17 +4,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="gemv_masked",
-        subop="gemv_masked",
-        class=MatVecMasked,
-        b=4096,
-        n=4096,
-        tpg=256,
-        tol=1e-2,
-    )
-)]
+#[kernel]
 pub fn mt_gemv_masked<T>(
     mat: Tensor<T>,
     vec: Tensor<T>,

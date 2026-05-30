@@ -57,15 +57,7 @@ use metaltile::kernel;
 ///   `w [n, k/8]` fp4 packed (8 codes/u32),
 ///   `scales [n, k/group_size]` (T) — group_size = 32, scale-only,
 ///   `x [m, k]` (T), `out [m, n]` (T).
-#[kernel(
-    bench(
-        op="fp_quantized",
-        subop="fp_qmm_nax",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fp_qmm_nax<T>(
     w: Tensor<u32>,

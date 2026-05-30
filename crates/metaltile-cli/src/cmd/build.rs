@@ -31,7 +31,7 @@ use metaltile_codegen::{
     passes::{PassStats, PipelineBuilder, run_passes_with_stats},
 };
 use metaltile_core::{all_benches, bench::KernelBench, ir::Kernel};
-use metaltile_std::{bench_types::DType, spec::all_specs};
+use metaltile_std::bench_types::DType;
 
 use crate::{
     BuildArgs,
@@ -508,13 +508,18 @@ fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) -> Result<(),
     let dtypes_filter: Option<Vec<DType>> =
         dtypes_arg.map(|s| s.split(',').filter_map(|t| t.trim().parse::<DType>().ok()).collect());
 
-    let kernels: Vec<_> = all_specs()
-        .filter(|s| matches_filter(filter, s.kernel_name))
-        .flat_map(|s| {
-            s.dtypes
+    let kernels: Vec<_> = all_benches()
+        .map(|e| e.bench())
+        .filter(|b| {
+            let first = b.dtypes().first().copied().unwrap_or(DType::F32);
+            matches_filter(filter, &b.setup(first).kernel().name)
+        })
+        .flat_map(|b| {
+            b.dtypes()
                 .iter()
                 .filter(|dt| dtypes_filter.as_ref().is_none_or(|df| df.contains(dt)))
-                .map(|&dt| (s.kernel_ir)(dt))
+                .map(|&dt| b.setup(dt).kernel().clone())
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -585,30 +590,31 @@ fn run_time_passes(filter: Option<&str>, dtypes_arg: Option<&str>) -> Result<(),
 mod tests {
     use std::collections::BTreeMap;
 
-    use metaltile_std::spec::{BenchSpec, effective_mode};
-
     use super::*;
 
     /// Collect all registered kernels (unfiltered) with indirect-dispatch
     /// flags applied. Used only by tests to verify the full kernel corpus.
+    /// Mirrors the `--emit` path: kernels are discovered via the `#[bench]`
+    /// registry, with the mode baked into each bench's setup IR.
     fn collect_all_kernels() -> Vec<Kernel> {
-        let mut by_name: BTreeMap<&str, (&BenchSpec, Vec<DType>)> = BTreeMap::new();
-        for spec in all_specs() {
-            let entry = by_name.entry(spec.kernel_name).or_insert_with(|| (spec, Vec::new()));
-            for &dt in spec.dtypes {
-                if !entry.1.contains(&dt) {
-                    entry.1.push(dt);
+        let mut by_name: BTreeMap<String, EmitKernel> = BTreeMap::new();
+        for entry in all_benches() {
+            let b = entry.bench();
+            let Some(&first_dt) = b.dtypes().first() else { continue };
+            let name = b.setup(first_dt).kernel().name.to_string();
+            let e = by_name.entry(name).or_insert((b, Vec::new()));
+            for &dt in b.dtypes() {
+                if !e.1.contains(&dt) {
+                    e.1.push(dt);
                 }
             }
         }
         let total: usize = by_name.values().map(|(_, dtypes)| dtypes.len()).sum();
         let mut kernels = Vec::with_capacity(total);
-        for (spec, dtypes) in by_name.values() {
-            let mode = effective_mode(spec);
+        for (name, (b, dtypes)) in &by_name {
             for &dt in dtypes {
-                let mut k = (spec.kernel_ir)(dt);
-                k.name = monomorphized_name(spec.kernel_name, dt, dtypes.len());
-                k.mode = mode;
+                let mut k = b.setup(dt).kernel().clone();
+                k.name = monomorphized_name(name, dt, dtypes.len());
                 if metaltile_std::ffai::dequant_gemv::dequant_gemv_wants_indirect(&k.name) {
                     k.wants_indirect_variant = true;
                 }

@@ -53,15 +53,7 @@ use metaltile::kernel;
 /// `w [n, k/8]` fp4 E2M1 packed (8 codes/u32, MSB = sign),
 /// `scales [n, k/group_size]` T (scale-only, group_size=32),
 /// `x [m, k]` T, `out [m, n]` T.
-#[kernel(
-    bench(
-        op="fp_quantized",
-        subop="fp4_qmm_mma",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fp4_qmm_mma<T>(
     w: Tensor<u32>,
@@ -281,15 +273,7 @@ pub fn mt_fp4_qmm_mma<T>(
 /// `w [n, k/4]` fp8 E4M3 packed (4 codes/u32),
 /// `scales [n, k/group_size]` T (scale-only, group_size=32),
 /// `x [m, k]` T, `out [m, n]` T.
-#[kernel(
-    bench(
-        op="fp_quantized",
-        subop="fp8_e4m3_qmm_mma",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_fp8_e4m3_qmm_mma<T>(
     w: Tensor<u32>,

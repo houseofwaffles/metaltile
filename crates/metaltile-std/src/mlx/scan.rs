@@ -28,20 +28,7 @@
 
 use metaltile::kernel;
 
-static SCAN_SHAPES: &[(usize, usize)] = &[(1_024, 4_096)];
-
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan",
-        class=Scan,
-        shapes=&SCAN_SHAPES,
-        tpg=256,
-        tol=1e-3,
-        mlx="contig_scan_inclusive_sum_{tn}_{tn}",
-        metal_file="scan.metal",
-    )
-)]
+#[kernel]
 pub fn mt_scan<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -113,15 +100,7 @@ pub fn mt_scan<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 // the inclusive-sum oracle; correctness is pinned by
 // `tests/scan_exclusive_gpu_correctness.rs` instead.
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_exclusive",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -234,15 +213,7 @@ pub fn mt_scan_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32)
 // `out[i] = v[0] * v[1] * … * v[i]`  (inclusive prefix product per row).
 // Identity element is 1.0; out-of-range loads are padded with 1.0.
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_prod",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -305,15 +276,7 @@ pub fn mt_scan_prod<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 //
 // `out[0] = 1`,  `out[i] = v[0] * … * v[i-1]`  (exclusive prefix product).
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_prod_exclusive",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_prod_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -371,15 +334,7 @@ pub fn mt_scan_prod_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n:
 // `out[i] = max(v[0], …, v[i])`  (running maximum per row).
 // Identity element is -∞; out-of-range loads are padded with -∞.
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_max",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_max<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -445,15 +400,7 @@ pub fn mt_scan_max<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 //
 // `out[0] = -∞`,  `out[i] = max(v[0], …, v[i-1])`  (exclusive max prefix).
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_max_exclusive",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_max_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -517,15 +464,7 @@ pub fn mt_scan_max_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: 
 // `out[i] = min(v[0], …, v[i])`  (running minimum per row).
 // Identity element is +∞; out-of-range loads are padded with +∞.
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_min",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;
@@ -587,15 +526,7 @@ pub fn mt_scan_min<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
 //
 // `out[0] = +∞`,  `out[i] = min(v[0], …, v[i-1])`  (exclusive min prefix).
 
-#[kernel(
-    bench(
-        op="scan",
-        subop="scan_min_exclusive",
-        class=GenericEmpty,
-        tol=1e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_scan_min_exclusive<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<1>();
     let lid = tid;

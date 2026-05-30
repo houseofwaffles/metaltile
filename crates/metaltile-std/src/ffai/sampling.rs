@@ -39,15 +39,7 @@ use metaltile::kernel;
 // to find the exact index. The full-vocab serial walk (152K ops) is
 // replaced by 1 × n/lsize chunk-traverse per lane + an 8-stage scan +
 // 1 × n/lsize finalizing walk on the winning lane.
-#[kernel(
-    bench(
-        op="sampling",
-        subop="softmax_categorical_sample",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn softmax_categorical_sample<T>(
     inp: Tensor<T>,
     out: Tensor<u32>,

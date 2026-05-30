@@ -12,18 +12,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="arange",
-        subop="arange",
-        class=Arange,
-        start=0.0,
-        step=1.0,
-        tol=1.0,
-        mlx="arange{tn}",
-        metal_file="arange.metal",
-    )
-)]
+#[kernel]
 pub fn mt_arange<T>(out: Tensor<T>, start: Tensor<T>, step: Tensor<T>, #[constexpr] n: u32) {
     let idx = program_id(0);
     let s = load(start[0]);
@@ -75,7 +64,7 @@ pub mod kernel_tests {
 }
 
 /// Benchmark for `mt_arange` in the new `#[bench]` syntax. Registered
-/// alongside the legacy `#[kernel(bench(...))]` above, so it appears in
+/// alongside the legacy `#[kernel]` above, so it appears in
 /// `tile bench` next to the legacy `arange` row for A/B comparison.
 pub mod kernel_benches {
     use metaltile::{bench, test::*};

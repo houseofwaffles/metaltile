@@ -13,16 +13,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="select",
-        subop="select",
-        class=Select,
-        tol=1e-4,
-        mlx="v_Select{tn}",
-        metal_file="ternary.metal",
-    )
-)]
+#[kernel]
 pub fn mt_select<T>(cond: Tensor<u8>, on_true: Tensor<T>, on_false: Tensor<T>, out: Tensor<T>) {
     let idx = program_id(0);
     let c = load(cond[idx]);

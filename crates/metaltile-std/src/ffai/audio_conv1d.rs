@@ -31,15 +31,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="audio_conv1d",
-        subop="audio_conv1d",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn audio_conv1d<T>(
     input: Tensor<T>,
     weight: Tensor<T>,

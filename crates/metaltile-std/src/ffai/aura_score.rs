@@ -49,9 +49,7 @@ use metaltile::kernel;
 
 macro_rules! aura_score_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             q_rot: Tensor<T>,
             packed: Tensor<u32>,

@@ -32,7 +32,7 @@
 //!
 //! ## Macro structure
 //!
-//! `dequant_gather_kernel!` emits the entire `#[kernel(bench(...))] pub fn …`
+//! `dequant_gather_kernel!` emits the entire `#[kernel] pub fn …`
 //! at module scope.  The compiler expands the outer macro before the
 //! `#[kernel]` proc-macro runs, so the body parser sees concrete tokens
 //! with `$bits` already substituted.  Embedding the body inside an *inner*
@@ -43,9 +43,7 @@ use metaltile::kernel;
 
 macro_rules! dequant_gather_kernel {
     ($name:ident, $bits:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="dequant_gather", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Grid3D,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             weight: Tensor<u32>,
             scales: Tensor<T>,

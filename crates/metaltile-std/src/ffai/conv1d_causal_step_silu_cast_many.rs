@@ -75,15 +75,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="ssm",
-        subop="conv1d_causal_step_silu_cast_many",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn ffai_conv1d_causal_step_silu_cast_many<T>(
     src: Tensor<T>,
     w: Tensor<T>,

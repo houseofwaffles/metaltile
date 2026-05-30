@@ -76,7 +76,7 @@
 //!
 //! ## Macro structure
 //!
-//! `aura_encode_kernel!` wraps a single `#[kernel(bench(...))] pub fn …`
+//! `aura_encode_kernel!` wraps a single `#[kernel] pub fn …`
 //! at module scope.  Bit-widths get separate invocations so the compiler
 //! expands the outer macro before the `#[kernel]` proc-macro sees it —
 //! required because the proc-macro does not expand inner declarative macros.
@@ -111,9 +111,7 @@ macro_rules! aura_encode_kernel {
         // boundaries → aura4v4 compressed-flash KLD 1.76; f32 boundaries
         // → 1.40 (mirror baseline 1.41). The 0.3-nat gap maps cleanly
         // to the bf16 boundary rounding flipping borderline bins.
-        #[kernel(
-            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             input: Tensor<T>,
             rotation: Tensor<T>,

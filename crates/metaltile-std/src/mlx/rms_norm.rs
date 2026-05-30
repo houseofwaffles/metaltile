@@ -95,22 +95,7 @@ pub fn mt_rms_inv_scalar(
     store(out[0u32], rsqrt(tg_ssq / n + eps));
 }
 
-#[kernel(
-    bench(
-        op="rms_norm",
-        subop="rms_norm",
-        class=RowNorm,
-        b=1024,
-        n=4096,
-        tpg=1024,
-        reads=2,
-        pre_weight=1.0,
-        post_eps=1e-5,
-        tol=1e-4,
-        mlx="rms{tn}",
-        metal_file="rms_norm.metal",
-    )
-)]
+#[kernel]
 pub fn mt_rms_norm<T>(
     x: Tensor<T>,
     w: Tensor<T>,
@@ -169,27 +154,7 @@ pub fn mt_rms_norm<T>(
 /// Algorithm-identical to `mt_rms_norm`: f32 accumulator for the
 /// sum-of-squares, threadgroup-wide `reduce_sum`, `rsqrt(ssq/n + eps)`
 /// scaling, per-element output store rounded through `T`.
-#[kernel(
-    bench(
-        op="rms_norm",
-        subop="rms_norm_small",
-        class=RowNorm,
-        // Per-head dispatch shape: head_dim=64 row count tuned so the bench
-        // walks a representative batched-prefill workload (4 batches × 16
-            // tokens × 16 q heads at head_dim=64 = 1024 rows). Same `n × b`
-        // total element count as the parent `mt_rms_norm` bench so the
-        // GB/s comparison is apples-to-apples.
-        b=1024,
-        n=64,
-        tpg=32,
-        reads=2,
-        pre_weight=1.0,
-        post_eps=1e-5,
-        tol=1e-4,
-        mlx="rms{tn}",
-        metal_file="rms_norm.metal",
-    )
-)]
+#[kernel]
 pub fn mt_rms_norm_small<T>(
     x: Tensor<T>,
     w: Tensor<T>,
@@ -240,15 +205,7 @@ pub fn mt_rms_norm_small<T>(
 ///   `n`, so no `N = TPG * k` relationship is required; threads whose
 ///   stride walks past `n` simply stop. Unlike `mt_rms_norm` there is
 ///   no 128-alignment or `n ≤ 4096` requirement.
-#[kernel(
-    bench(
-        op="rms_norm",
-        subop="rms_norm_wide",
-        class=GenericEmpty,
-        tol=5e-4,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_rms_norm_wide<T>(
     x: Tensor<T>,
     w: Tensor<T>,
@@ -300,15 +257,7 @@ pub fn mt_rms_norm_wide<T>(
 /// 4 consecutive `Dv`-axis elements; the OOB clamp + mask copies the
 /// `mt_rms_norm` template so a wrong-TPG dispatch fails loudly rather
 /// than silently miscomputing.
-#[kernel(
-    bench(
-        op="rms_norm",
-        subop="gated_mixer_norm",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_gated_mixer_norm<T>(
     y: Tensor<f32>,
     z: Tensor<T>,

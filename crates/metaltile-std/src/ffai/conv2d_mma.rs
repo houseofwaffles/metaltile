@@ -82,15 +82,7 @@ use metaltile::kernel;
 /// Each TG computes a 32×32 tile of `out[pixels, out_channels]`.
 ///
 /// Correctness pinned by `conv2d_mma_gpu_correctness`.
-#[kernel(
-    bench(
-        op="conv2d",
-        subop="mma",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_mma<T>(
     input: Tensor<T>,

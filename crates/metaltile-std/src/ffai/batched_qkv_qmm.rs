@@ -45,15 +45,7 @@ use metaltile::kernel;
 ///
 /// Grid: `[ceil(max(out_q,out_k,out_v)/8), M, 3]`. See module docs for
 /// the full geometry contract. TGs past a matrix's `out_*` rows no-op.
-#[kernel(
-    bench(
-        op="batched_qkv_qmm",
-        subop="batched_qkv_qmm_fast",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_batched_qkv_qmm_fast<T>(
     x: Tensor<T>,
     w_q: Tensor<u32>,

@@ -4,21 +4,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="logsumexp",
-        subop="logsumexp",
-        class=RowNorm,
-        b=1024,
-        n=4096,
-        tpg=256,
-        reads=1,
-        out_elements=1,
-        tol=1e-4,
-        mlx="looped_logsumexp_{tn}",
-        metal_file="logsumexp.metal",
-    )
-)]
+#[kernel]
 pub fn mt_logsumexp<T>(inp: Tensor<T>, out: Tensor<T>, #[constexpr] n: u32) {
     let row = program_id::<0>();
     let rs = row * n;

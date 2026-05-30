@@ -23,15 +23,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="rope",
-        subop="rope_llama",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn ffai_rope_llama<T>(
     qk: Tensor<T>,
     out: Tensor<T>,

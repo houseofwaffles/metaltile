@@ -50,15 +50,7 @@ use metaltile::kernel;
 
 /// NAX fused GEMM `C = A · B`. Params:
 ///   `a [m, k]`, `b [k, n]`, `out [m, n]`.
-#[kernel(
-    bench(
-        op="steel_gemm",
-        subop="fused_nax",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_steel_gemm_fused_nax<T>(
     a: Tensor<T>,

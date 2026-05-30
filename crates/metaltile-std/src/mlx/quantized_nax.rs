@@ -34,15 +34,7 @@ use metaltile::kernel;
 
 /// MPP int4 quantized matmul `Out = X · dequant(W)`. Same shape as
 /// `mt_qmm_mma_mpp`; both kernels co-exist for naming compatibility.
-#[kernel(
-    bench(
-        op="quantized",
-        subop="qmm_nax",
-        class=GenericEmpty,
-        tol=5e-2,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn mt_qmm_nax<T>(
     w: Tensor<u32>,

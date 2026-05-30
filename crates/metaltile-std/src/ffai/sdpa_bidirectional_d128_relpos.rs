@@ -39,15 +39,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op = "sdpa",
-        subop = "sdpa_bidirectional_d128_relpos",
-        class = GenericEmpty,
-        tol = 1e-3,
-        kernel_mode = Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_sdpa_bidirectional_d128_relpos<T>(
     q: Tensor<T>,
     k: Tensor<T>,

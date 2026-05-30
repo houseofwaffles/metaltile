@@ -38,15 +38,7 @@ use metaltile::kernel;
 
 /// Fused Q/K/V int4 quantized GEMV — one output row per TG.
 /// `program_id::<2>()` picks the matrix.
-#[kernel(
-    bench(
-        op="batched_qkv_qgemv",
-        subop="batched_qkv_qgemv",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_batched_qkv_qgemv<T>(
     x: Tensor<T>,
     w_q: Tensor<u32>,
@@ -161,15 +153,7 @@ pub fn ffai_batched_qkv_qgemv<T>(
 /// Grid: `[ceil(max(out_q,out_k,out_v)/8), 1, 3]`.
 /// out_q, out_k, out_v must be multiples of 8; in_dim must be a multiple
 /// of 512; group_size must be 64. TGs past a matrix's out_* rows no-op.
-#[kernel(
-    bench(
-        op="batched_qkv_qgemv",
-        subop="batched_qkv_qgemv_fast",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_batched_qkv_qgemv_fast<T>(
     x: Tensor<T>,
     w_q: Tensor<u32>,

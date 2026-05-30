@@ -60,15 +60,7 @@ use metaltile::kernel;
 /// Grid `[out_ch/32, (batch*out_d*out_h*out_w)/32, 1]`, tpg = 128.
 ///
 /// Correctness pinned by `conv3d_mma_gpu_correctness`.
-#[kernel(
-    bench(
-        op="conv3d",
-        subop="mma",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d_mma<T>(
     input: Tensor<T>,

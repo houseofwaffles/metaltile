@@ -44,15 +44,7 @@
 
 use metaltile::kernel;
 
-#[kernel(
-    bench(
-        op="mel_spectrogram",
-        subop="mel_spectrogram",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mel_spectrogram<T>(
     audio: Tensor<T>,
     window: Tensor<T>,
@@ -119,15 +111,7 @@ pub fn mel_spectrogram<T>(
 /// planes the `mt_fft_n*` kernels expect. `out_re[frame*n_fft + t] =
 /// audio[frame*hop + t] · window[t]`, `out_im` zeroed. One thread per
 /// `(frame, t)`; dispatch flat over `n_frames * n_fft`.
-#[kernel(
-    bench(
-        op="mel_spectrogram",
-        subop="stft_window",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mel_stft_window<T>(
     audio: Tensor<T>,
     window: Tensor<T>,
@@ -151,15 +135,7 @@ pub fn mel_stft_window<T>(
 /// `(frame, mel)`; dispatch flat over `n_frames * n_mels`. Output is
 /// bit-identical in form to `mel_spectrogram` — only the spectrum source
 /// (FFT vs in-thread DFT) differs.
-#[kernel(
-    bench(
-        op="mel_spectrogram",
-        subop="filterbank",
-        class=GenericEmpty,
-        tol=1e-3,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mel_filterbank<T>(
     fft_re: Tensor<T>,
     fft_im: Tensor<T>,

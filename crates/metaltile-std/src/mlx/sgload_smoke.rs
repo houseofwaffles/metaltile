@@ -57,16 +57,7 @@ use metaltile::kernel;
 /// Outputs:
 ///   - `dst`: `[64]` flat row-major 8×8 destination, written from
 ///     the fragment in A/C lane convention
-#[kernel(
-    bench(
-        op="sgload",
-        subop="smoke",
-        class=GenericEmpty,
-        tol=0.0,
-        dtypes=&[DType::F32, DType::F16],
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn mt_sgload_smoke<T>(src: Tensor<T>, mut dst: Tensor<T>) {
     let lane = simd_lane;
     // A/C lane → frag-element mapping. Matches the probe kernel +

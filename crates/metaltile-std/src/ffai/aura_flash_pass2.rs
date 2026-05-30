@@ -39,9 +39,7 @@ use metaltile::kernel;
 
 macro_rules! aura_flash_pass2_kernel {
     ($name:ident, $dims_per_lane:literal, $subop:literal) => {
-        #[kernel(
-            bench(op="aura", subop=$subop, class=GenericEmpty, tol=0.0, kernel_mode=Reduction,)
-        )]
+        #[kernel]
         pub fn $name<T>(
             o_partials: Tensor<T>,
             m_partials: Tensor<T>,

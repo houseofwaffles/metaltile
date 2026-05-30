@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //! `tile inspect` — Print IR and/or MSL for kernels.
 //!
-//! Auto-discovers kernels via inventory — no hardcoded list.
+//! Auto-discovers kernels via the `#[bench]` inventory — no hardcoded list.
 //!
 //! Usage:
 //!   tile inspect                           # list all registered kernels
@@ -15,10 +15,8 @@
 use std::{collections::BTreeMap, str::FromStr};
 
 use metaltile_codegen::generator_for_mode;
-use metaltile_std::{
-    bench_types::DType,
-    spec::{BenchSpec, all_specs, effective_mode},
-};
+use metaltile_core::{all_benches, bench::KernelBench};
+use metaltile_std::bench_types::DType;
 
 use crate::{
     CliError,
@@ -26,6 +24,10 @@ use crate::{
     matches_filter,
     term::{Color, Style, paint_stdout},
 };
+
+/// One registered kernel: the `#[bench]` that carries its IR + the union of
+/// dtypes it is benched at.
+type InspectKernel = (&'static dyn KernelBench, Vec<DType>);
 
 pub fn run(args: &InspectArgs) -> Result<(), CliError> {
     let filter_val = args.filter.as_ref().or(args.kernel.as_ref());
@@ -45,13 +47,19 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
     let pass_arg = &args.pass;
     let dtype_override: Option<DType> = args.dtype.as_deref().and_then(|s| DType::from_str(s).ok());
 
-    // Collect all specs and group by kernel_name.
-    let mut kernels: BTreeMap<&str, (&BenchSpec, Vec<DType>)> = BTreeMap::new();
-    for spec in all_specs() {
-        let entry = kernels.entry(spec.kernel_name).or_insert_with(|| (spec, Vec::new()));
-        for &dt in spec.dtypes {
-            if !entry.1.contains(&dt) {
-                entry.1.push(dt);
+    // Collect all #[bench]-registered kernels, grouped by IR kernel name. The
+    // bench's `setup(dt)` carries the kernel IR (mode applied via `.mode()`)
+    // and the threadgroup geometry — everything inspect needs — so this no
+    // longer depends on the legacy `BenchSpec` inventory.
+    let mut kernels: BTreeMap<String, InspectKernel> = BTreeMap::new();
+    for entry in all_benches() {
+        let b = entry.bench();
+        let Some(&first_dt) = b.dtypes().first() else { continue };
+        let name = b.setup(first_dt).kernel().name.to_string();
+        let e = kernels.entry(name).or_insert((b, Vec::new()));
+        for &dt in b.dtypes() {
+            if !e.1.contains(&dt) {
+                e.1.push(dt);
             }
         }
     }
@@ -61,15 +69,15 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let mut sorted: Vec<(&str, (&BenchSpec, Vec<DType>))> = kernels.into_iter().collect();
-    sorted.sort_unstable_by_key(|(name, _)| *name);
+    let mut sorted: Vec<(String, InspectKernel)> = kernels.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     // --all flag: dump every kernel
     if all_flag {
-        for (name, (spec, dtypes)) in &sorted {
+        for (name, (b, dtypes)) in &sorted {
             let dt = dtypes.first().copied().unwrap_or(DType::F32);
             if ir_flag {
-                let k = (spec.kernel_ir)(dt);
+                let k = b.setup(dt).kernel().clone();
                 if let Some(d) = dir {
                     let path = format!("{}/{}.ir", d, name);
                     std::fs::create_dir_all(d).map_err(CliError::Io)?;
@@ -79,14 +87,14 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
                     println!("{k}");
                 }
             } else {
-                let msl = generate_msl(spec, dtypes);
+                let msl = generate_msl_dt(*b, name, dt);
                 if let Some(d) = dir {
                     let path = format!("{}/{}.metal", d, name);
                     std::fs::create_dir_all(d).map_err(CliError::Io)?;
                     std::fs::write(&path, &msl).map_err(CliError::Io)?;
                     println!("wrote {path}");
                 } else {
-                    let mode_str = effective_mode(spec).to_string();
+                    let mode_str = b.setup(dt).kernel().mode.to_string();
                     println!("// ═══════════════════════════════════════════════════════");
                     println!("// kernel: {}  mode: {}", name, mode_str);
                     println!("// ═══════════════════════════════════════════════════════");
@@ -101,9 +109,10 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
     let Some(filter) = filter else {
         eprintln!("{}", paint_stdout("tile inspect", Style::new().fg(Color::Cyan).bold()),);
         eprintln!();
-        for (name, (spec, dtypes)) in &sorted {
+        for (name, (b, dtypes)) in &sorted {
             let dtype_str = dtypes.iter().map(|dt| dt.label()).collect::<Vec<_>>().join("/");
-            let mode_str = effective_mode(spec).to_string();
+            let dt0 = dtypes.first().copied().unwrap_or(DType::F32);
+            let mode_str = b.setup(dt0).kernel().mode.to_string();
             eprintln!(
                 "  {}   {}   {dtype_str}",
                 paint_stdout(format!("{name:<20}"), Style::new().fg(Color::Cyan).bold()),
@@ -137,19 +146,19 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
             "\n{} {}",
             paint_stdout("Available:", Style::new().fg(Color::BrightBlack)),
             paint_stdout(
-                sorted.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "),
+                sorted.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
                 Style::new().fg(Color::BrightWhite),
             ),
         );
         return Err(CliError::Other(format!("no kernel matched '{filter}'")));
     }
 
-    for (name, (spec, dtypes)) in &matched {
+    for (name, (b, dtypes)) in &matched {
         let dt = dtype_override.unwrap_or_else(|| dtypes.first().copied().unwrap_or(DType::F32));
 
         if ir_flag {
             // Print raw IR via Display impl
-            let k = (spec.kernel_ir)(dt);
+            let k = b.setup(dt).kernel().clone();
             if let Some(d) = dir {
                 let path = format!("{}/{}.ir", d, name);
                 std::fs::create_dir_all(d).map_err(CliError::Io)?;
@@ -159,20 +168,17 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
                 println!("{k}");
             }
         } else if stats_flag {
-            let mut k = (spec.kernel_ir)(dt);
-            k.mode = effective_mode(spec);
-            let expected_tpg =
-                spec.shapes.first().map(|s| s.tpg as u32).or_else(|| spec.dispatch.tpg_hint());
-            let generator = generator_for_mode(effective_mode(spec), expected_tpg);
+            let setup = b.setup(dt);
+            let k = setup.kernel().clone();
+            let expected_tpg = Some(setup.grid().tpg[0]);
+            let generator = generator_for_mode(k.mode, expected_tpg);
             match generator.generate_with_stats(&k) {
                 Ok((_, stats)) => print_stats_table(&stats),
                 Err(e) => eprintln!("error: {e}"),
             }
         } else if let Some(pass) = pass_arg {
             // --pass flag: print IR after a specific pass (or 'all' for every stage)
-            let mut k = (spec.kernel_ir)(dt);
-            let mode = effective_mode(spec);
-            k.mode = mode;
+            let mut k = b.setup(dt).kernel().clone();
 
             match pass.as_str() {
                 "all" => {
@@ -200,14 +206,14 @@ pub fn run(args: &InspectArgs) -> Result<(), CliError> {
             // Default: print MSL
             let eff_dt =
                 dtype_override.unwrap_or_else(|| dtypes.first().copied().unwrap_or(DType::F32));
-            let msl = generate_msl_dt(spec, eff_dt);
+            let msl = generate_msl_dt(*b, name, eff_dt);
             if let Some(d) = dir {
                 let path = format!("{}/{}.metal", d, name);
                 std::fs::create_dir_all(d).map_err(CliError::Io)?;
                 std::fs::write(&path, &msl).map_err(CliError::Io)?;
                 println!("wrote {path}");
             } else {
-                let mode_str = effective_mode(spec).to_string();
+                let mode_str = b.setup(eff_dt).kernel().mode.to_string();
                 println!("// ═══════════════════════════════════════════════════════");
                 println!("// kernel: {}  mode: {}", name, mode_str);
                 println!("// ═══════════════════════════════════════════════════════");
@@ -248,22 +254,17 @@ fn run_all_passes_and_print(k: &mut metaltile_core::ir::Kernel) {
     }
 }
 
-fn generate_msl(spec: &BenchSpec, dtypes: &[DType]) -> String {
-    generate_msl_dt(spec, dtypes.first().copied().unwrap_or(DType::F32))
-}
-
-fn generate_msl_dt(spec: &BenchSpec, dt: DType) -> String {
-    let mut k = (spec.kernel_ir)(dt);
-    // Mirror bench-side mt_qmm_mma dtype-aware-skew patch so `tile inspect`
-    // shows the same MSL the bench compiles.
-    if spec.kernel_name == "mt_qmm_mma" {
+/// Generate the final MSL a kernel emits, at dtype `dt`. Mirrors the bench /
+/// emit path: the IR comes from the `#[bench]` setup (mode already applied),
+/// and `mt_qmm_mma` gets the same dtype-aware-skew patch the bench compiles.
+fn generate_msl_dt(b: &dyn KernelBench, name: &str, dt: DType) -> String {
+    let setup = b.setup(dt);
+    let mut k = setup.kernel().clone();
+    if name == "mt_qmm_mma" {
         metaltile_std::mlx::quantized::patch_qmm_mma_dtype_aware_skew(&mut k, dt);
     }
-    let mode = effective_mode(spec);
-    k.mode = mode;
-    let expected_tpg =
-        spec.shapes.first().map(|s| s.tpg as u32).or_else(|| spec.dispatch.tpg_hint());
-    generator_for_mode(mode, expected_tpg)
+    let expected_tpg = Some(setup.grid().tpg[0]);
+    generator_for_mode(k.mode, expected_tpg)
         .generate(&k)
         .unwrap_or_else(|e| format!("// ERROR: {e}\n"))
 }

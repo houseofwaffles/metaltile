@@ -61,18 +61,7 @@ use metaltile::kernel;
 #[rustfmt::skip]
 macro_rules! steel_gemm_splitk_kernel {
     ($name:ident, $bm:literal, $bn:literal, $wm:literal, $wn:literal, $tpg:literal, $subop:literal) => {
-        #[kernel(
-            bench(
-                op="steel_gemm_splitk",
-                subop=$subop,
-                class=SteelGemm,
-                tol=1e-2,
-                kernel_mode=SimdGroup2D,
-                bm=$bm,
-                bn=$bn,
-                tpg=$tpg,
-            )
-        )]
+        #[kernel]
         pub fn $name<T>(
             a: Tensor<T>,
             b: Tensor<T>,
@@ -200,17 +189,7 @@ steel_gemm_splitk_kernel!(
 /// (fp32) into the final `[M, N]` output. One thread per output
 /// element. This is the plain-sum form of MLX's
 /// `steel_gemm_splitk_accum`.
-#[kernel(
-    bench(
-        op="steel_gemm_splitk",
-        subop="accum",
-        class=GenericEmpty,
-        tol=1e-3f32,
-        kernel_mode=Elementwise,
-        mlx="steel_gemm_splitk_accum_{tn}_float32",
-        metal_file="steel/gemm/steel_gemm_splitk.metal",
-    )
-)]
+#[kernel]
 pub fn mt_steel_gemm_splitk_accum<T>(
     partials: Tensor<f32>,
     mut out: Tensor<T>,
@@ -233,17 +212,7 @@ pub fn mt_steel_gemm_splitk_accum<T>(
 /// Split-K accumulation, `axpby` form: `out = α·(Σ partials) + β·c_in`.
 /// The fused-bias / residual variant of MLX's
 /// `steel_gemm_splitk_accum_*_axbpy`. One thread per output element.
-#[kernel(
-    bench(
-        op="steel_gemm_splitk",
-        subop="accum_axpby",
-        class=GenericEmpty,
-        tol=1e-3f32,
-        kernel_mode=Elementwise,
-        mlx="steel_gemm_splitk_accum_{tn}_float32_axbpy",
-        metal_file="steel/gemm/steel_gemm_splitk.metal",
-    )
-)]
+#[kernel]
 pub fn mt_steel_gemm_splitk_accum_axpby<T>(
     partials: Tensor<f32>,
     c_in: Tensor<T>,

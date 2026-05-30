@@ -28,15 +28,7 @@ use metaltile::kernel;
 // expansion silently produced no IR.  A DSL `for` loop over the seven
 // stages yields identical MSL and survives the proc-macro intact.
 
-#[kernel(
-    bench(
-        op="arg_reduce",
-        subop="argmax_u32",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Reduction,
-    )
-)]
+#[kernel]
 pub fn ffai_argmax<T>(inp: Tensor<T>, out: Tensor<u32>, #[constexpr] n: u32) {
     let lid = tid;
     let mut best_val = neg_infinity();

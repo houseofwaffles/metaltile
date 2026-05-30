@@ -43,15 +43,7 @@ use metaltile::kernel;
 /// threads past the output (a Grid3D dispatch rounds the thread count
 /// up to a multiple of TPG) early-out — they must not read `indices`
 /// out of bounds or write a stray `out` slot.
-#[kernel(
-    bench(
-        op="indexing",
-        subop="gather_front",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_gather_front<T>(
     src: Tensor<T>,
     indices: Tensor<u32>,
@@ -81,15 +73,7 @@ pub fn mt_gather_front<T>(
 /// threads past the update count early-out — without the guard a
 /// stray thread reads `indices` / `updates` out of bounds and scatters
 /// garbage into `out`.
-#[kernel(
-    bench(
-        op="indexing",
-        subop="scatter",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_scatter<T>(
     updates: Tensor<T>,
     indices: Tensor<u32>,
@@ -119,15 +103,7 @@ pub fn mt_scatter<T>(
 /// derives `batch_idx` from a `mask_batch_size`; this port flattens to
 /// the single-batch case (`offsets` already absolute into `src`),
 /// which is what the FFAI masked-cache-update path needs.
-#[kernel(
-    bench(
-        op="indexing",
-        subop="masked_scatter",
-        class=GenericEmpty,
-        tol=0.0,
-        kernel_mode=Grid3D,
-    )
-)]
+#[kernel]
 pub fn mt_masked_scatter<T>(
     mask: Tensor<u32>,
     offsets: Tensor<u32>,
